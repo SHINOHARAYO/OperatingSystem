@@ -50,7 +50,7 @@ typedef enum {
 } task_termination_reason_t;
 
 // Must perfectly align with the assembly `save_all` macro
-typedef struct {
+typedef struct tcb_t {
     uint64_t registers[31];
     uint64_t sp;
     uint64_t pc;
@@ -65,12 +65,23 @@ typedef struct {
     uint32_t ticks_remaining;
     uint32_t wait_time;
     uint32_t sleep_ticks_remaining;
+    uint8_t sched_queued;
+    uint8_t timer_queued;
+    uint16_t sched_padding;
+    uint64_t wake_tick;
+    struct tcb_t *sched_next;
+    struct tcb_t *sched_prev;
+    struct tcb_t *timer_next;
+    struct tcb_t *timer_prev;
 
     uint32_t ipc_target_tid;
     uint32_t ipc_received_sender_tid;
     uint64_t ipc_msg_flags;
     uint64_t ipc_msg_len;
     uint64_t ipc_msg_payload[IPC_INLINE_WORDS];
+    struct tcb_t *ipc_next;
+    struct tcb_t *ipc_call_head;
+    struct tcb_t *ipc_call_tail;
 
     uint32_t awaiting_irq;
     uint32_t parent_tid;
@@ -96,6 +107,7 @@ int sched_create_user_task(const uint8_t *elf_data, uint64_t elf_size, uint8_t p
 int sched_create_user_task_from_file(const uint8_t *elf_data, uint64_t elf_size, uint8_t priority, uint32_t initrd_index);
 
 void sched_tick(void);
+void sched_reschedule(void);
 
 void sched_yield_syscall(void);
 void sched_mmap_syscall(uint64_t *regs, uint64_t size);
@@ -128,6 +140,7 @@ tcb_t *sched_current_task(void);
 uint64_t *sched_task_trap_frame(tcb_t *task);
 void sched_clear_ipc_state(tcb_t *task);
 void sched_handoff_to_task(tcb_t *target);
+void sched_make_ready(tcb_t *task);
 int sched_current_is_user(void);
 void sched_fault_current_task(uint64_t esr, uint64_t elr, uint64_t far);
 

@@ -206,7 +206,7 @@ void neptune_kmain(void *memory_map, uint64_t map_size, uint64_t desc_size,
   LOG_INFO_HEX("Creating Shell ELF Blob Size: ", shell_elf_len);
   sched_create_user_task(shell_elf, shell_elf_len, 10);
 
-  LOG_INFO("Starting ARM Generic Timer (10Hz)...");
+  LOG_INFO("Starting ARM Generic Timer (1kHz)...");
   timer_init();
 
   LOG_OK("Entering Idle Loop (Task 0)...");

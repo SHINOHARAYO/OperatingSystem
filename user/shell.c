@@ -17,6 +17,7 @@
 #define IPCFAST_FILE "ipcfast.elf"
 #define IPCCAP_FILE "ipccap.elf"
 #define IPCKILL_FILE "ipckill.elf"
+#define SPEED_FILE "speed.elf"
 #define PAGE_BYTES 4096ULL
 
 #define IPCKILL_SERVER_HOLD        1
@@ -1093,6 +1094,7 @@ void _start(void) {
         printf("  ipcfast       Test 0/8/64/128-byte register IPC\n");
         printf("  ipccap        Transfer an endpoint cap through IPC\n");
         printf("  ipckill       Test IPC cleanup across task kills\n");
+        printf("  speed         Run userspace OS speed benchmarks\n");
         printf("  memshare      Share one page with a child task\n");
         printf("  memxfer       Transfer one page to a child task\n");
         printf("  memcaplife    Share a cap after unmapping old VA\n");
@@ -1230,6 +1232,14 @@ void _start(void) {
 
       } else if (_streq(cmd, "ipckill")) {
         run_ipckill_demo();
+
+      } else if (_streq(cmd, "speed")) {
+        uint32_t speed_tid = spawn_program(SPEED_FILE, PONG_PRIORITY);
+        if ((int)speed_tid < 0) {
+          printf("Error: Could not spawn speed benchmark\n");
+        } else {
+          print_wait_result(sys_wait(speed_tid));
+        }
 
       } else if (_streq(cmd, "memshare")) {
         run_memshare_demo();

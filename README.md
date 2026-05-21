@@ -6,7 +6,9 @@ kernel capability subsystem, capability-based synchronous IPC, register-only
 fast messages, zero-copy memory attachments, a name server, a simple initrd FS
 service, a shell, task lifecycle syscalls, per-task VMA tracking, lazy
 anonymous memory, dynamic stack growth, ASID-aware address spaces, and basic
-memory diagnostics.
+memory diagnostics. The scheduler is now a CPU0 O(1) MLFQ using 32 ready
+queues, bitmap/CLZ selection, a 1 kHz generic timer tick, and timer-wheel
+wakeups.
 
 This is an experimental teaching OS, not a production system.
 
@@ -87,6 +89,7 @@ Available commands:
 | `vmstress` | Grow and shrink the VMA table under many file mappings |
 | `lazyexec` | Spawn an initrd ELF through lazy executable VM objects |
 | `taskstress` | Grow the kernel task table with many spin tasks |
+| `speed` | Run scheduler, syscall, lazy-fault, memory, and IPC speed checks |
 | `ps` | Show scheduler state, including PPID |
 | `pong` | Spawn pong, run the IPC demo, wait for exit |
 | `fault` | Spawn a task that page-faults, wait for fault status |
@@ -156,7 +159,7 @@ wait 4
 - Boots as an AArch64 UEFI application under QEMU.
 - Loads `initrd.bin` from the FAT image before `ExitBootServices`.
 - Initializes exceptions, the MMU, ACPI hardware discovery, GICv2, and the ARM
-  generic timer.
+  generic timer at a 1 kHz scheduler tick.
 - Uses a 39-bit lower-half identity map with 40-bit physical-address support.
 - Supports per-user address spaces with allocated ASIDs in `TTBR0_EL1`,
   targeted TLB invalidation, and flush-on-ASID-reuse.
@@ -231,7 +234,19 @@ wait 4
 ### Tasks And Scheduling
 
 - EL0 user task creation and context switching.
-- Timer-driven scheduler with priorities and basic aging.
+- CPU0 per-core scheduler structure prepared for later SMP expansion.
+- O(1) MLFQ scheduler with 32 circular ready queues.
+- Ready selection uses a 32-bit bitmap where bit 31 is queue 0 and native
+  AArch64 `CLZ` finds the highest runnable priority.
+- Exponential time slices: 1 ms for queues 0-3, 2 ms for 4-7, 4 ms for 8-15,
+  8 ms for 16-23, and 16 ms for 24-31.
+- 1 kHz ARM generic timer tick; `sleep(ms)` now uses millisecond ticks.
+- 1024-bucket timer wheel for sleep and IRQ timeout wakeups.
+- Global priority boost every 1000 ticks to prevent starvation.
+- Yield keeps the current priority and moves the task to the tail of its
+  queue; CPU-bound quantum expiry demotes by one queue.
+- Blocking on IPC, sleep, wait, IRQ, or fault removes the task from scheduler
+  ownership without demoting it.
 - Dynamically growing task and termination-record tables.
 - Parent-child task tracking with child termination records.
 - `wait` and `poll` support for child status.
@@ -269,6 +284,8 @@ The current embedded user programs are:
 | `ipcfast` | `user/ipcfast.c` | Register-only IPC boundary test |
 | `ipccap` | `user/ipccap.c` | Endpoint-cap transfer regression test |
 | `ipckill` | `user/ipckill.c` | IPC kill/unwind regression helper |
+| `speed` | `user/speed.c` | OS speed benchmark for CPU loop, syscalls, yield, lazy faults, memory writes, and IPC |
+| `speedipc` | `user/speedipc.c` | Helper endpoint used by the speed IPC benchmark |
 
 The build packs these ELFs into `build/initrd.bin`. UEFI loads that file from
 the FAT image before `ExitBootServices`. The FS server validates filenames and
@@ -277,6 +294,8 @@ transfers boot-granted file or executable capabilities to clients.
 ## Known Limitations
 
 - The FS server currently exposes initrd only; there is no general VFS yet.
+- Scheduler is CPU0-only; the data shape is per-core, but SMP dispatch is not
+  implemented yet.
 - User programs are still packaged at build time into `initrd.bin`.
 - No persistent filesystem or file writes yet.
 - The bootstrap identity map covers the 39-bit lower VA space. This supports

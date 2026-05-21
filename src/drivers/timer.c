@@ -13,20 +13,26 @@
 // The physical timer is typically routed to PPI 30 on the GIC
 #define TIMER_IRQ 30
 
-static uint64_t timer_freq;
+static uint64_t timer_freq_hz;
+static uint64_t timer_period_counts;
+static uint64_t timer_base_count;
 static uint64_t ticks = 0;
 
 void timer_init(void) {
     LOG_INFO("TIMER: Initializing ARM Generic Timer...");
-    __asm__ volatile("mrs %0, cntfrq_el0" : "=r"(timer_freq));
-    LOG_INFO_HEX("TIMER: Frequency (Hz): ", timer_freq);
+    __asm__ volatile("mrs %0, cntfrq_el0" : "=r"(timer_freq_hz));
+    __asm__ volatile("mrs %0, cntpct_el0" : "=r"(timer_base_count));
+    LOG_INFO_HEX("TIMER: Frequency (Hz): ", timer_freq_hz);
 
-    if (timer_freq == 0) {
+    if (timer_freq_hz == 0) {
         LOG_FAIL("TIMER PANIC: Timer frequency is zero!");
         while(1);
     }
-    timer_freq = timer_freq / 10;
-    __asm__ volatile("msr cntp_tval_el0, %0" : : "r"(timer_freq));
+    timer_period_counts = timer_freq_hz / 1000;
+    if (timer_period_counts == 0) {
+        timer_period_counts = 1;
+    }
+    __asm__ volatile("msr cntp_tval_el0, %0" : : "r"(timer_period_counts));
     // CNTP_CTL_EL0: Bit 0 = Enable, Bit 1 = IMASK (0 to unmask)
     __asm__ volatile("msr cntp_ctl_el0, %0" : : "r"(1ULL));
     gic_enable_interrupt(TIMER_IRQ);
@@ -36,8 +42,18 @@ void timer_init(void) {
 
 void timer_handle_interrupt(void) {
     ticks++;
-    __asm__ volatile("msr cntp_tval_el0, %0" : : "r"(timer_freq));
+    __asm__ volatile("msr cntp_tval_el0, %0" : : "r"(timer_period_counts));
 }
 uint64_t timer_get_uptime_seconds(void) {
-    return ticks / 10;
+    return ticks / 1000;
+}
+
+uint64_t timer_get_uptime_ms(void) {
+    return ticks;
+}
+
+uint64_t timer_get_uptime_ns(void) {
+    uint64_t count = 0;
+    __asm__ volatile("mrs %0, cntpct_el0" : "=r"(count));
+    return ((count - timer_base_count) * 1000000000ULL) / timer_freq_hz;
 }

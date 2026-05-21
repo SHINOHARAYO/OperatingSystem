@@ -8,6 +8,7 @@ static uint64_t total_pages = 0;
 static uint64_t usable_pages = 0;
 static uint64_t free_pages = 0;
 static uint64_t memory_offset = 0;
+static uint64_t next_free_hint = 0;
 static void bitmap_set(uint64_t bit) {
     bitmap[bit / 8] |= (1 << (bit % 8));
 }
@@ -81,14 +82,30 @@ void pmm_init(void *memory_map, uint64_t map_size, uint64_t desc_size) {
         }
     }
 
+    next_free_hint = 0;
+    while (next_free_hint < total_pages && bitmap_test(next_free_hint)) {
+        next_free_hint++;
+    }
+    if (next_free_hint >= total_pages) {
+        next_free_hint = 0;
+    }
+
     LOG_OK_HEX("PMM: Initialized. Free Pages: ", free_pages);
 }
 
 void *pmm_alloc_page(void) {
-    for (uint64_t i = 0; i < total_pages; i++) {
+    for (uint64_t searched = 0; searched < total_pages; searched++) {
+        uint64_t i = next_free_hint + searched;
+        if (i >= total_pages) {
+            i -= total_pages;
+        }
         if (!bitmap_test(i)) {
             bitmap_set(i);
             free_pages--;
+            next_free_hint = i + 1;
+            if (next_free_hint >= total_pages) {
+                next_free_hint = 0;
+            }
             uint64_t paddr = memory_offset + (i * PAGE_SIZE);
             
             uint8_t *page = (uint8_t *)paddr;
@@ -145,6 +162,9 @@ void pmm_free_page(void *page) {
     if (bitmap_test(bit)) {
         bitmap_clear(bit);
         free_pages++;
+        if (bit < next_free_hint) {
+            next_free_hint = bit;
+        }
     }
 }
 
@@ -169,6 +189,9 @@ void pmm_free_contiguous_pages(void *pages, uint64_t page_count) {
         if (bitmap_test(start_bit + i)) {
             bitmap_clear(start_bit + i);
             free_pages++;
+            if (start_bit + i < next_free_hint) {
+                next_free_hint = start_bit + i;
+            }
         }
     }
 }

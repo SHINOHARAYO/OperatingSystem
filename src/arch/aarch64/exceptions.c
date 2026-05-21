@@ -44,6 +44,8 @@
 #define SYS_IPC_RECV     36
 #define SYS_IPC_REPLY    37
 #define SYS_CAPSTAT      38
+#define SYS_UPTIME_MS    39
+#define SYS_UPTIME_NS    40
 
 #define EC_IABORT_LOWER_EL 0x20
 #define EC_PC_ALIGN_FAULT  0x22
@@ -145,6 +147,10 @@ void handle_sync(uint64_t *regs) {
             ipc_reply_syscall(regs);
         } else if (syscall_num == SYS_CAPSTAT) {
             sched_capstat_syscall(regs, (uint32_t)arg0);
+        } else if (syscall_num == SYS_UPTIME_MS) {
+            regs[0] = timer_get_uptime_ms();
+        } else if (syscall_num == SYS_UPTIME_NS) {
+            regs[0] = timer_get_uptime_ns();
         } else {
             uart_puts("Unknown Syscall: ");
             uart_hex(syscall_num);
@@ -177,15 +183,16 @@ void handle_sync(uint64_t *regs) {
 
 void handle_irq(void) {
     uint32_t int_id = gic_acknowledge_interrupt();
-    int should_schedule = 0;
+    int timer_tick = 0;
+    int should_reschedule = 0;
 
     if (int_id == 30) {
         timer_handle_interrupt();
-        should_schedule = 1;
+        timer_tick = 1;
     } else if (int_id > 31 && int_id < 1020) {
         extern void sched_wake_irq(uint32_t irq_num);
         sched_wake_irq(int_id);
-        should_schedule = 1;
+        should_reschedule = 1;
     } else if (int_id < 1020) {
         LOG_INFO_HEX("Unhandled IRQ ID: ", int_id);
     }
@@ -196,8 +203,10 @@ void handle_irq(void) {
         gic_end_of_interrupt(int_id);
     }
 
-    if (should_schedule) {
+    if (timer_tick) {
         sched_tick();
+    } else if (should_reschedule) {
+        sched_reschedule();
     }
 }
 

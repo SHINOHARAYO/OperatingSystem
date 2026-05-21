@@ -29,6 +29,30 @@ static int endpoint_tid_from_cap(tcb_t *task, uint32_t cap) {
     return sched_find_task(tid) ? (int)tid : -1;
 }
 
+static void enqueue_caller(tcb_t *endpoint, tcb_t *caller) {
+    caller->ipc_next = NULL;
+    if (endpoint->ipc_call_tail) {
+        endpoint->ipc_call_tail->ipc_next = caller;
+    } else {
+        endpoint->ipc_call_head = caller;
+    }
+    endpoint->ipc_call_tail = caller;
+}
+
+static tcb_t *dequeue_caller(tcb_t *endpoint) {
+    if (!endpoint || !endpoint->ipc_call_head) {
+        return NULL;
+    }
+
+    tcb_t *caller = endpoint->ipc_call_head;
+    endpoint->ipc_call_head = caller->ipc_next;
+    if (endpoint->ipc_call_tail == caller) {
+        endpoint->ipc_call_tail = NULL;
+    }
+    caller->ipc_next = NULL;
+    return caller;
+}
+
 static int copy_cap_to_task(tcb_t *src, tcb_t *dst, uint32_t src_cap) {
     uint32_t dst_slot = 0;
     if (!src || !dst ||
@@ -102,6 +126,29 @@ static int deliver_ipc_call(tcb_t *caller, tcb_t *receiver, uint64_t *recv_regs)
     return 0;
 }
 
+static int deliver_fast_ipc_call(tcb_t *caller, tcb_t *receiver,
+                                 uint64_t *recv_regs, uint64_t *call_regs,
+                                 uint64_t len) {
+    int reply_cap = install_reply_cap(receiver, caller->tid);
+    if (reply_cap < 0) {
+        return -1;
+    }
+
+    recv_regs[0] = (uint64_t)reply_cap;
+    recv_regs[1] = caller->tid;
+    recv_regs[2] = len;
+    for (uint32_t i = 0; i < IPC_INLINE_WORDS; i++) {
+        recv_regs[ipc_reg_index(i)] = call_regs[ipc_reg_index(i)];
+    }
+
+    caller->ipc_target_tid = receiver->tid;
+    caller->ipc_msg_flags = 0;
+    caller->ipc_msg_len = len;
+    caller->state = TASK_STATE_BLOCKED_ON_IPC_REPLY;
+    receiver->ipc_target_tid = 0;
+    return 0;
+}
+
 int ipc_call_syscall(uint64_t *regs) {
     tcb_t *current = sched_current_task();
     if (!regs || !current) {
@@ -110,6 +157,11 @@ int ipc_call_syscall(uint64_t *regs) {
 
     int endpoint_tid = endpoint_tid_from_cap(current, (uint32_t)regs[0]);
     if (endpoint_tid < 0) {
+        regs[0] = (uint64_t)-1;
+        return -1;
+    }
+    tcb_t *receiver = sched_find_task((uint32_t)endpoint_tid);
+    if (!receiver) {
         regs[0] = (uint64_t)-1;
         return -1;
     }
@@ -129,26 +181,26 @@ int ipc_call_syscall(uint64_t *regs) {
         current->ipc_msg_payload[i] = regs[ipc_reg_index(i)];
     }
 
-    uint32_t capacity = sched_task_capacity();
-    for (uint32_t i = 0; i < capacity; i++) {
-        tcb_t *receiver = sched_task_at(i);
-        if (receiver && receiver->state == TASK_STATE_BLOCKED_ON_IPC_RECV &&
-            receiver->ipc_target_tid == (uint32_t)endpoint_tid) {
-            uint64_t *recv_regs = sched_task_trap_frame(receiver);
-            if (deliver_ipc_call(current, receiver, recv_regs) < 0) {
-                sched_clear_ipc_state(current);
-                regs[0] = (uint64_t)-1;
-                return -1;
-            }
-            receiver->state = TASK_STATE_READY;
-            sched_handoff_to_task(receiver);
-            return 0;
+    if (receiver->state == TASK_STATE_BLOCKED_ON_IPC_RECV &&
+        receiver->ipc_target_tid == (uint32_t)endpoint_tid) {
+        uint64_t *recv_regs = sched_task_trap_frame(receiver);
+        int delivered = (flags == 0) ?
+            deliver_fast_ipc_call(current, receiver, recv_regs, regs, len) :
+            deliver_ipc_call(current, receiver, recv_regs);
+        if (delivered < 0) {
+            sched_clear_ipc_state(current);
+            regs[0] = (uint64_t)-1;
+            return -1;
         }
+        sched_make_ready(receiver);
+        sched_handoff_to_task(receiver);
+        return 0;
     }
 
+    enqueue_caller(receiver, current);
     current->state = TASK_STATE_BLOCKED_ON_IPC_CALL;
     current->ticks_remaining = 0;
-    sched_tick();
+    sched_reschedule();
     return (int)regs[0];
 }
 
@@ -164,26 +216,27 @@ void ipc_recv_syscall(uint64_t *regs) {
         return;
     }
 
-    uint32_t capacity = sched_task_capacity();
-    for (uint32_t i = 0; i < capacity; i++) {
-        tcb_t *caller = sched_task_at(i);
-        if (caller && caller->state == TASK_STATE_BLOCKED_ON_IPC_CALL &&
+    tcb_t *caller = dequeue_caller(current);
+    if (caller) {
+        if (caller->state == TASK_STATE_BLOCKED_ON_IPC_CALL &&
             caller->ipc_target_tid == current->tid) {
             if (deliver_ipc_call(caller, current, regs) < 0) {
                 uint64_t *caller_tf = sched_task_trap_frame(caller);
                 caller_tf[0] = (uint64_t)-1;
                 sched_clear_ipc_state(caller);
-                caller->state = TASK_STATE_READY;
+                sched_make_ready(caller);
                 regs[0] = (uint64_t)-1;
             }
-            return;
+        } else {
+            regs[0] = (uint64_t)-1;
         }
+        return;
     }
 
     current->state = TASK_STATE_BLOCKED_ON_IPC_RECV;
     current->ipc_target_tid = current->tid;
     current->ticks_remaining = 0;
-    sched_tick();
+    sched_reschedule();
 }
 
 int ipc_reply_syscall(uint64_t *regs) {
@@ -217,7 +270,7 @@ int ipc_reply_syscall(uint64_t *regs) {
 
     if ((flags & ~(IPC_FLAG_MEM | IPC_FLAG_CAP)) != 0 ||
         ((flags & IPC_FLAG_MEM) == 0 && len > IPC_REPLY_INLINE_WORDS * 8) ||
-        prepare_ipc_payload(current, caller, flags, len, in, out) < 0) {
+        (flags != 0 && prepare_ipc_payload(current, caller, flags, len, in, out) < 0)) {
         regs[0] = (uint64_t)-1;
         return -1;
     }
@@ -226,13 +279,20 @@ int ipc_reply_syscall(uint64_t *regs) {
     caller_tf[0] = regs[1];
     caller_tf[1] = flags;
     caller_tf[2] = len;
-    for (uint32_t i = 0; i < IPC_INLINE_WORDS; i++) {
-        caller_tf[ipc_reg_index(i)] = out[i];
+    if (flags == 0) {
+        for (uint32_t i = 0; i < IPC_REPLY_INLINE_WORDS; i++) {
+            caller_tf[ipc_reg_index(i)] = regs[ipc_reply_reg_index(i)];
+        }
+        caller_tf[ipc_reg_index(IPC_INLINE_WORDS - 1)] = 0;
+    } else {
+        for (uint32_t i = 0; i < IPC_INLINE_WORDS; i++) {
+            caller_tf[ipc_reg_index(i)] = out[i];
+        }
     }
 
     ocap_revoke_slot(&current->caps, reply_cap);
     sched_clear_ipc_state(caller);
-    caller->state = TASK_STATE_READY;
+    sched_make_ready(caller);
     regs[0] = 0;
     sched_handoff_to_task(caller);
     return 0;

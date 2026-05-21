@@ -464,6 +464,34 @@ static inline uint64_t sys_uptime(void) {
     return x0;
 }
 
+static inline uint64_t sys_uptime_ms(void) {
+    register uint64_t x0 asm("x0");
+    register uint64_t x8 asm("x8") = 39;
+
+    asm volatile(
+        "svc #0"
+        : "=r" (x0)
+        : "r" (x8)
+        : "memory"
+    );
+
+    return x0;
+}
+
+static inline uint64_t sys_uptime_ns(void) {
+    register uint64_t x0 asm("x0");
+    register uint64_t x8 asm("x8") = 40;
+
+    asm volatile(
+        "svc #0"
+        : "=r" (x0)
+        : "r" (x8)
+        : "memory"
+    );
+
+    return x0;
+}
+
 static inline task_info_t sys_ps(uint32_t index) {
     register uint64_t x0 asm("x0") = (uint64_t)index;
     register uint64_t x1 asm("x1");

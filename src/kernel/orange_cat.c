@@ -1,4 +1,3 @@
-//Meow, motherfuckers!
 #include "orange_cat.h"
 #include "mmu.h"
 #include "pmm.h"

@@ -15,6 +15,13 @@ OBJ = $(BUILD)/main.o $(BUILD)/uart.o $(BUILD)/exceptions.o $(BUILD)/mmu.o \
       $(BUILD)/gic.o $(BUILD)/timer.o $(BUILD)/acpi.o $(BUILD)/orange_cat.o $(BUILD)/ipc.o $(BUILD)/memcap.o $(BUILD)/sched.o \
       $(BUILD)/elf.o $(BUILD)/initrd.o $(BUILD)/usercopy.o
 
+KERNEL_HEADERS := $(wildcard includes/*.h)
+USER_HEADERS   := $(wildcard user/*.h)
+USER_ELFS      := $(BUILD)/shell.elf $(BUILD)/pong.elf $(BUILD)/fault.elf $(BUILD)/spin.elf $(BUILD)/badptr.elf \
+                  $(BUILD)/stackgrow.elf $(BUILD)/memshare.elf $(BUILD)/memxfer.elf $(BUILD)/memrevoke.elf \
+                  $(BUILD)/ipcfast.elf $(BUILD)/ipccap.elf $(BUILD)/ipckill.elf $(BUILD)/speed.elf $(BUILD)/speedipc.elf \
+                  $(BUILD)/uart.elf $(BUILD)/keyboard.elf $(BUILD)/ns.elf $(BUILD)/fs.elf
+
 USER_CFLAGS = -target aarch64-linux-gnu -ffreestanding -nostdlib -static -fno-builtin \
               -Wl,-Ttext=0x80000000 -Wl,--entry=_start
 
@@ -28,7 +35,11 @@ $(BUILD):
 
 # ── User-space ELF blobs ─────────────────────────────────────────────────────
 
-user_apps: $(BUILD)/shell.elf $(BUILD)/pong.elf $(BUILD)/fault.elf $(BUILD)/spin.elf $(BUILD)/badptr.elf $(BUILD)/stackgrow.elf $(BUILD)/memshare.elf $(BUILD)/memxfer.elf $(BUILD)/memrevoke.elf $(BUILD)/ipcfast.elf $(BUILD)/ipccap.elf $(BUILD)/ipckill.elf $(BUILD)/uart.elf $(BUILD)/keyboard.elf $(BUILD)/ns.elf $(BUILD)/fs.elf
+user_apps: $(USER_ELFS)
+
+$(OBJ): $(KERNEL_HEADERS)
+
+$(USER_ELFS): $(USER_HEADERS)
 
 $(BUILD)/pong.elf: user/pong.c user/lib.h user/lib.c user/ns_proto.h user/malloc.h user/malloc.c | $(BUILD)
 	clang $(USER_CFLAGS) user/pong.c user/lib.c user/malloc.c -o $(BUILD)/pong.elf
@@ -62,6 +73,12 @@ $(BUILD)/ipccap.elf: user/ipccap.c user/ipc_proto.h user/lib.h user/lib.c user/n
 
 $(BUILD)/ipckill.elf: user/ipckill.c user/ipc_proto.h user/lib.h user/lib.c user/ns_proto.h user/malloc.h user/malloc.c | $(BUILD)
 	clang $(USER_CFLAGS) user/ipckill.c user/lib.c user/malloc.c -o $(BUILD)/ipckill.elf
+
+$(BUILD)/speed.elf: user/speed.c user/lib.h user/lib.c user/ns_proto.h user/ipc_proto.h user/malloc.h user/malloc.c | $(BUILD)
+	clang $(USER_CFLAGS) user/speed.c user/lib.c user/malloc.c -o $(BUILD)/speed.elf
+
+$(BUILD)/speedipc.elf: user/speedipc.c user/lib.h user/lib.c | $(BUILD)
+	clang $(USER_CFLAGS) user/speedipc.c user/lib.c -o $(BUILD)/speedipc.elf
 
 $(BUILD)/shell.elf: user/shell.c user/lib.h user/lib.c user/malloc.h user/malloc.c user/fs_proto.h user/ns_proto.h user/ipc_proto.h | $(BUILD)
 	clang $(USER_CFLAGS) user/shell.c user/lib.c user/malloc.c -o $(BUILD)/shell.elf
@@ -98,7 +115,9 @@ $(BUILD)/initrd.bin: $(BUILD)/mkinitrd user_apps | $(BUILD)
 		$(BUILD)/memrevoke.elf \
 		$(BUILD)/ipcfast.elf \
 		$(BUILD)/ipccap.elf \
-		$(BUILD)/ipckill.elf
+		$(BUILD)/ipckill.elf \
+		$(BUILD)/speed.elf \
+		$(BUILD)/speedipc.elf
 
 # ── Kernel object files ───────────────────────────────────────────────────────
 
