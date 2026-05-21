@@ -1,7 +1,7 @@
 #include "lib.h"
 #include "ns_proto.h"
 
-// PL011 UART MMIO page mapped by the kernel for this shit driver task.
+// PL011 UART MMIO page mapped by the kernel for this driver task.
 #define UART_BASE 0xB0000000
 
 #define UART_DR ((volatile uint32_t *)(UART_BASE + 0x000))
@@ -29,8 +29,7 @@ static int get_shell_cap(void) {
 static int forward_pending_input(void) {
   int delivered = 0;
 
-  // UART_FR bit 4 is RXFE (Receive FIFO Empty, don't ask why it's fucking
-  // called that)
+  // UART_FR bit 4 is RXFE (receive FIFO empty).
   while ((*UART_FR & (1 << 4)) == 0) {
     char c = (char)(*UART_DR & 0xFF);
     uint64_t payload[IPC_INLINE_WORDS] = {0};
@@ -47,11 +46,10 @@ void _start(void) {
     sys_sleep(10);
   }
 
-  // 1. Clear stale RX interrupt state, then unmask these fucking RX interrupts.
+  // Clear stale RX interrupt state, then unmask RX interrupts.
   *UART_ICR = UART_INT_RX | UART_INT_RXTIME;
 
-  // RXIM fires at the FIFO trigger level; RTIM fires for short interactive
-  // input, fuck.
+  // RXIM fires at the FIFO trigger level; RTIM covers short interactive input.
   *UART_IMSC |= UART_INT_RX | UART_INT_RXTIME;
 
   while (1) {

@@ -29,7 +29,7 @@ static uint64_t GICC_BASE = 0;
 #define GICC_HPPIR       (GICC_BASE + 0x0018)
 
 void gic_init(void) {
-    LOG_INFO("GIC: Initializing Generic Interrupt Controller (v2)...");
+    LOG_DEBUG("GIC: Initializing Generic Interrupt Controller v2.");
 
     GICD_BASE = acpi_get_gicd_base();
     GICC_BASE = acpi_get_gicc_base();
@@ -40,7 +40,7 @@ void gic_init(void) {
     mmio_write32(GICD_CTLR, 0);
     uint32_t typer = mmio_read32(GICD_TYPER);
     uint32_t max_lines = ((typer & 0x1F) + 1) * 32;
-    LOG_INFO_HEX("GIC: Maximum Interrupt Lines: ", max_lines);
+    LOG_DEBUG_HEX("GIC: Maximum Interrupt Lines: ", max_lines);
     for (uint32_t i = 1; i < (max_lines / 32); i++) {
         mmio_write32(GICD_ICENABLER(i), 0xFFFFFFFF);
     }

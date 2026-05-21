@@ -49,6 +49,20 @@ typedef struct {
     uint32_t capacity;
 } cap_info_t;
 
+typedef struct {
+    uint32_t log_level;
+    uint32_t tick_hz;
+    uint32_t task_capacity;
+    uint32_t max_user_asids;
+    uint64_t user_stack_max_size;
+    uint32_t max_mem_objects;
+    uint32_t max_mem_mappings;
+    uint32_t active_mem_objects;
+    uint32_t active_mem_mappings;
+    uint32_t current_vma_count;
+    uint32_t current_vma_capacity;
+} debug_info_t;
+
 #define VMA_READ       (1ULL << 0)
 #define VMA_WRITE      (1ULL << 1)
 #define VMA_EXEC       (1ULL << 2)
@@ -770,6 +784,40 @@ static inline cap_info_t sys_capstat(uint32_t slot) {
     info.rights = x4;
     info.flags = x5;
     info.capacity = (uint32_t)x6;
+    return info;
+}
+
+static inline debug_info_t sys_debug_info(void) {
+    register uint64_t x0 asm("x0");
+    register uint64_t x1 asm("x1");
+    register uint64_t x2 asm("x2");
+    register uint64_t x3 asm("x3");
+    register uint64_t x4 asm("x4");
+    register uint64_t x5 asm("x5");
+    register uint64_t x6 asm("x6");
+    register uint64_t x7 asm("x7");
+    register uint64_t x8 asm("x8") = 41;
+
+    asm volatile(
+        "svc #0"
+        : "=r" (x0), "=r" (x1), "=r" (x2), "=r" (x3),
+          "=r" (x4), "=r" (x5), "=r" (x6), "=r" (x7)
+        : "r" (x8)
+        : "memory"
+    );
+
+    debug_info_t info;
+    info.log_level = (uint32_t)x0;
+    info.tick_hz = (uint32_t)x1;
+    info.task_capacity = (uint32_t)x2;
+    info.max_user_asids = (uint32_t)x3;
+    info.user_stack_max_size = x4;
+    info.max_mem_objects = (uint32_t)(x5 >> 32);
+    info.max_mem_mappings = (uint32_t)x5;
+    info.active_mem_objects = (uint32_t)(x6 >> 32);
+    info.active_mem_mappings = (uint32_t)x6;
+    info.current_vma_count = (uint32_t)(x7 >> 32);
+    info.current_vma_capacity = (uint32_t)x7;
     return info;
 }
 

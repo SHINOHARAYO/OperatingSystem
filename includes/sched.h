@@ -123,6 +123,7 @@ void sched_exit_syscall(uint64_t *regs, int exit_code);
 void sched_ps_syscall(uint64_t *regs, uint32_t index);
 void sched_task_capacity_syscall(uint64_t *regs);
 void sched_capstat_syscall(uint64_t *regs, uint32_t slot);
+void sched_debug_info_syscall(uint64_t *regs);
 int  sched_kill_syscall(uint64_t *regs, uint32_t tid);
 void sched_wait_syscall(uint64_t *regs, uint32_t tid);
 void sched_poll_syscall(uint64_t *regs, uint32_t tid);

@@ -80,7 +80,7 @@ int vmm_map_page_asid(uint64_t* pgd, uint16_t asid, uint64_t va, uint64_t pa, ui
         uint64_t old_block_attrs = root_l1[l1_idx] & ~PTE_MASK;
         
         if (is_block) {
-             LOG_WARN("VMM Warning: Splitting L1 block into L2 table.");
+             LOG_DEBUG("VMM: Splitting L1 block into L2 table.");
         }
         
         l2_table = (uint64_t *)pmm_alloc_page();

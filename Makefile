@@ -3,11 +3,12 @@ TARGET = $(BUILD)/BOOTAA64.EFI
 QEMU_MEM ?= 2048M
 QEMU_CPU ?= cortex-a57
 QEMU_WIN_CPU ?= host
+LOG_LEVEL ?= 1
 
 CC = clang
 LD = lld-link
 
-CFLAGS   = -target aarch64-unknown-windows -ffreestanding -fshort-wchar -mno-red-zone -Wall -Wextra -O2 -Iincludes
+CFLAGS   = -target aarch64-unknown-windows -ffreestanding -fshort-wchar -mno-red-zone -Wall -Wextra -O2 -Iincludes -DLOG_LEVEL=$(LOG_LEVEL)
 LDFLAGS  = -subsystem:efi_application -entry:efi_main
 
 OBJ = $(BUILD)/main.o $(BUILD)/uart.o $(BUILD)/exceptions.o $(BUILD)/mmu.o \

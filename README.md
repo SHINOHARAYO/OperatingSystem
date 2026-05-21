@@ -48,6 +48,21 @@ The default QEMU memory size is 2048 MiB. Override it with:
 make run QEMU_MEM=3072M
 ```
 
+The kernel log level is selected at build time:
+
+| Value | Meaning |
+| --- | --- |
+| `LOG_LEVEL=0` | Quiet: failures only |
+| `LOG_LEVEL=1` | Normal boot milestones and warnings |
+| `LOG_LEVEL=2` | Debug logs |
+| `LOG_LEVEL=3` | Trace logs |
+
+Example:
+
+```sh
+make image LOG_LEVEL=2
+```
+
 Some QEMU CPU/backend combinations only expose a 32-bit physical address space.
 On `virt`, RAM starts at `0x40000000`, so those combinations can boot up to
 about `3072M`. Use a CPU/backend with wider physical addresses before trying
@@ -75,6 +90,8 @@ Available commands:
 | `mem` | Show RAM and kernel heap usage |
 | `vmmap` | Show the shell task's virtual memory areas |
 | `capstat` | Show the shell task's Orange Cat capability slots |
+| `debug` | Show kernel build/runtime debug information |
+| `smoke` | Run bounded core regression checks |
 | `lazy` | Check lazy mmap and syscall usercopy into lazy memory |
 | `ipcfast` | Test 0/8/64/128-byte register IPC payloads |
 | `ipccap` | Transfer an endpoint capability through IPC and use it |
@@ -161,6 +178,9 @@ wait 4
 - Initializes exceptions, the MMU, ACPI hardware discovery, GICv2, and the ARM
   generic timer at a 1 kHz scheduler tick.
 - Uses a 39-bit lower-half identity map with 40-bit physical-address support.
+- Early MMU page-table setup uses scalar volatile stores and explicit barriers,
+  so boot correctness does not depend on logging side effects or compiler loop
+  vectorization.
 - Supports per-user address spaces with allocated ASIDs in `TTBR0_EL1`,
   targeted TLB invalidation, and flush-on-ASID-reuse.
 
@@ -257,10 +277,15 @@ wait 4
 
 - Interactive shell with dynamically growing job table.
 - Shell-side job tracking for spawned children.
+- `debug` reports build log level, scheduler tick rate, task capacity, ASID
+  limit, stack growth limit, current VMA table use, cap slots, and memory-cap
+  table use.
+- `smoke` runs bounded core checks for lazy memory, register IPC, invalid
+  pointers, stack growth, and the speed benchmark.
 - Implemented syscalls include sleep, spawn, spawn-file compatibility,
   spawn-exec, ipc-call, ipc-recv, ipc-reply, exit, kill, wait, poll, ps, mem,
   mmap, munmap, mem-export, mem-share, mem-transfer, mem-lend, mem-revoke,
-  uptime, fork, file-stat, file-mmap, and capstat.
+  uptime, fork, file-stat, file-mmap, capstat, and debug-info.
 
 ## User Programs
 
@@ -314,6 +339,9 @@ transfers boot-granted file or executable capabilities to clients.
 - Memory-cap object and mapping tables are fixed-size v1 tables.
 - Copy-on-write currently covers forked, writable, frame-backed user pages.
 - Terminal input is intentionally simple and ASCII-oriented.
+- `smoke` is intentionally bounded and does not include every destructive or
+  long-running regression; run `ipccap`, `ipckill`, `memshare`, `memxfer`, and
+  `memrevoke` directly for those specific paths.
 
 ## Good Next Steps
 
@@ -323,4 +351,5 @@ transfers boot-granted file or executable capabilities to clients.
 - Add real file-backed user program loading from FAT or another filesystem.
 - Add a nonblocking keyboard/event API for richer shell interaction.
 - Add job names and child creation metadata to kernel `ps`.
-- Add regression smoke scripts for QEMU once the workflow stabilizes.
+- Add host-side QEMU smoke scripts that drive `debug`, `smoke`, and the
+  heavier dedicated IPC/memory-cap commands with timeouts.

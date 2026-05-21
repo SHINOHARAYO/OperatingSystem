@@ -46,6 +46,7 @@
 #define SYS_CAPSTAT      38
 #define SYS_UPTIME_MS    39
 #define SYS_UPTIME_NS    40
+#define SYS_DEBUG_INFO   41
 
 #define EC_IABORT_LOWER_EL 0x20
 #define EC_PC_ALIGN_FAULT  0x22
@@ -151,6 +152,8 @@ void handle_sync(uint64_t *regs) {
             regs[0] = timer_get_uptime_ms();
         } else if (syscall_num == SYS_UPTIME_NS) {
             regs[0] = timer_get_uptime_ns();
+        } else if (syscall_num == SYS_DEBUG_INFO) {
+            sched_debug_info_syscall(regs);
         } else {
             uart_puts("Unknown Syscall: ");
             uart_hex(syscall_num);

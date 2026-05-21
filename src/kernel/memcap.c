@@ -484,6 +484,26 @@ void memcap_init(void) {
     }
 }
 
+uint32_t memcap_object_count(void) {
+    uint32_t count = 0;
+    for (uint32_t i = 1; i < MAX_MEM_OBJECTS; i++) {
+        if (mem_objects[i].present) {
+            count++;
+        }
+    }
+    return count;
+}
+
+uint32_t memcap_mapping_count(void) {
+    uint32_t count = 0;
+    for (uint32_t i = 1; i < MAX_MEM_MAPPINGS; i++) {
+        if (mem_mappings[i].present) {
+            count++;
+        }
+    }
+    return count;
+}
+
 void memcap_release_for_owner(uint32_t owner_tid) {
     if (owner_tid == 0) {
         return;

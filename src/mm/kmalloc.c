@@ -16,7 +16,7 @@ static inline uint64_t align_up(uint64_t addr, uint64_t align) {
 }
 
 void kmalloc_init(void) {
-    LOG_INFO_HEX("KMALLOC: Initializing Kernel Heap (Bump Allocator) at ", HEAP_START_VA);
+    LOG_DEBUG_HEX("KMALLOC: Initializing Kernel Heap at ", HEAP_START_VA);
 }
 
 void *kmalloc(uint64_t size) {

@@ -47,8 +47,8 @@ int initrd_init(const void *data, uint64_t size) {
     initrd_header = header;
     initrd_entries = entries;
 
-    LOG_OK_HEX("INITRD: Loaded image bytes: ", initrd_size);
-    LOG_INFO_HEX("INITRD: File count: ", header->file_count);
+    LOG_DEBUG_HEX("INITRD: Loaded image bytes: ", initrd_size);
+    LOG_OK_HEX("INITRD: File count: ", header->file_count);
     return 0;
 }
 

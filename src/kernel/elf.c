@@ -33,8 +33,8 @@ uint64_t elf_load(const uint8_t *elf_data, uint64_t elf_size, uint64_t *pgd, uin
         return 0;
     }
 
-    LOG_INFO_HEX("ELF: Entry point:    ", ehdr->e_entry);
-    LOG_INFO_HEX("ELF: Program headers: ", ehdr->e_phnum);
+    LOG_DEBUG_HEX("ELF: Entry point:    ", ehdr->e_entry);
+    LOG_DEBUG_HEX("ELF: Program headers: ", ehdr->e_phnum);
 
     if (ehdr->e_phentsize < sizeof(Elf64_Phdr) || ehdr->e_phoff > elf_size) {
         LOG_FAIL("ELF: Invalid program header table.");
@@ -55,9 +55,9 @@ uint64_t elf_load(const uint8_t *elf_data, uint64_t elf_size, uint64_t *pgd, uin
         const Elf64_Phdr *phdr = (const Elf64_Phdr *)(elf_data + ph_offset);
         if (phdr->p_type != PT_LOAD) continue;
 
-        LOG_INFO_HEX("ELF: Loading segment at vaddr: ", phdr->p_vaddr);
-        LOG_INFO_HEX("ELF:   filesz: ", phdr->p_filesz);
-        LOG_INFO_HEX("ELF:   memsz:  ", phdr->p_memsz);
+        LOG_DEBUG_HEX("ELF: Loading segment at vaddr: ", phdr->p_vaddr);
+        LOG_DEBUG_HEX("ELF:   filesz: ", phdr->p_filesz);
+        LOG_DEBUG_HEX("ELF:   memsz:  ", phdr->p_memsz);
 
         if (phdr->p_memsz < phdr->p_filesz) {
             LOG_FAIL("ELF: Segment memsz smaller than filesz.");

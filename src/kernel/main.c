@@ -38,12 +38,12 @@ void neptune_kmain(void *memory_map, uint64_t map_size, uint64_t desc_size,
   uart_puts("    Neptune Microkernel (AArch64)\n");
   uart_puts("========================================\n");
   LOG_OK("Serial Console Initialized.");
-  LOG_INFO("BootServices Exited. Kernel in full control.");
-  LOG_INFO_HEX("neptune_kmain loaded at: ", (uint64_t)neptune_kmain);
+  LOG_OK("BootServices exited.");
+  LOG_DEBUG_HEX("neptune_kmain loaded at: ", (uint64_t)neptune_kmain);
   uint64_t current_el;
   __asm__ volatile("mrs %0, CurrentEL" : "=r"(current_el));
   current_el = (current_el >> 2) & 0x3;
-  LOG_INFO_HEX("Current Exception Level (EL): ", current_el);
+  LOG_DEBUG_HEX("Current Exception Level (EL): ", current_el);
 
   if (current_el != 1) {
     LOG_WARN("Not in EL1!");
@@ -59,14 +59,14 @@ void neptune_kmain(void *memory_map, uint64_t map_size, uint64_t desc_size,
   exceptions_init();
   LOG_OK("Exceptions Initialized (VBAR_EL1 set).");
 
-  LOG_INFO("Enabling MMU...");
+  LOG_DEBUG("Enabling MMU...");
   mmu_init();
   LOG_OK("MMU is active. We are running with Virtual Memory mapped!");
 
-  LOG_INFO("Starting Physical Memory Manager (PMM)...");
+  LOG_DEBUG("Starting Physical Memory Manager (PMM)...");
   pmm_init(memory_map, map_size, desc_size);
 
-  LOG_INFO("Starting Frame Object Manager...");
+  LOG_DEBUG("Starting Frame Object Manager...");
   if (frame_init() < 0) {
     LOG_FAIL("Cannot continue without frame objects.");
     while (1) {
@@ -74,16 +74,16 @@ void neptune_kmain(void *memory_map, uint64_t map_size, uint64_t desc_size,
     }
   }
 
-  LOG_INFO("Starting Virtual Memory Manager (VMM)...");
+  LOG_DEBUG("Starting Virtual Memory Manager (VMM)...");
   vmm_init();
 
-  LOG_INFO("Starting Page Cache...");
+  LOG_DEBUG("Starting Page Cache...");
   page_cache_init();
 
-  LOG_INFO("Starting VM Object Manager...");
+  LOG_DEBUG("Starting VM Object Manager...");
   vm_object_init();
 
-  LOG_INFO("Starting Kernel Heap (kmalloc)...");
+  LOG_DEBUG("Starting Kernel Heap (kmalloc)...");
   kmalloc_init();
   typedef struct {
     uint64_t a;
@@ -94,27 +94,26 @@ void neptune_kmain(void *memory_map, uint64_t map_size, uint64_t desc_size,
   if (ts) {
     ts->a = 0x1111222233334444ULL;
     ts->b = 0xAAAABBBBCCCCDDDDULL;
-    LOG_OK_HEX("Allocated kmalloc struct at VA: ", ts);
-    LOG_INFO_HEX("Struct Field A: ", ts->a);
-    LOG_INFO_HEX("Struct Field B: ", ts->b);
-    LOG_OK("kmalloc test PASSED!");
+    LOG_DEBUG_HEX("Allocated kmalloc struct at VA: ", ts);
+    LOG_DEBUG_HEX("Struct Field A: ", ts->a);
+    LOG_DEBUG_HEX("Struct Field B: ", ts->b);
+    LOG_DEBUG("kmalloc test passed.");
   } else {
     LOG_FAIL("kmalloc test FAILED!");
   }
 
-  LOG_INFO("Starting ACPI Parsing for Hardware Discovery...");
+  LOG_DEBUG("Starting ACPI Parsing for Hardware Discovery...");
   if (acpi_init(rsdp_ptr) < 0) {
     LOG_FAIL("Failed to parse ACPI tables!");
   }
 
-  LOG_INFO("Starting Generic Interrupt Controller (GICv2)...");
+  LOG_DEBUG("Starting Generic Interrupt Controller (GICv2)...");
   gic_init();
 
-  LOG_INFO("Starting Task Scheduler...");
+  LOG_DEBUG("Starting Task Scheduler...");
   sched_init();
 
-  // Extract these fucking user service ELF blobs and instance them inside Ring 3.
-  // TID assignment order matters for bootstrap: name server=1, don't fuck this up!
+  // TID assignment order matters for bootstrap: name server=1.
 
   const uint8_t *ns_elf = 0;
   uint64_t ns_elf_len = 0;
@@ -123,7 +122,7 @@ void neptune_kmain(void *memory_map, uint64_t map_size, uint64_t desc_size,
     while (1) __asm__ volatile("wfi");
   }
 
-  LOG_INFO_HEX("Creating Name Server ELF Blob Size: ", ns_elf_len);
+  LOG_DEBUG_HEX("Creating Name Server ELF Blob Size: ", ns_elf_len);
   sched_create_user_task(ns_elf, ns_elf_len, 5);
 
   const uint8_t *uart_elf = 0;
@@ -133,7 +132,7 @@ void neptune_kmain(void *memory_map, uint64_t map_size, uint64_t desc_size,
     while (1) __asm__ volatile("wfi");
   }
 
-  LOG_INFO_HEX("Creating UART Server ELF Blob Size: ", uart_elf_len);
+  LOG_DEBUG_HEX("Creating UART Server ELF Blob Size: ", uart_elf_len);
   int uart_tid = sched_create_user_task(uart_elf, uart_elf_len, 5);
 
   // Grant the UART server EL0 access to the PL011 UART MMIO page.
@@ -153,7 +152,7 @@ void neptune_kmain(void *memory_map, uint64_t map_size, uint64_t desc_size,
     while (1) __asm__ volatile("wfi");
   }
 
-  LOG_INFO_HEX("Creating Keyboard Server ELF Blob Size: ", keyboard_elf_len);
+  LOG_DEBUG_HEX("Creating Keyboard Server ELF Blob Size: ", keyboard_elf_len);
   int kb_tid = sched_create_user_task(keyboard_elf, keyboard_elf_len, 5);
 
   // Grant the Keyboard server EL0 access to the PL011 UART MMIO page.
@@ -173,7 +172,7 @@ void neptune_kmain(void *memory_map, uint64_t map_size, uint64_t desc_size,
     while (1) __asm__ volatile("wfi");
   }
 
-  LOG_INFO_HEX("Creating FS Server ELF Blob Size: ", fs_elf_len);
+  LOG_DEBUG_HEX("Creating FS Server ELF Blob Size: ", fs_elf_len);
   int fs_tid = sched_create_user_task(fs_elf, fs_elf_len, 5);
   if (fs_tid < 0) {
     LOG_FAIL("Failed to create FS server.");
@@ -203,7 +202,7 @@ void neptune_kmain(void *memory_map, uint64_t map_size, uint64_t desc_size,
     while (1) __asm__ volatile("wfi");
   }
 
-  LOG_INFO_HEX("Creating Shell ELF Blob Size: ", shell_elf_len);
+  LOG_DEBUG_HEX("Creating Shell ELF Blob Size: ", shell_elf_len);
   sched_create_user_task(shell_elf, shell_elf_len, 10);
 
   LOG_INFO("Starting ARM Generic Timer (1kHz)...");
@@ -308,9 +307,7 @@ EFI_STATUS efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable) {
   EFI_STATUS STATUS = SystemTable->BootServices->GetMemoryMap(
       &MemoryMapSize, MemoryMap, &MapKey, &DescriptorSize, &DescriptorVersion);
 
-  // Normally we should allocate `MemoryMapSize + buffer` to ensure it fucking fits
-  // after alloc changes the memory map. Let's allocate a static buffer for
-  // simplicity because we are fucking lazy.
+  // Keep a static buffer large enough for the UEFI memory map snapshot.
   static uint8_t mmap_buf[8192];
   MemoryMapSize = sizeof(mmap_buf);
   MemoryMap = (EFI_MEMORY_DESCRIPTOR *)mmap_buf;
@@ -323,9 +320,7 @@ EFI_STATUS efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable) {
   }
   STATUS = SystemTable->BootServices->ExitBootServices(ImageHandle, MapKey);
   if (STATUS != EFI_SUCCESS) {
-    // A fucking common issue: some shit triggered a timer and changed the memory map
-    // between GetMemoryMap and ExitBootServices.
-    // Try one more time.
+    // Retry once in case the memory map changed before ExitBootServices.
     MemoryMapSize = sizeof(mmap_buf);
     STATUS = SystemTable->BootServices->GetMemoryMap(&MemoryMapSize, MemoryMap,
                                                      &MapKey, &DescriptorSize,

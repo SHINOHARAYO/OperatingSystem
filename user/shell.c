@@ -11,6 +11,7 @@
 #define FAULT_FILE "fault.elf"
 #define SPIN_FILE "spin.elf"
 #define BADPTR_FILE "badptr.elf"
+#define STACKGROW_FILE "stackgrow.elf"
 #define MEMSHARE_FILE "memshare.elf"
 #define MEMXFER_FILE "memxfer.elf"
 #define MEMREVOKE_FILE "memrevoke.elf"
@@ -43,6 +44,7 @@ static int last_spawn_endpoint_cap = -1;
 static void print_wait_result(wait_info_t info);
 static uint32_t spawn_program(const char *name, uint8_t priority);
 static int open_file_cap(const char *name);
+static wait_info_t poll_until_done(uint32_t tid, uint32_t attempts, uint64_t sleep_ms);
 
 static int ensure_job_capacity(uint32_t min_capacity) {
   if (job_capacity >= min_capacity) {
@@ -211,6 +213,39 @@ static void print_capstat(void) {
     }
     printf("\n");
   }
+}
+
+static const char *log_level_name(uint32_t level) {
+  switch (level) {
+    case 0: return "quiet";
+    case 1: return "info";
+    case 2: return "debug";
+    case 3: return "trace";
+    default: return "custom";
+  }
+}
+
+static void print_debug_info(void) {
+  debug_info_t info = sys_debug_info();
+  cap_info_t first_cap = sys_capstat(0);
+  memory_info_t mem = sys_mem();
+
+  printf("KERNEL\n");
+  printf("  log-level: %u (%s)\n", info.log_level, log_level_name(info.log_level));
+  printf("  scheduler: CPU0 O(1) MLFQ, %u Hz tick\n", info.tick_hz);
+  printf("  task-capacity: %u slots\n", info.task_capacity);
+  printf("  max-user-asids: %u\n", info.max_user_asids);
+
+  printf("MEMORY\n");
+  printf("  free-ram: %lu KiB\n", mem.free_memory / 1024);
+  printf("  heap-used: %lu KiB / %lu KiB\n", mem.heap_used / 1024, mem.heap_size / 1024);
+  printf("  user-stack-max: %lu KiB\n", info.user_stack_max_size / 1024);
+  printf("  current-vmas: %u / %u\n", info.current_vma_count, info.current_vma_capacity);
+
+  printf("CAPABILITIES\n");
+  printf("  current-cap-slots: %u\n", first_cap.capacity);
+  printf("  memory-objects: %u / %u\n", info.active_mem_objects, info.max_mem_objects);
+  printf("  memory-mappings: %u / %u\n", info.active_mem_mappings, info.max_mem_mappings);
 }
 
 static void print_vmmap(void) {
@@ -805,11 +840,15 @@ static void run_ipccap_demo(void) {
   int ok = reply.status == 0 && reply.payload[0] == 1 &&
            cap_status.reason == TASK_TERM_EXITED && cap_status.exit_code == 0;
 
-  sys_kill(pong_tid);
-  wait_info_t pong_status = sys_wait(pong_tid);
+  int kill_result = sys_kill(pong_tid);
+  wait_info_t pong_poll = poll_until_done(pong_tid, 20, 50);
   printf("ipccap: %s reply=%lu\n", ok ? "ok" : "failed", reply.payload[1]);
   print_wait_result(cap_status);
-  print_wait_result(pong_status);
+  if (pong_poll.status == WAIT_STATUS_DONE) {
+    print_wait_result(sys_wait(pong_tid));
+  } else {
+    printf("ipccap: pong cleanup pending kill=%d\n", kill_result);
+  }
 }
 
 static int setup_ipckill_task(uint32_t tid, int endpoint_cap, uint64_t mode) {
@@ -934,6 +973,36 @@ static void run_ipckill_demo(void) {
   printf("ipckill: %s server=%d caller=%d recv=%d\n",
          (ok_server_kill && ok_caller_kill && ok_recv_kill) ? "ok" : "failed",
          ok_server_kill, ok_caller_kill, ok_recv_kill);
+}
+
+static int run_and_expect_exit(const char *name) {
+  uint32_t tid = spawn_program(name, PONG_PRIORITY);
+  if ((int)tid < 0) {
+    printf("smoke: %s spawn failed\n", name);
+    return -1;
+  }
+
+  wait_info_t status = sys_wait(tid);
+  int ok = status.reason == TASK_TERM_EXITED && status.exit_code == 0;
+  printf("smoke: %s %s\n", name, ok ? "ok" : "failed");
+  if (!ok) {
+    print_wait_result(status);
+    return -1;
+  }
+  return 0;
+}
+
+static void run_smoke_demo(void) {
+  int failures = 0;
+
+  printf("smoke: starting\n");
+  run_lazy_memory_check();
+  run_ipcfast_demo();
+  if (run_and_expect_exit(BADPTR_FILE) < 0) failures++;
+  if (run_and_expect_exit(STACKGROW_FILE) < 0) failures++;
+  if (run_and_expect_exit(SPEED_FILE) < 0) failures++;
+
+  printf("smoke: %s failures=%d\n", failures == 0 ? "done" : "failed", failures);
 }
 
 static int get_keyboard_cap(void) {
@@ -1090,6 +1159,8 @@ void _start(void) {
         printf("  mem           Show memory usage\n");
         printf("  vmmap         Show this task's VMAs\n");
         printf("  capstat       Show this task's capability slots\n");
+        printf("  debug         Show kernel build/runtime debug info\n");
+        printf("  smoke         Run core regression smoke checks\n");
         printf("  lazy          Check lazy mmap and syscall usercopy\n");
         printf("  ipcfast       Test 0/8/64/128-byte register IPC\n");
         printf("  ipccap        Transfer an endpoint cap through IPC\n");
@@ -1220,6 +1291,12 @@ void _start(void) {
 
       } else if (_streq(cmd, "capstat")) {
         print_capstat();
+
+      } else if (_streq(cmd, "debug")) {
+        print_debug_info();
+
+      } else if (_streq(cmd, "smoke")) {
+        run_smoke_demo();
 
       } else if (_streq(cmd, "lazy")) {
         run_lazy_memory_check();

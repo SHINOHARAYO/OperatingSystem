@@ -67,7 +67,7 @@ static uint64_t gicd_base = 0;
 static uint64_t gicc_base = 0;
 
 static int parse_madt(ACPI_MADT *madt) {
-    LOG_INFO_HEX("ACPI: Parsing MADT at: ", madt);
+    LOG_DEBUG_HEX("ACPI: Parsing MADT at: ", madt);
 
     uint8_t *ptr = (uint8_t *)madt + sizeof(ACPI_MADT);
     uint8_t *end = (uint8_t *)madt + madt->Header.Length;
@@ -78,7 +78,7 @@ static int parse_madt(ACPI_MADT *madt) {
         if (sub->Type == MADT_TYPE_GIC_DISTRIBUTOR) {
             ACPI_MADT_GICD *gicd = (ACPI_MADT_GICD *)sub;
             gicd_base = gicd->PhysicalBaseAddress;
-            LOG_INFO_HEX("ACPI: Found GIC Distributor Base: ", gicd_base);
+            LOG_DEBUG_HEX("ACPI: Found GIC Distributor Base: ", gicd_base);
         } 
         else if (sub->Type == MADT_TYPE_GIC_CPU_INTERFACE) {
             ACPI_MADT_GICC *gicc = (ACPI_MADT_GICC *)sub;
@@ -86,7 +86,7 @@ static int parse_madt(ACPI_MADT *madt) {
             // so we can just read the first one we find.
             if (gicc_base == 0 && gicc->PhysicalBaseAddress != 0) {
                 gicc_base = gicc->PhysicalBaseAddress;
-                LOG_INFO_HEX("ACPI: Found GIC CPU Interface Base: ", gicc_base);
+                LOG_DEBUG_HEX("ACPI: Found GIC CPU Interface Base: ", gicc_base);
             }
         }
 
@@ -106,7 +106,7 @@ int acpi_init(void *rsdp_ptr) {
     if (!rsdp_ptr) return -1;
     
     ACPI_RSDP *rsdp = (ACPI_RSDP *)rsdp_ptr;
-    LOG_INFO_HEX("ACPI: Found RSDP at: ", rsdp);
+    LOG_DEBUG_HEX("ACPI: Found RSDP at: ", rsdp);
 
     // XSDT has 64-bit pointers. RSDT has 32-bit pointers. UEFI standard uses XSDT.
     if (rsdp->XsdtAddress == 0) {
@@ -115,7 +115,7 @@ int acpi_init(void *rsdp_ptr) {
     }
 
     ACPI_HEADER *xsdt = (ACPI_HEADER *)rsdp->XsdtAddress;
-    LOG_INFO_HEX("ACPI: Parsing XSDT at: ", xsdt);
+    LOG_DEBUG_HEX("ACPI: Parsing XSDT at: ", xsdt);
 
     int entries = (xsdt->Length - sizeof(ACPI_HEADER)) / 8;
     uint64_t *pointers = (uint64_t *)((uint8_t *)xsdt + sizeof(ACPI_HEADER));

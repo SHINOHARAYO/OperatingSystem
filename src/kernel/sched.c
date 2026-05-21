@@ -347,7 +347,7 @@ static int grow_task_tables(uint32_t min_capacity) {
         pmm_free_contiguous_pages(old_records, old_term_pages);
     }
 
-    LOG_INFO_HEX("SCHED: Task table capacity: ", task_capacity);
+    LOG_DEBUG_HEX("SCHED: Task table capacity: ", task_capacity);
     return 0;
 }
 
@@ -1240,7 +1240,7 @@ static __attribute__((noreturn)) void terminate_current_task(uint32_t reason, in
 }
 
 void sched_init(void) {
-    LOG_INFO("SCHED: Initializing O(1) MLFQ Scheduler...");
+    LOG_DEBUG("SCHED: Initializing O(1) MLFQ Scheduler...");
 
     for (uint32_t i = 0; i <= MAX_USER_ASIDS; i++) {
         asid_in_use[i] = 0;
@@ -1347,7 +1347,7 @@ int sched_create_task(void (*entry_point)(void), uint8_t priority) {
     install_standard_caps(tcb);
     sched_make_ready(tcb);
 
-    LOG_INFO_HEX("SCHED: Created new kernel task. TID = ", tcb->tid);
+    LOG_DEBUG_HEX("SCHED: Created new kernel task. TID = ", tcb->tid);
     
     return tcb->tid;
 }
@@ -1458,8 +1458,8 @@ static int create_user_task_with_file_cap(const uint8_t *elf_data, uint64_t elf_
     tcb->sp_el0 = USER_STACK_TOP;
     sched_make_ready(tcb);
     
-    LOG_INFO_HEX("SCHED: Created new USER task (Ring 3). TID = ", tcb->tid);
-    LOG_INFO_HEX("SCHED:   ELF Entry Point: ", entry_point);
+    LOG_DEBUG_HEX("SCHED: Created new user task. TID = ", tcb->tid);
+    LOG_DEBUG_HEX("SCHED:   ELF entry point: ", entry_point);
     
     return tcb->tid;
 
@@ -1789,7 +1789,7 @@ void sched_mmap_syscall(uint64_t *regs, uint64_t size) {
 
     current_task->user_heap_pointer += aligned_size;
 
-    LOG_INFO_HEX("SCHED: mmap reserved lazy user memory at VA: ", start_va);
+    LOG_DEBUG_HEX("SCHED: mmap reserved lazy user memory at VA: ", start_va);
 
     regs[0] = start_va;
     return;
@@ -1934,7 +1934,7 @@ int sched_spawn_syscall(uint64_t *regs, uint64_t elf_data, uint64_t elf_size, ui
     }
 
     if (user_range_readable(elf_data, (size_t)elf_size) < 0) {
-        LOG_WARN("SCHED: spawn rejected invalid user ELF pointer.");
+        LOG_DEBUG("SCHED: spawn rejected invalid user ELF pointer.");
         if (regs) regs[0] = (uint64_t)-1;
         return -1;
     }
@@ -1962,7 +1962,7 @@ int sched_spawn_file_syscall(uint64_t *regs, uint64_t name_ptr, uint8_t priority
 
     char name[64];
     if (copy_string_from_user(name, sizeof(name), name_ptr) < 0) {
-        LOG_WARN("SCHED: spawn_file rejected invalid user filename pointer.");
+        LOG_DEBUG("SCHED: spawn_file rejected invalid user filename pointer.");
         if (regs) regs[0] = (uint64_t)-1;
         return -1;
     }
@@ -1972,7 +1972,7 @@ int sched_spawn_file_syscall(uint64_t *regs, uint64_t name_ptr, uint8_t priority
     uint32_t initrd_index = 0;
     if (initrd_find_index(name, &initrd_index) < 0 ||
         initrd_get_file(initrd_index, &elf_data, &elf_size) < 0) {
-        LOG_WARN("SCHED: initrd file not found.");
+        LOG_DEBUG("SCHED: initrd file not found.");
         if (regs) regs[0] = (uint64_t)-1;
         return -1;
     }
@@ -2143,6 +2143,22 @@ void sched_capstat_syscall(uint64_t *regs, uint32_t slot) {
     regs[5] = cap.flags;
 }
 
+void sched_debug_info_syscall(uint64_t *regs) {
+    if (!regs) {
+        return;
+    }
+
+    regs[0] = LOG_LEVEL;
+    regs[1] = 1000;
+    regs[2] = task_capacity;
+    regs[3] = MAX_USER_ASIDS;
+    regs[4] = USER_STACK_MAX_SIZE;
+    regs[5] = ((uint64_t)MAX_MEM_OBJECTS << 32) | MAX_MEM_MAPPINGS;
+    regs[6] = ((uint64_t)memcap_object_count() << 32) | memcap_mapping_count();
+    regs[7] = current_task ? (((uint64_t)current_task->vm.count << 32) |
+                              current_task->vm.capacity) : 0;
+}
+
 void sched_vmmap_syscall(uint64_t *regs, uint32_t index) {
     if (!regs || !current_task || !current_task->pgd) {
         if (regs) regs[0] = 0;
@@ -2311,7 +2327,7 @@ int sched_kill_syscall(uint64_t *regs, uint32_t tid) {
         return -1;
     }
 
-    LOG_INFO_HEX("SCHED: Killing task. TID = ", tid);
+    LOG_DEBUG_HEX("SCHED: Killing task. TID = ", tid);
     if (regs) regs[0] = 0;
 
     if (target == current_task) {
@@ -2367,9 +2383,9 @@ void sched_fault_current_task(uint64_t esr, uint64_t elr, uint64_t far) {
     } else if (vma->flags & VMA_GUARD) {
         LOG_WARN("SCHED: Fault address hit a guard VMA.");
     } else {
-        LOG_INFO_HEX("SCHED: Fault VMA start: ", vma->start);
-        LOG_INFO_HEX("SCHED: Fault VMA end: ", vma->end);
-        LOG_INFO_HEX("SCHED: Fault VMA flags: ", vma->flags);
+        LOG_DEBUG_HEX("SCHED: Fault VMA start: ", vma->start);
+        LOG_DEBUG_HEX("SCHED: Fault VMA end: ", vma->end);
+        LOG_DEBUG_HEX("SCHED: Fault VMA flags: ", vma->flags);
     }
 
     terminate_current_task(TASK_TERM_FAULTED, -1, esr, elr, fault_va);
@@ -2384,8 +2400,8 @@ void sched_exit_syscall(uint64_t *regs, int exit_code) {
     (void)regs;
     if (!current_task) return;
 
-    LOG_INFO_HEX("SCHED: Task exited. TID = ", current_task->tid);
-    LOG_INFO_HEX("SCHED: Exit code: ", exit_code);
+    LOG_DEBUG_HEX("SCHED: Task exited. TID = ", current_task->tid);
+    LOG_DEBUG_HEX("SCHED: Exit code: ", exit_code);
 
     terminate_current_task(TASK_TERM_EXITED, exit_code, 0, 0, 0);
 }

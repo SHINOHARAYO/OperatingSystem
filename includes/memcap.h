@@ -7,6 +7,8 @@
 #define MAX_MEM_MAPPINGS 128
 
 void memcap_init(void);
+uint32_t memcap_object_count(void);
+uint32_t memcap_mapping_count(void);
 void memcap_release_for_owner(uint32_t owner_tid);
 void memcap_forget_mappings_for_target(uint32_t target_tid);
 void memcap_forget_mappings_overlapping_target(uint32_t target_tid,

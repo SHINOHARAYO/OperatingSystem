@@ -19,10 +19,10 @@ static uint64_t timer_base_count;
 static uint64_t ticks = 0;
 
 void timer_init(void) {
-    LOG_INFO("TIMER: Initializing ARM Generic Timer...");
+    LOG_DEBUG("TIMER: Initializing ARM Generic Timer...");
     __asm__ volatile("mrs %0, cntfrq_el0" : "=r"(timer_freq_hz));
     __asm__ volatile("mrs %0, cntpct_el0" : "=r"(timer_base_count));
-    LOG_INFO_HEX("TIMER: Frequency (Hz): ", timer_freq_hz);
+    LOG_DEBUG_HEX("TIMER: Frequency (Hz): ", timer_freq_hz);
 
     if (timer_freq_hz == 0) {
         LOG_FAIL("TIMER PANIC: Timer frequency is zero!");
@@ -37,7 +37,7 @@ void timer_init(void) {
     __asm__ volatile("msr cntp_ctl_el0, %0" : : "r"(1ULL));
     gic_enable_interrupt(TIMER_IRQ);
 
-    LOG_OK("TIMER: Generic Timer Enabled and Interrupt unmasked.");
+    LOG_OK("TIMER: Generic Timer Enabled at 1 kHz.");
 }
 
 void timer_handle_interrupt(void) {

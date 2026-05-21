@@ -20,7 +20,7 @@ static int bitmap_test(uint64_t bit) {
 }
 
 void pmm_init(void *memory_map, uint64_t map_size, uint64_t desc_size) {
-    LOG_INFO("PMM: Parsing UEFI Memory Map...");
+    LOG_DEBUG("PMM: Parsing UEFI Memory Map...");
 
     uint64_t highest_address = 0;
     uint64_t lowest_address = 0xFFFFFFFFFFFFFFFF;
@@ -48,8 +48,8 @@ void pmm_init(void *memory_map, uint64_t map_size, uint64_t desc_size) {
     uint64_t bitmap_size_bytes = total_pages / 8;
     if (total_pages % 8) bitmap_size_bytes++;
 
-    LOG_INFO_HEX("PMM: Total Ram Extent: ", highest_address - lowest_address);
-    LOG_INFO_HEX("PMM: Bitmap Size needed (bytes): ", bitmap_size_bytes);
+    LOG_DEBUG_HEX("PMM: Total Ram Extent: ", highest_address - lowest_address);
+    LOG_DEBUG_HEX("PMM: Bitmap Size needed (bytes): ", bitmap_size_bytes);
     if (largest_free_pages * PAGE_SIZE < bitmap_size_bytes) {
         LOG_FAIL("PMM PANIC: Not enough contiguous memory for Bitmap!");
         while(1);
