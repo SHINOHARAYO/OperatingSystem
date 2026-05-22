@@ -12,6 +12,7 @@
 #include "initrd.h"
 #include "usercopy.h"
 #include "memcap.h"
+#include "vfs.h"
 #include <stdbool.h>
 
 extern uint64_t l1_table[512];
@@ -284,6 +285,7 @@ static void init_free_task_slot(tcb_t *task) {
     ready_queue_reset_task(task);
     timer_queue_reset_task(task);
     sched_clear_ipc_state(task);
+    vfs_clear_task_state(task);
     clear_caps(task);
 }
 
@@ -544,6 +546,9 @@ static void rebuild_scheduler_queues_after_task_move(void) {
         tasks[i].ipc_next = NULL;
         tasks[i].ipc_call_head = NULL;
         tasks[i].ipc_call_tail = NULL;
+        tasks[i].vfs_next = NULL;
+        tasks[i].vfs_call_head = NULL;
+        tasks[i].vfs_call_tail = NULL;
         if (tasks[i].state == TASK_STATE_READY && tasks[i].tid != 0) {
             ready_enqueue_tail(&tasks[i]);
         }
@@ -570,6 +575,24 @@ static void rebuild_scheduler_queues_after_task_move(void) {
             endpoint->ipc_call_head = &tasks[i];
         }
         endpoint->ipc_call_tail = &tasks[i];
+    }
+
+    for (uint32_t i = 0; i < task_capacity; i++) {
+        if (tasks[i].state != TASK_STATE_BLOCKED_ON_VFS_CALL ||
+            tasks[i].vfs_reply_tid == 0) {
+            continue;
+        }
+        tcb_t *fs = get_tcb(tasks[i].vfs_reply_tid);
+        if (!fs || fs->vfs_active_client_tid == tasks[i].tid) {
+            continue;
+        }
+        tasks[i].vfs_next = NULL;
+        if (fs->vfs_call_tail) {
+            fs->vfs_call_tail->vfs_next = &tasks[i];
+        } else {
+            fs->vfs_call_head = &tasks[i];
+        }
+        fs->vfs_call_tail = &tasks[i];
     }
 }
 
@@ -1051,6 +1074,7 @@ static void destroy_task(tcb_t *task) {
     unlink_queued_ipc_call(task);
     wake_ipc_peers(task->tid);
     invalidate_reply_caps_for_caller(task->tid);
+    vfs_task_died(task->tid);
     memcap_release_for_owner(task->tid);
     memcap_forget_mappings_for_target(task->tid);
 
@@ -1078,6 +1102,7 @@ static void destroy_task(tcb_t *task) {
     task->ipc_call_head = NULL;
     task->ipc_call_tail = NULL;
     sched_clear_ipc_state(task);
+    vfs_clear_task_state(task);
     task->awaiting_irq = 0;
     task->parent_tid = 0;
     task->wait_target_tid = 0;
@@ -1268,6 +1293,7 @@ void sched_init(void) {
     timer_queue_reset_task(&tasks[0]);
     tasks[0].ipc_target_tid = 0;
     sched_clear_ipc_state(&tasks[0]);
+    vfs_clear_task_state(&tasks[0]);
     tasks[0].awaiting_irq = 0;
     tasks[0].parent_tid = 0;
     tasks[0].wait_target_tid = 0;
@@ -1329,6 +1355,7 @@ int sched_create_task(void (*entry_point)(void), uint8_t priority) {
     ready_queue_reset_task(tcb);
     timer_queue_reset_task(tcb);
     sched_clear_ipc_state(tcb);
+    vfs_clear_task_state(tcb);
     tcb->awaiting_irq = 0;
     tcb->parent_tid = 0;
     tcb->wait_target_tid = 0;
@@ -1417,6 +1444,7 @@ static int create_user_task_with_file_cap(const uint8_t *elf_data, uint64_t elf_
     timer_queue_reset_task(tcb);
     
     sched_clear_ipc_state(tcb);
+    vfs_clear_task_state(tcb);
     tcb->awaiting_irq = 0;
     tcb->parent_tid = 0;
     tcb->wait_target_tid = 0;
@@ -1663,6 +1691,11 @@ int sched_fork_syscall(uint64_t *regs) {
     ready_queue_reset_task(child);
     timer_queue_reset_task(child);
     sched_clear_ipc_state(child);
+    vfs_clear_task_state(child);
+    for (uint32_t i = 0; i < MAX_VFS_ROUTES; i++) {
+        child->vfs_ids[i] = current_task->vfs_ids[i];
+        child->vfs_tids[i] = current_task->vfs_tids[i];
+    }
     child->awaiting_irq = 0;
     child->parent_tid = current_task->tid;
     child->wait_target_tid = 0;
@@ -2014,6 +2047,39 @@ int sched_install_file_cap_at(uint32_t tid, uint32_t cap, uint32_t initrd_index)
 
     return install_cap_at(task, cap, OCAP_FILE, initrd_index,
                           OCAP_RIGHT_READ | OCAP_RIGHT_MAP | OCAP_RIGHT_TRANSFER, 0);
+}
+
+int sched_map_boot_data(uint32_t tid, const void *data, uint64_t size, uint64_t user_va) {
+    tcb_t *task = get_tcb(tid);
+    if (!task || !task->pgd || !data || size == 0 ||
+        ((uint64_t)data & (PAGE_SIZE - 1)) != 0 ||
+        (user_va & (PAGE_SIZE - 1)) != 0 ||
+        size > VMA_USER_LIMIT || user_va > VMA_USER_LIMIT ||
+        size > VMA_USER_LIMIT - user_va) {
+        return -1;
+    }
+
+    uint64_t aligned_size = (size + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1);
+    if (vma_add_ex(&task->vm, user_va, user_va + aligned_size,
+                   VMA_USER | VMA_READ | VMA_FILE,
+                   0, size, 0, VMA_BACKING_NONE, 0,
+                   aligned_size / PAGE_SIZE, aligned_size / PAGE_SIZE) < 0) {
+        return -1;
+    }
+
+    uint64_t src = (uint64_t)data;
+    for (uint64_t off = 0; off < aligned_size; off += PAGE_SIZE) {
+        if (vmm_map_page_asid(task->pgd, task->asid, user_va + off, src + off,
+                              VMM_FLAG_USER_CODE | PTE_READONLY) < 0) {
+            for (uint64_t undo = 0; undo < off; undo += PAGE_SIZE) {
+                vmm_unmap_page_asid(task->pgd, task->asid, user_va + undo);
+            }
+            vma_remove(&task->vm, user_va, user_va + aligned_size);
+            return -1;
+        }
+    }
+
+    return 0;
 }
 
 int sched_spawn_exec_syscall(uint64_t *regs, uint32_t exec_cap, uint8_t priority) {

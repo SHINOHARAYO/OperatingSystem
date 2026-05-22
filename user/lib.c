@@ -66,6 +66,38 @@ void *memset(void *dst, int value, uint64_t n) {
     return dst;
 }
 
+int memcmp(const void *a, const void *b, uint64_t n) {
+    const uint8_t *pa = (const uint8_t *)a;
+    const uint8_t *pb = (const uint8_t *)b;
+    for (uint64_t i = 0; i < n; i++) {
+        if (pa[i] != pb[i]) {
+            return (int)pa[i] - (int)pb[i];
+        }
+    }
+    return 0;
+}
+
+uint64_t strlen(const char *s) {
+    uint64_t len = 0;
+    while (s && s[len]) {
+        len++;
+    }
+    return len;
+}
+
+char *strchr(const char *s, int c) {
+    if (!s) {
+        return 0;
+    }
+    while (*s) {
+        if (*s == (char)c) {
+            return (char *)s;
+        }
+        s++;
+    }
+    return c == 0 ? (char *)s : 0;
+}
+
 void puts(const char *s) {
     int len = 0;
     while (s[len]) len++;

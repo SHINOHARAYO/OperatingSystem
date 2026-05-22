@@ -13,7 +13,7 @@ LDFLAGS  = -subsystem:efi_application -entry:efi_main
 
 OBJ = $(BUILD)/main.o $(BUILD)/uart.o $(BUILD)/exceptions.o $(BUILD)/mmu.o \
       $(BUILD)/pmm.o $(BUILD)/frame.o $(BUILD)/vmm.o $(BUILD)/vma.o $(BUILD)/vm_object.o $(BUILD)/page_cache.o $(BUILD)/kmalloc.o $(BUILD)/vectors.o \
-      $(BUILD)/gic.o $(BUILD)/timer.o $(BUILD)/acpi.o $(BUILD)/orange_cat.o $(BUILD)/ipc.o $(BUILD)/memcap.o $(BUILD)/sched.o \
+      $(BUILD)/gic.o $(BUILD)/timer.o $(BUILD)/acpi.o $(BUILD)/orange_cat.o $(BUILD)/ipc.o $(BUILD)/memcap.o $(BUILD)/vfs.o $(BUILD)/sched.o \
       $(BUILD)/elf.o $(BUILD)/initrd.o $(BUILD)/usercopy.o
 
 KERNEL_HEADERS := $(wildcard includes/*.h)
@@ -24,7 +24,7 @@ USER_ELFS      := $(BUILD)/shell.elf $(BUILD)/pong.elf $(BUILD)/fault.elf $(BUIL
                   $(BUILD)/uart.elf $(BUILD)/keyboard.elf $(BUILD)/ns.elf $(BUILD)/fs.elf
 
 USER_CFLAGS = -target aarch64-linux-gnu -ffreestanding -nostdlib -static -fno-builtin \
-              -Wl,-Ttext=0x80000000 -Wl,--entry=_start
+              -Ithird_party/fatfs -Wl,-Ttext=0x80000000 -Wl,--entry=_start
 
 # ── Top-level targets ────────────────────────────────────────────────────────
 
@@ -93,13 +93,19 @@ $(BUILD)/keyboard.elf: user/keyboard.c user/lib.h user/lib.c user/ns_proto.h use
 $(BUILD)/ns.elf: user/ns.c user/ns_proto.h user/ipc_proto.h user/lib.h user/lib.c | $(BUILD)
 	clang $(USER_CFLAGS) user/ns.c user/lib.c -o $(BUILD)/ns.elf
 
-$(BUILD)/fs.elf: user/fs.c user/fs_proto.h user/ns_proto.h user/ipc_proto.h user/lib.h user/lib.c | $(BUILD)
-	clang $(USER_CFLAGS) user/fs.c user/lib.c -o $(BUILD)/fs.elf
+$(BUILD)/fs.elf: user/fs.c user/fat_diskio.c user/fat_diskio.h user/fat_unicode.c user/fs_proto.h user/ns_proto.h user/ipc_proto.h user/lib.h user/lib.c user/malloc.h user/malloc.c third_party/fatfs/ff.c third_party/fatfs/ff.h third_party/fatfs/diskio.h third_party/fatfs/ffconf.h | $(BUILD)
+	clang $(USER_CFLAGS) user/fs.c user/fat_diskio.c user/fat_unicode.c user/lib.c user/malloc.c third_party/fatfs/ff.c -o $(BUILD)/fs.elf
 
 $(BUILD)/mkinitrd: tools/mkinitrd.c | $(BUILD)
 	cc tools/mkinitrd.c -o $(BUILD)/mkinitrd
 
-$(BUILD)/initrd.bin: $(BUILD)/mkinitrd user_apps | $(BUILD)
+$(BUILD)/apps.fat: user_apps | $(BUILD)
+	rm -f $(BUILD)/apps.fat
+	dd if=/dev/zero of=$(BUILD)/apps.fat bs=1M count=4
+	mkfs.fat -F 12 $(BUILD)/apps.fat
+	mcopy -i $(BUILD)/apps.fat $(USER_ELFS) ::/
+
+$(BUILD)/initrd.bin: $(BUILD)/mkinitrd user_apps $(BUILD)/apps.fat | $(BUILD)
 	$(BUILD)/mkinitrd $(BUILD)/initrd.bin \
 		$(BUILD)/shell.elf \
 		$(BUILD)/uart.elf \
@@ -118,7 +124,8 @@ $(BUILD)/initrd.bin: $(BUILD)/mkinitrd user_apps | $(BUILD)
 		$(BUILD)/ipccap.elf \
 		$(BUILD)/ipckill.elf \
 		$(BUILD)/speed.elf \
-		$(BUILD)/speedipc.elf
+		$(BUILD)/speedipc.elf \
+		$(BUILD)/apps.fat
 
 # ── Kernel object files ───────────────────────────────────────────────────────
 
@@ -138,6 +145,9 @@ $(BUILD)/ipc.o: src/kernel/ipc.c | $(BUILD)
 	$(CC) $(CFLAGS) -c $< -o $@
 
 $(BUILD)/memcap.o: src/kernel/memcap.c | $(BUILD)
+	$(CC) $(CFLAGS) -c $< -o $@
+
+$(BUILD)/vfs.o: src/kernel/vfs.c | $(BUILD)
 	$(CC) $(CFLAGS) -c $< -o $@
 
 $(BUILD)/elf.o: src/kernel/elf.c | $(BUILD)

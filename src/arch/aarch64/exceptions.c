@@ -6,6 +6,7 @@
 #include "sched.h"
 #include "ipc.h"
 #include "memcap.h"
+#include "vfs.h"
 #include "pmm.h"
 #include "kmalloc.h"
 
@@ -47,6 +48,11 @@
 #define SYS_UPTIME_MS    39
 #define SYS_UPTIME_NS    40
 #define SYS_DEBUG_INFO   41
+#define SYS_VFS_BIND     42
+#define SYS_VFS_CALL     43
+#define SYS_VFS_REPLY    44
+#define SYS_VFS_INJECT   45
+#define SYS_VFS_RECV     46
 
 #define EC_IABORT_LOWER_EL 0x20
 #define EC_PC_ALIGN_FAULT  0x22
@@ -154,6 +160,16 @@ void handle_sync(uint64_t *regs) {
             regs[0] = timer_get_uptime_ns();
         } else if (syscall_num == SYS_DEBUG_INFO) {
             sched_debug_info_syscall(regs);
+        } else if (syscall_num == SYS_VFS_BIND) {
+            vfs_bind_syscall(regs, (uint32_t)arg0, (uint32_t)arg1);
+        } else if (syscall_num == SYS_VFS_CALL) {
+            vfs_call_syscall(regs);
+        } else if (syscall_num == SYS_VFS_REPLY) {
+            vfs_reply_syscall(regs);
+        } else if (syscall_num == SYS_VFS_INJECT) {
+            vfs_inject_syscall(regs, (uint32_t)arg0, arg1, arg2);
+        } else if (syscall_num == SYS_VFS_RECV) {
+            vfs_recv_syscall(regs);
         } else {
             uart_puts("Unknown Syscall: ");
             uart_hex(syscall_num);

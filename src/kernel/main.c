@@ -28,8 +28,8 @@
       ;                                                                        \
   } while (0)
 
-#define INITRD_MAX_SIZE (2 * 1024 * 1024)
-static uint8_t initrd_storage[INITRD_MAX_SIZE];
+#define INITRD_MAX_SIZE (8 * 1024 * 1024)
+static uint8_t initrd_storage[INITRD_MAX_SIZE] __attribute__((aligned(4096)));
 
 void neptune_kmain(void *memory_map, uint64_t map_size, uint64_t desc_size,
                    void *rsdp_ptr, void *initrd_data, uint64_t initrd_size) {
@@ -178,19 +178,23 @@ void neptune_kmain(void *memory_map, uint64_t map_size, uint64_t desc_size,
     LOG_FAIL("Failed to create FS server.");
     while (1) __asm__ volatile("wfi");
   }
-
+  if (sched_map_boot_data((uint32_t)fs_tid, initrd_data, initrd_size,
+                          USER_BOOT_INITRD_BASE) < 0) {
+    LOG_FAIL("Failed to map boot initrd into FS server.");
+    while (1) __asm__ volatile("wfi");
+  }
   uint64_t initrd_count = initrd_file_count();
   for (uint32_t i = 0; i < initrd_count; i++) {
     if (sched_install_exec_cap_at((uint32_t)fs_tid,
                                   FS_BOOT_EXEC_CAP_BASE + i,
                                   i) < 0) {
-      LOG_FAIL("Failed to bootstrap FS executable capability.");
+      LOG_FAIL("Failed to bootstrap legacy FS executable capability.");
       while (1) __asm__ volatile("wfi");
     }
     if (sched_install_file_cap_at((uint32_t)fs_tid,
                                   FS_BOOT_FILE_CAP_BASE + i,
                                   i) < 0) {
-      LOG_FAIL("Failed to bootstrap FS file capability.");
+      LOG_FAIL("Failed to bootstrap legacy FS file capability.");
       while (1) __asm__ volatile("wfi");
     }
   }

@@ -166,6 +166,22 @@ typedef struct {
     int endpoint_cap;
 } spawn_result_t;
 
+typedef struct {
+    int status;
+    uint64_t value0;
+    uint64_t value1;
+    uint64_t value2;
+} vfs_reply_t;
+
+typedef struct {
+    int status;
+    uint32_t vfs_id;
+    uint32_t client_tid;
+    uint64_t arg0;
+    uint64_t arg1;
+    uint64_t arg2;
+} vfs_request_t;
+
 static inline ipc_msg_t sys_ipc_call(uint32_t cap, uint64_t flags, uint64_t len, const uint64_t payload[IPC_INLINE_WORDS]) {
     register uint64_t x0 asm("x0") = cap;
     register uint64_t x1 asm("x1") = flags;
@@ -819,6 +835,109 @@ static inline debug_info_t sys_debug_info(void) {
     info.current_vma_count = (uint32_t)(x7 >> 32);
     info.current_vma_capacity = (uint32_t)x7;
     return info;
+}
+
+static inline int sys_vfs_bind(uint32_t vfs_id, uint32_t endpoint_cap) {
+    register uint64_t x0 asm("x0") = vfs_id;
+    register uint64_t x1 asm("x1") = endpoint_cap;
+    register uint64_t x8 asm("x8") = 42;
+
+    asm volatile(
+        "svc #0"
+        : "+r" (x0)
+        : "r" (x1), "r" (x8)
+        : "memory"
+    );
+
+    return (int)x0;
+}
+
+static inline vfs_reply_t sys_vfs_call(uint32_t vfs_id,
+                                       uint64_t arg0,
+                                       uint64_t arg1,
+                                       uint64_t arg2) {
+    register uint64_t x0 asm("x0") = vfs_id;
+    register uint64_t x1 asm("x1") = arg0;
+    register uint64_t x2 asm("x2") = arg1;
+    register uint64_t x3 asm("x3") = arg2;
+    register uint64_t x8 asm("x8") = 43;
+
+    asm volatile(
+        "svc #0"
+        : "+r" (x0), "+r" (x1), "+r" (x2), "+r" (x3)
+        : "r" (x8)
+        : "memory"
+    );
+
+    vfs_reply_t reply;
+    reply.status = (int)x0;
+    reply.value0 = x1;
+    reply.value1 = x2;
+    reply.value2 = x3;
+    return reply;
+}
+
+static inline int sys_vfs_reply(int status,
+                                uint64_t value0,
+                                uint64_t value1,
+                                uint64_t value2) {
+    register uint64_t x0 asm("x0") = (uint64_t)status;
+    register uint64_t x1 asm("x1") = value0;
+    register uint64_t x2 asm("x2") = value1;
+    register uint64_t x3 asm("x3") = value2;
+    register uint64_t x8 asm("x8") = 44;
+
+    asm volatile(
+        "svc #0"
+        : "+r" (x0)
+        : "r" (x1), "r" (x2), "r" (x3), "r" (x8)
+        : "memory"
+    );
+
+    return (int)x0;
+}
+
+static inline void *sys_vfs_inject(uint32_t client_tid,
+                                   void *client_va,
+                                   uint64_t page_count) {
+    register uint64_t x0 asm("x0") = client_tid;
+    register uint64_t x1 asm("x1") = (uint64_t)client_va;
+    register uint64_t x2 asm("x2") = page_count;
+    register uint64_t x8 asm("x8") = 45;
+
+    asm volatile(
+        "svc #0"
+        : "+r" (x0), "+r" (x1), "+r" (x2)
+        : "r" (x8)
+        : "memory"
+    );
+
+    return (void *)x0;
+}
+
+static inline vfs_request_t sys_vfs_recv(void) {
+    register uint64_t x0 asm("x0");
+    register uint64_t x1 asm("x1");
+    register uint64_t x2 asm("x2");
+    register uint64_t x3 asm("x3");
+    register uint64_t x4 asm("x4");
+    register uint64_t x8 asm("x8") = 46;
+
+    asm volatile(
+        "svc #0"
+        : "=r" (x0), "=r" (x1), "=r" (x2), "=r" (x3), "=r" (x4)
+        : "r" (x8)
+        : "memory"
+    );
+
+    vfs_request_t request;
+    request.status = (int)x0 < 0 ? -1 : 0;
+    request.vfs_id = (uint32_t)x0;
+    request.arg0 = x1;
+    request.arg1 = x2;
+    request.arg2 = x3;
+    request.client_tid = (uint32_t)x4;
+    return request;
 }
 
 static inline wait_info_t sys_wait(uint32_t tid) {

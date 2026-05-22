@@ -14,6 +14,8 @@
 #define USER_STACK_BASE (USER_STACK_TOP - TASK_STACK_SIZE)
 #define USER_STACK_GUARD_BASE (USER_STACK_BASE - TASK_STACK_SIZE)
 #define USER_SHARED_BASE 0xC0000000ULL
+#define USER_BOOT_INITRD_BASE 0xD0000000ULL
+#define MAX_VFS_ROUTES 8
 
 #define IPC_INLINE_BYTES 128
 #define IPC_INLINE_WORDS 16
@@ -40,7 +42,9 @@ typedef enum {
     TASK_STATE_BLOCKED_ON_IPC_REPLY,
     TASK_STATE_SLEEPING,
     TASK_STATE_BLOCKED_ON_IRQ,
-    TASK_STATE_BLOCKED_ON_WAIT
+    TASK_STATE_BLOCKED_ON_WAIT,
+    TASK_STATE_BLOCKED_ON_VFS_CALL,
+    TASK_STATE_BLOCKED_ON_VFS_RECV
 } task_state_t;
 
 typedef enum {
@@ -83,6 +87,16 @@ typedef struct tcb_t {
     struct tcb_t *ipc_call_head;
     struct tcb_t *ipc_call_tail;
 
+    uint32_t vfs_ids[MAX_VFS_ROUTES];
+    uint32_t vfs_tids[MAX_VFS_ROUTES];
+    uint32_t vfs_active_client_tid;
+    uint32_t vfs_active_id;
+    uint32_t vfs_reply_tid;
+    uint64_t vfs_args[3];
+    struct tcb_t *vfs_next;
+    struct tcb_t *vfs_call_head;
+    struct tcb_t *vfs_call_tail;
+
     uint32_t awaiting_irq;
     uint32_t parent_tid;
     uint32_t wait_target_tid;
@@ -117,6 +131,7 @@ int sched_spawn_file_syscall(uint64_t *regs, uint64_t name_ptr, uint8_t priority
 int sched_spawn_exec_syscall(uint64_t *regs, uint32_t exec_cap, uint8_t priority);
 int sched_install_exec_cap_at(uint32_t tid, uint32_t cap, uint32_t initrd_index);
 int sched_install_file_cap_at(uint32_t tid, uint32_t cap, uint32_t initrd_index);
+int sched_map_boot_data(uint32_t tid, const void *data, uint64_t size, uint64_t user_va);
 void sched_await_irq_syscall(uint64_t *regs, uint32_t irq_num);
 void sched_await_irq_timeout_syscall(uint64_t *regs, uint32_t irq_num, uint64_t timeout_ms);
 void sched_exit_syscall(uint64_t *regs, int exit_code);

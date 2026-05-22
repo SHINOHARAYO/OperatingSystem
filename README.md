@@ -1,20 +1,22 @@
 # Neptune OS
 
-Neptune is a small AArch64 microkernel-style OS that boots as a UEFI
-application under QEMU. It has isolated EL0 user tasks, the Orange Cat unified
-kernel capability subsystem, capability-based synchronous IPC, register-only
-fast messages, zero-copy memory attachments, a name server, a simple initrd FS
-service, a shell, task lifecycle syscalls, per-task VMA tracking, lazy
-anonymous memory, dynamic stack growth, ASID-aware address spaces, and basic
-memory diagnostics. The scheduler is now a CPU0 O(1) MLFQ using 32 ready
-queues, bitmap/CLZ selection, a 1 kHz generic timer tick, and timer-wheel
-wakeups.
+Neptune is an experimental AArch64 microkernel-style OS that boots as a UEFI
+application under QEMU. It has isolated EL0 user tasks, capability-based IPC,
+lazy virtual memory, zero-copy memory sharing, a user-space service model, an
+EL1 VFS fast channel, and a CPU0 O(1) MLFQ scheduler.
 
-This is an experimental teaching OS, not a production system.
+This is a teaching and research OS. It is not production software.
 
-## Build And Run
+## Quick Start
 
-The build currently expects a Linux/WSL environment with:
+Build from Linux or WSL in the repository root:
+
+```sh
+make image
+make run
+```
+
+The build expects:
 
 - `clang`
 - `lld-link`
@@ -24,29 +26,27 @@ The build currently expects a Linux/WSL environment with:
 - `qemu-system-aarch64`
 - `qemu-efi-aarch64`
 
-From WSL, in the repository root:
-
-```sh
-make
-make image
-make run
-```
-
 Useful targets:
 
 | Target | Purpose |
 | --- | --- |
-| `make` | Build kernel EFI image, user ELFs, and initrd |
+| `make` | Build the kernel EFI image, user ELFs, and initrd |
 | `make image` | Create `build/fat.img` with `BOOTAA64.EFI` and `initrd.bin` |
 | `make run` | Boot QEMU in `-nographic` mode |
-| `make run_g` | Boot QEMU with graphical display |
-| `make clean` | Remove `build/` and stale generated user ELF headers |
+| `make run_g` | Boot QEMU with a graphical display |
+| `make clean` | Remove generated build output |
 
-The default QEMU memory size is 2048 MiB. Override it with:
+The default QEMU memory size is `2048M`.
 
 ```sh
-make run QEMU_MEM=3072M
+make run QEMU_MEM=1024M
 ```
+
+Some QEMU CPU/backend combinations expose only a 32-bit physical address space.
+On `virt`, RAM starts at `0x40000000`, so those combinations cannot boot all
+memory sizes.
+
+## Logging
 
 The kernel log level is selected at build time:
 
@@ -60,67 +60,200 @@ The kernel log level is selected at build time:
 Example:
 
 ```sh
-make image LOG_LEVEL=2
+make image LOG_LEVEL=1
 ```
 
-Some QEMU CPU/backend combinations only expose a 32-bit physical address space.
-On `virt`, RAM starts at `0x40000000`, so those combinations can boot up to
-about `3072M`. Use a CPU/backend with wider physical addresses before trying
-`QEMU_MEM=4096M`.
+## System Shape
+
+Neptune currently boots this service stack:
+
+| Service | Runs In | Purpose |
+| --- | --- | --- |
+| `uart_server` | EL0 | Serial output service |
+| `keyboard_server` | EL0 | Keyboard input service |
+| `name_server` | EL0 | Service registry and endpoint lookup |
+| `fs_server` | EL0 | Initrd-backed filesystem service |
+| `shell` | EL0 | Interactive command shell |
+
+The kernel keeps authority, scheduling, memory mappings, faults, and IPC
+handoff. Filesystem metadata and directory state now live in `fs.elf` user
+memory. The boot initrd is mapped read-only into the FS task at
+`0xD0000000`; inside it, `fs.elf` mounts `apps.fat` with FatFs and serves file
+operations from that real FAT volume.
+
+## Implemented Features
+
+### Boot And Platform
+
+- AArch64 UEFI boot under QEMU.
+- FAT image boot with `BOOTAA64.EFI` and `initrd.bin`.
+- Exception vectors, MMU, ACPI discovery, GICv2, and ARM generic timer setup.
+- 1 kHz timer tick.
+- 39-bit lower-half virtual address layout.
+- 40-bit physical-address support.
+- ASID-aware user address spaces with targeted TLB invalidation.
+
+### Scheduler
+
+- CPU0 per-core scheduler structure.
+- O(1) MLFQ with 32 circular ready queues.
+- Bitmap readiness tracking with native AArch64 `CLZ` selection.
+- Queue 0 is highest priority and maps to bitmap bit 31.
+- Exponential time slices:
+  - queues 0-3: 1 ms
+  - queues 4-7: 2 ms
+  - queues 8-15: 4 ms
+  - queues 16-23: 8 ms
+  - queues 24-31: 16 ms
+- 1024-bucket timer wheel for sleep and IRQ timeout wakeups.
+- Global priority boost every 1000 ticks.
+- Yield keeps priority; CPU-bound quantum exhaustion demotes.
+- Blocking on IPC, VFS, sleep, wait, IRQ, or fault does not demote.
+
+### Memory Management
+
+- Physical page allocator.
+- Kernel heap diagnostics.
+- Frame objects with refcounts above PMM pages.
+- VM objects for anonymous and initrd-backed mappings.
+- Per-task VMA tables for ELF, stack, guard, mmap, imports, and file mappings.
+- Dynamically growing VMA tables with sorted lookup.
+- VMA split/remove/coalesce support.
+- Lazy anonymous `mmap`.
+- Lazy file-backed mappings.
+- Lazy executable loading for initrd-backed spawns.
+- Dynamic stack growth up to 64 KiB with a moving guard page.
+- `fork` with copy-on-write for writable frame-backed user pages.
+- Public `munmap`.
+- `vmmap` inspection from the shell.
+
+### Fault And User Safety
+
+- User stack guard page.
+- Shared fault resolver for lazy memory, file mappings, and stack growth.
+- Usercopy resolves valid lazy pages during syscall copy-in/copy-out.
+- Invalid user pointers are rejected.
+- User faults kill only the faulting task.
+
+### Orange Cat Capabilities
+
+- Unified per-task capability table.
+- Typed slots with object IDs, rights, and flags.
+- Endpoint, reply, exec, file, VMA, and frame cap types.
+- Reserved `CAP_SELF = 1` and `CAP_NS = 2`.
+- Capability checks for IPC, spawn, file access, and memory mapping.
+- `capstat` shell command.
+- Compatibility boot grants for FS file/exec caps are still installed for
+  legacy FS IPC paths.
+
+### IPC
+
+- Capability-based synchronous IPC.
+- `ipc_call`, `ipc_recv`, and one-shot `ipc_reply`.
+- Register-only fast path for payloads up to 128 bytes in `x3` through `x18`.
+- Slow path with one zero-copy memory attachment.
+- Memory attachment modes: share, transfer, lend, revoke.
+- Handoff scheduling from caller to waiting receiver and replier to caller.
+- Kill/exit cleanup unwinds IPC queues and reply caps.
+- IPC implementation lives in `src/kernel/ipc.c`.
+
+### VFS And Files
+
+- EL1 VFS fast channel in `src/kernel/vfs.c`.
+- Per-task fixed VFS route arrays.
+- `SYS_VFS_BIND`, `SYS_VFS_CALL`, `SYS_VFS_RECV`, `SYS_VFS_REPLY`, and
+  `SYS_VFS_INJECT`.
+- Direct handoff from client to FS service for VFS calls.
+- Shared page injection maps pages into both client and FS address spaces.
+- FatFs is vendored in `third_party/fatfs`.
+- The build creates an `apps.fat` FAT volume containing the user ELFs.
+- `fs.elf` mounts `apps.fat` in EL0 and owns directory/open-handle state.
+- `ls` uses the VFS path.
+- `fsls` remains as the legacy FS-over-IPC fallback.
+- `run <file>` loads executables through VFS and spawns them from shell memory.
+
+### Task Lifecycle
+
+- EL0 user task creation and context switching.
+- Dynamically growing task and termination-record tables.
+- Parent-child tracking.
+- `ps`, `jobs`, `poll`, `wait`, and `kill`.
+- Exit records survive until reaped by the parent.
+- Kill/exit cleanup handles scheduler, IPC, VFS, caps, VMAs, and memory caps.
 
 ## Shell Commands
 
-After boot, Neptune starts `uart_server`, `keyboard_server`, `name_server`,
-`fs_server`, and `shell`.
-The shell prompt is:
+After boot:
 
 ```text
 Neptune>
 ```
 
-Available commands:
+Core commands:
 
 | Command | Purpose |
 | --- | --- |
-| `help` | Show shell commands |
+| `help` | Show shell help |
 | `clear` | Clear the terminal |
 | `echo <text>` | Print text |
-| `ls` | List initrd files through the user-space FS server |
-| `uptime` | Show seconds since boot |
-| `mem` | Show RAM and kernel heap usage |
-| `vmmap` | Show the shell task's virtual memory areas |
-| `capstat` | Show the shell task's Orange Cat capability slots |
-| `debug` | Show kernel build/runtime debug information |
-| `smoke` | Run bounded core regression checks |
-| `lazy` | Check lazy mmap and syscall usercopy into lazy memory |
-| `ipcfast` | Test 0/8/64/128-byte register IPC payloads |
-| `ipccap` | Transfer an endpoint capability through IPC and use it |
-| `ipckill` | Verify IPC queues/reply caps unwind across task kills |
-| `memshare` | Share one page with a child task through IPC memory attach |
-| `memxfer` | Transfer one page to a child task through IPC memory attach |
-| `memcaplife` | Share an exported memory cap after unmapping the old VA |
-| `memrevoke` | Lend a page, revoke it, and verify borrower isolation |
-| `munmap` | Check user unmap and stale export rejection |
-| `forkcow` | Fork the shell and verify copy-on-write isolation |
-| `filelazy` | Lazily map an initrd file and read it |
-| `vmstress` | Grow and shrink the VMA table under many file mappings |
-| `lazyexec` | Spawn an initrd ELF through lazy executable VM objects |
-| `taskstress` | Grow the kernel task table with many spin tasks |
-| `speed` | Run scheduler, syscall, lazy-fault, memory, and IPC speed checks |
-| `ps` | Show scheduler state, including PPID |
-| `pong` | Spawn pong, run the IPC demo, wait for exit |
-| `fault` | Spawn a task that page-faults, wait for fault status |
-| `spawn pong` | Run pong and leave its exit record for `wait` |
-| `spawn fault` | Spawn a faulting child and leave its status for `wait` |
-| `spawn spin` | Spawn a child that runs until killed |
-| `badptr` | Verify invalid syscall pointers are rejected |
-| `run <file>` | Ask FS for an executable capability and spawn it |
-| `jobs` | Show shell-tracked child jobs with nonblocking status |
-| `poll <tid>` | Check child status without reaping it |
-| `wait <tid>` | Wait for/reap a child status |
+| `uptime` | Show uptime |
+| `mem` | Show RAM and heap usage |
+| `vmmap` | Show this task's VMA table |
+| `capstat` | Show this task's capability slots |
+| `debug` | Show kernel/runtime debug info |
+| `ps` | Show task state |
+| `jobs` | Show shell child jobs |
+| `poll <tid>` | Check child status without reaping |
+| `wait <tid>` | Wait for and reap child status |
 | `kill <tid>` | Kill a user task |
 
-## Process Lifecycle Demo
+File and VFS commands:
+
+| Command | Purpose |
+| --- | --- |
+| `ls` | List files through the VFS fast channel |
+| `fsls` | List files through legacy FS IPC |
+| `vfstest` | Test VFS call/reply handoff |
+| `vfsinject` | Test shared page injection |
+| `vfsls` | Explicit VFS file listing |
+| `vfsopen <file>` | Show VFS metadata for one file |
+| `vfsread` | Read one file page through VFS injection |
+| `vfsexec` | Resolve an executable through VFS and spawn it |
+| `run <file>` | Load and spawn an initrd ELF through VFS |
+| `filelazy` | Read a file page through the lazy/VFS path |
+| `vmstress` | Stress VMA growth with file mappings |
+
+IPC and memory commands:
+
+| Command | Purpose |
+| --- | --- |
+| `ipcfast` | Test 0/8/64/128-byte register IPC payloads |
+| `ipccap` | Transfer an endpoint cap through IPC |
+| `ipckill` | Verify IPC cleanup on task kill |
+| `memshare` | Share one page with another task |
+| `memxfer` | Transfer one page to another task |
+| `memcaplife` | Use a memory cap after unmapping the old VA |
+| `memrevoke` | Lend and revoke a page |
+| `munmap` | Test unmap and stale export rejection |
+| `forkcow` | Verify copy-on-write after fork |
+
+Regression and demo commands:
+
+| Command | Purpose |
+| --- | --- |
+| `smoke` | Run bounded core regression checks |
+| `lazy` | Test lazy mmap and usercopy |
+| `lazyexec` | Test lazy executable VM objects |
+| `taskstress` | Grow the kernel task table |
+| `speed` | Benchmark syscalls, yield, faults, memory, and IPC |
+| `pong` | Run the IPC pong demo |
+| `fault` | Spawn a deliberate faulting task |
+| `badptr` | Verify invalid syscall pointers are rejected |
+| `spawn pong` | Spawn pong and leave status for `wait` |
+| `spawn fault` | Spawn a faulting child |
+| `spawn spin` | Spawn a long-running child |
+
+## Demos
 
 Run a long-lived child:
 
@@ -128,228 +261,78 @@ Run a long-lived child:
 spawn spin
 ps
 jobs
-poll 4
-kill 4
-poll 4
-wait 4
-jobs
-```
-
-Expected behavior:
-
-- `ps` shows the child with shell as PPID.
-- `poll 4` first reports the child is still running.
-- `kill 4` terminates the child.
-- `poll 4` reports the child was killed without reaping it.
-- `wait 4` reports the same status and removes the child record.
-- `jobs` no longer lists the reaped child.
-
-Run a user fault isolation demo:
-
-```text
-spawn fault
-jobs
-poll 4
-wait 4
-```
-
-Expected behavior:
-
-- The faulting task writes into the user stack guard page.
-- The kernel logs ESR/ELR/FAR.
-- The shell survives.
-- `poll` and `wait` report the fault status.
-
-Run an ELF through the FS/executable-capability path:
-
-```text
-run spin.elf
-jobs
 kill 4
 wait 4
 ```
 
-## Implemented Features
+Run the VFS path:
 
-### Boot And Platform
+```text
+ls
+vfstest
+vfsinject
+vfsread
+run badptr.elf
+wait 7
+```
 
-- Boots as an AArch64 UEFI application under QEMU.
-- Loads `initrd.bin` from the FAT image before `ExitBootServices`.
-- Initializes exceptions, the MMU, ACPI hardware discovery, GICv2, and the ARM
-  generic timer at a 1 kHz scheduler tick.
-- Uses a 39-bit lower-half identity map with 40-bit physical-address support.
-- Early MMU page-table setup uses scalar volatile stores and explicit barriers,
-  so boot correctness does not depend on logging side effects or compiler loop
-  vectorization.
-- Supports per-user address spaces with allocated ASIDs in `TTBR0_EL1`,
-  targeted TLB invalidation, and flush-on-ASID-reuse.
+Run core smoke checks:
 
-### Memory Management
+```text
+smoke
+```
 
-- Physical page allocator plus basic kernel heap diagnostics.
-- Frame objects with refcounts layered above raw PMM pages.
-- First-class VM objects for anonymous and initrd-backed mappings.
-- Per-task VMA tables for ELF segments, stack, guard, mmap, imported memory,
-  and file-backed regions.
-- Dynamically growing VMA tables with binary-search lookup and sorted insertion.
-- VMA remove/split/coalesce with basic committed-page accounting.
-- Lazy anonymous `mmap`; physical pages are committed on first valid access.
-- Lazy file-backed initrd mappings through file capabilities and `file_mmap`,
-  backed by a shared initrd page cache.
-- Lazy executable loading for initrd-backed `spawn_file` and `spawn_exec`.
-- Public `munmap` for user mmap/imported mappings.
-- `fork` with copy-on-write for writable frame-backed user pages.
-- Dynamic user stack growth up to 64 KiB with a moving guard page.
-- `vmmap` syscall and shell command for inspecting the current task's VMAs.
-
-### Fault And User Safety
-
-- User stack guard page.
-- Fault resolver for lazy VMAs, file-backed VMAs, stack growth, and invalid
-  access detection.
-- User faults kill only the faulting task.
-- Syscall user-pointer validation, including lazy page resolution during
-  usercopy.
-- Invalid pointer regression coverage through `badptr`.
-
-### Capabilities: Orange Cat
-
-- Unified per-task capability tables with typed slots, object IDs, rights, and
-  flags.
-- `capstat` syscall and shell command for inspecting current task cap slots.
-- Cap types include endpoint, reply, exec, file, VMA, frame, and future objects.
-- Reserved `CAP_SELF` and `CAP_NS` endpoint caps are installed for each task.
-- Memory, file, exec, endpoint, and reply authority checks use Orange Cat rights
-  instead of scheduler-local cap checks.
-- Bootstrapped FS authority: the kernel grants the FS service file and exec
-  caps for initrd entries at startup.
-- User tasks obtain file and executable authority only through FS IPC.
-
-### IPC
-
-- Synchronous capability IPC with `ipc_call`, `ipc_recv`, and one-shot
-  `ipc_reply` caps.
-- Register-only fast path for messages up to 128 bytes in `x3` through `x18`.
-- IPC syscalls use SVC immediates so `x8` can carry payload.
-- Slow path supports one zero-copy memory attachment using share, transfer, or
-  lend mapping machinery.
-- Memory capabilities support zero-copy share, transfer, lend, and revoke.
-- Exported memory caps are backed by pinned frame objects, so the cap no
-  longer depends on the original exporter VA staying mapped.
-- Memory-cap object and mapping management lives in `src/kernel/memcap.c`,
-  including export, import, share, transfer, lend, revoke, and munmap cleanup.
-- Handoff scheduling switches directly from caller to waiting receiver and from
-  replier to blocked caller.
-- Kernel IPC code lives in `src/kernel/ipc.c`; `sched.c` now only exposes the
-  scheduler boundary needed for task lookup, trap frames, and handoff.
-
-### User Services And Files
-
-- User-space name server for service registration and discovery.
-- User-space FS server for initrd listing, file-capability open, and
-  executable-capability open over IPC.
-- UART and keyboard user services.
-- ELF loading for user applications stored in initrd.
-
-### Tasks And Scheduling
-
-- EL0 user task creation and context switching.
-- CPU0 per-core scheduler structure prepared for later SMP expansion.
-- O(1) MLFQ scheduler with 32 circular ready queues.
-- Ready selection uses a 32-bit bitmap where bit 31 is queue 0 and native
-  AArch64 `CLZ` finds the highest runnable priority.
-- Exponential time slices: 1 ms for queues 0-3, 2 ms for 4-7, 4 ms for 8-15,
-  8 ms for 16-23, and 16 ms for 24-31.
-- 1 kHz ARM generic timer tick; `sleep(ms)` now uses millisecond ticks.
-- 1024-bucket timer wheel for sleep and IRQ timeout wakeups.
-- Global priority boost every 1000 ticks to prevent starvation.
-- Yield keeps the current priority and moves the task to the tail of its
-  queue; CPU-bound quantum expiry demotes by one queue.
-- Blocking on IPC, sleep, wait, IRQ, or fault removes the task from scheduler
-  ownership without demoting it.
-- Dynamically growing task and termination-record tables.
-- Parent-child task tracking with child termination records.
-- `wait` and `poll` support for child status.
-- Kill/exit cleanup unwinds IPC waiters, reply caps, memory objects, and shared
-  mappings.
-
-### Shell And Syscalls
-
-- Interactive shell with dynamically growing job table.
-- Shell-side job tracking for spawned children.
-- `debug` reports build log level, scheduler tick rate, task capacity, ASID
-  limit, stack growth limit, current VMA table use, cap slots, and memory-cap
-  table use.
-- `smoke` runs bounded core checks for lazy memory, register IPC, invalid
-  pointers, stack growth, and the speed benchmark.
-- Implemented syscalls include sleep, spawn, spawn-file compatibility,
-  spawn-exec, ipc-call, ipc-recv, ipc-reply, exit, kill, wait, poll, ps, mem,
-  mmap, munmap, mem-export, mem-share, mem-transfer, mem-lend, mem-revoke,
-  uptime, fork, file-stat, file-mmap, capstat, and debug-info.
+The current smoke path covers lazy memory, VFS call/injection, register IPC,
+invalid pointers, stack growth, and the speed benchmark.
 
 ## User Programs
 
-The current embedded user programs are:
+The current initrd contains:
 
 | Program | Source | Purpose |
 | --- | --- | --- |
-| `shell` | `user/shell.c` | Interactive command shell |
-| `uart_server` | `user/uart.c` | Serial output service |
-| `keyboard_server` | `user/keyboard.c` | Keyboard input service |
-| `name_server` | `user/ns.c` | Service registration and capability minting |
-| `fs_server` | `user/fs.c` | Initrd listing service over IPC |
-| `pong` | `user/pong.c` | IPC demo child |
-| `fault` | `user/fault.c` | Deliberate guard-page fault test |
-| `spin` | `user/spin.c` | Long-lived child for ps/kill/wait/jobs |
-| `badptr` | `user/badptr.c` | Invalid syscall pointer regression test |
-| `stackgrow` | `user/stackgrow.c` | Dynamic stack growth regression test |
-| `memshare` | `user/memshare.c` | Shared-page receiver demo |
-| `memxfer` | `user/memxfer.c` | Transferred-page receiver demo |
-| `memrevoke` | `user/memrevoke.c` | Lend/revoke borrower isolation demo |
-| `ipcfast` | `user/ipcfast.c` | Register-only IPC boundary test |
-| `ipccap` | `user/ipccap.c` | Endpoint-cap transfer regression test |
-| `ipckill` | `user/ipckill.c` | IPC kill/unwind regression helper |
-| `speed` | `user/speed.c` | OS speed benchmark for CPU loop, syscalls, yield, lazy faults, memory writes, and IPC |
-| `speedipc` | `user/speedipc.c` | Helper endpoint used by the speed IPC benchmark |
-
-The build packs these ELFs into `build/initrd.bin`. UEFI loads that file from
-the FAT image before `ExitBootServices`. The FS server validates filenames and
-transfers boot-granted file or executable capabilities to clients.
+| `shell.elf` | `user/shell.c` | Interactive shell |
+| `uart.elf` | `user/uart.c` | UART service |
+| `keyboard.elf` | `user/keyboard.c` | Keyboard service |
+| `ns.elf` | `user/ns.c` | Name server |
+| `fs.elf` | `user/fs.c` | Initrd FS and VFS service |
+| `pong.elf` | `user/pong.c` | IPC demo |
+| `fault.elf` | `user/fault.c` | Deliberate fault test |
+| `spin.elf` | `user/spin.c` | Long-running task |
+| `badptr.elf` | `user/badptr.c` | Invalid pointer test |
+| `stackgrow.elf` | `user/stackgrow.c` | Stack growth test |
+| `memshare.elf` | `user/memshare.c` | Memory share receiver |
+| `memxfer.elf` | `user/memxfer.c` | Memory transfer receiver |
+| `memrevoke.elf` | `user/memrevoke.c` | Lend/revoke receiver |
+| `ipcfast.elf` | `user/ipcfast.c` | Register IPC test |
+| `ipccap.elf` | `user/ipccap.c` | Capability transfer test |
+| `ipckill.elf` | `user/ipckill.c` | IPC kill cleanup test |
+| `speed.elf` | `user/speed.c` | Performance benchmark |
+| `speedipc.elf` | `user/speedipc.c` | IPC benchmark helper |
 
 ## Known Limitations
 
-- The FS server currently exposes initrd only; there is no general VFS yet.
-- Scheduler is CPU0-only; the data shape is per-core, but SMP dispatch is not
-  implemented yet.
-- User programs are still packaged at build time into `initrd.bin`.
+- Single-core CPU0 scheduling only; the structures are ready for later SMP.
+- User programs are still packaged into `initrd.bin` at build time.
+- The current public FS backend is a read-only FAT12 boot volume inside initrd.
 - No persistent filesystem or file writes yet.
-- The bootstrap identity map covers the 39-bit lower VA space. This supports
-  large QEMU RAM sizes in principle, but current smoke testing covers 4 GiB.
-- Raw TID IPC and old cap-send/cap-recv syscall behavior are disabled; TIDs
-  remain for debug and lifecycle calls such as `ps`, `kill`, `wait`, and
-  `poll`.
-- `wait`/`poll` only apply to children of the calling task.
-- Kernel heap is still simple and mostly reusable only through task slot reuse.
-- Bootstrap services are still eagerly loaded; initrd-backed user spawns are
-  lazy-loaded through VM objects.
-- The initrd page cache is fixed-size and has no eviction policy yet.
-- VM objects use a fixed-size v1 table.
-- Memory caps currently export page-aligned, committed, non-guard, non-stack
-  user VMAs into pinned frame-list objects.
+- No user-space block driver or DMA path yet.
+- VFS currently fronts the FatFs-backed boot volume only.
+- FS-over-IPC compatibility still exists while the VFS path finishes taking
+  over every file operation.
+- The initrd page cache and VM object tables are fixed-size v1 tables.
 - Memory-cap object and mapping tables are fixed-size v1 tables.
 - Copy-on-write currently covers forked, writable, frame-backed user pages.
 - Terminal input is intentionally simple and ASCII-oriented.
-- `smoke` is intentionally bounded and does not include every destructive or
-  long-running regression; run `ipccap`, `ipckill`, `memshare`, `memxfer`, and
-  `memrevoke` directly for those specific paths.
+- `wait` and `poll` only apply to children of the calling task.
 
 ## Good Next Steps
 
-- Generalize memory-cap backing from pinned frame-list objects into reusable VM
-  object/page-cache backing.
-- Add a VFS layer over initrd entries.
-- Add real file-backed user program loading from FAT or another filesystem.
-- Add a nonblocking keyboard/event API for richer shell interaction.
-- Add job names and child creation metadata to kernel `ps`.
-- Add host-side QEMU smoke scripts that drive `debug`, `smoke`, and the
-  heavier dedicated IPC/memory-cap commands with timeouts.
+- Remove the remaining legacy FS-over-IPC path once VFS covers every command.
+- Move executable spawning to a cleaner kernel-owned VFS exec object instead of
+  shell-loaded bytes.
+- Add a writable user-space filesystem service.
+- Add a user-space block driver and connect it to VFS injected buffers.
+- Add host-side automated QEMU smoke scripts.
+- Extend the per-core scheduler work toward SMP.
+- Replace fixed-size v1 object tables with growable or reclaiming allocators.

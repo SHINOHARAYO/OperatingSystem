@@ -25,6 +25,8 @@
 #define IPCKILL_SERVER_DELAY_REPLY 2
 #define IPCKILL_CALLER_CALL        3
 #define IPCKILL_RECV_WAIT          4
+#define IPCCAP_MODE_SERVER         1
+#define IPCCAP_MODE_CLIENT         2
 
 #define SHELL_TASK_STATE_SLEEPING 6
 #define IPCKILL_PRIORITY 5
@@ -35,16 +37,34 @@ typedef struct {
   int active;
 } shell_job_t;
 
+typedef struct {
+  int status;
+  uint32_t index;
+  uint32_t handle;
+  uint64_t size;
+} vfs_file_info_t;
+
 static shell_job_t *jobs;
 static uint32_t job_capacity;
 static int keyboard_cap = -1;
 static int fs_cap = -1;
+static int vfs_cap = -1;
+static int vfs_bound = 0;
 static int last_spawn_endpoint_cap = -1;
 
 static void print_wait_result(wait_info_t info);
 static uint32_t spawn_program(const char *name, uint8_t priority);
 static int open_file_cap(const char *name);
 static wait_info_t poll_until_done(uint32_t tid, uint32_t attempts, uint64_t sleep_ms);
+static void run_vfstest_demo(void);
+static void run_vfsinject_demo(void);
+static void list_files_vfs(void);
+static vfs_file_info_t vfs_open_file(const char *target);
+static int64_t vfs_read_index(uint32_t index, void *buf);
+static int64_t vfs_read_handle_page(uint32_t handle, uint32_t page_index, void *buf);
+static void vfs_close_handle(uint32_t handle);
+static void *vfs_load_file(const char *name, uint64_t *out_size);
+static uint64_t page_align_size(uint64_t size);
 
 static int ensure_job_capacity(uint32_t min_capacity) {
   if (job_capacity >= min_capacity) {
@@ -126,6 +146,8 @@ static const char *task_state_name(uint32_t state) {
     case 6: return "sleep";
     case 7: return "irq";
     case 8: return "wait";
+    case 9: return "vfscall";
+    case 10: return "vfsrecv";
     default: return "?";
   }
 }
@@ -540,35 +562,44 @@ static void run_forkcow_demo(void) {
 }
 
 static void run_filelazy_demo(void) {
-  int file_cap = open_file_cap("shell.elf");
-  unsigned char *file = file_cap < 0 ? 0 : (unsigned char *)sys_file_mmap((uint32_t)file_cap);
+  vfs_file_info_t info = vfs_open_file("shell.elf");
+  unsigned char *file = info.status < 0 ? 0 : (unsigned char *)sys_mmap(PAGE_BYTES);
   if (!file) {
-    printf("filelazy: mmap failed\n");
+    printf("filelazy: vfs mmap failed\n");
+    return;
+  }
+
+  int64_t bytes = vfs_read_handle_page(info.handle, 0, file);
+  if (bytes < 0) {
+    printf("filelazy: vfs read failed\n");
     return;
   }
 
   int ok = file[0] == 0x7f && file[1] == 'E' && file[2] == 'L' && file[3] == 'F';
-  printf("filelazy: %s magic=%x %c%c%c\n",
-         ok ? "ok" : "failed", (uint32_t)file[0], file[1], file[2], file[3]);
+  printf("filelazy: %s vfs-bytes=%ld size=%lu magic=%x %c%c%c\n",
+         ok ? "ok" : "failed", bytes, info.size,
+         (uint32_t)file[0], file[1], file[2], file[3]);
+  vfs_close_handle(info.handle);
+  sys_munmap(file, PAGE_BYTES);
 }
 
 static void run_vmstress_demo(void) {
-  char name[32];
-  int file_cap = open_file_cap("shell.elf");
-  int64_t file_size = file_cap < 0 ? -1 : sys_file_stat((uint32_t)file_cap, name, sizeof(name));
-  if (file_size <= 0) {
-    printf("vmstress: file stat failed\n");
+  vfs_file_info_t info = vfs_open_file("shell.elf");
+  if (info.status < 0 || info.size == 0) {
+    printf("vmstress: vfs open failed\n");
     return;
   }
 
-  uint64_t map_size = ((uint64_t)file_size + PAGE_BYTES - 1) & ~(PAGE_BYTES - 1);
   void *maps[80];
   uint32_t mapped = 0;
   uint32_t touched = 0;
 
   for (uint32_t i = 0; i < 80; i++) {
-    unsigned char *file = (unsigned char *)sys_file_mmap((uint32_t)file_cap);
+    unsigned char *file = (unsigned char *)sys_mmap(PAGE_BYTES);
     if (!file) {
+      break;
+    }
+    if (vfs_read_handle_page(info.handle, 0, file) < 0) {
       break;
     }
     maps[mapped++] = file;
@@ -578,11 +609,12 @@ static void run_vmstress_demo(void) {
   }
 
   for (uint32_t i = 0; i < mapped; i++) {
-    sys_munmap(maps[i], map_size);
+    sys_munmap(maps[i], PAGE_BYTES);
   }
 
   printf("vmstress: %s mapped=%u touched=%u\n",
          mapped == 80 && touched == 80 ? "ok" : "failed", mapped, touched);
+  vfs_close_handle(info.handle);
 }
 
 static void run_lazyexec_demo(void) {
@@ -816,39 +848,44 @@ static void run_ipcfast_demo(void) {
 }
 
 static void run_ipccap_demo(void) {
-  uint32_t pong_tid = spawn_program(PONG_FILE, PONG_PRIORITY);
-  int pong_cap = last_spawn_endpoint_cap;
-  if ((int)pong_tid < 0 || pong_cap < 0) {
-    printf("ipccap: pong spawn failed\n");
+  uint32_t server_tid = spawn_program(IPCCAP_FILE, PONG_PRIORITY);
+  int server_cap = last_spawn_endpoint_cap;
+  if ((int)server_tid < 0 || server_cap < 0) {
+    printf("ipccap: server spawn failed\n");
     return;
   }
 
-  uint32_t cap_tid = spawn_program(IPCCAP_FILE, PONG_PRIORITY);
-  int cap_endpoint = last_spawn_endpoint_cap;
-  if ((int)cap_tid < 0 || cap_endpoint < 0) {
-    printf("ipccap: receiver spawn failed\n");
-    cleanup_blocked_child(pong_tid);
+  uint64_t server_setup[IPC_INLINE_WORDS] = {
+    [IPC_CAP_WORD_OP] = IPCCAP_MODE_SERVER
+  };
+  ipc_msg_t server_ready = sys_ipc_call((uint32_t)server_cap, 0, 8, server_setup);
+  if (server_ready.status < 0 || server_ready.payload[0] != 1) {
+    printf("ipccap: server setup failed\n");
+    cleanup_blocked_child(server_tid);
+    return;
+  }
+
+  uint32_t client_tid = spawn_program(IPCCAP_FILE, PONG_PRIORITY);
+  int client_cap = last_spawn_endpoint_cap;
+  if ((int)client_tid < 0 || client_cap < 0) {
+    printf("ipccap: client spawn failed\n");
+    cleanup_blocked_child(server_tid);
     return;
   }
 
   uint64_t payload[IPC_INLINE_WORDS] = {
-    [IPC_CAP_WORD_CAP] = (uint64_t)pong_cap,
-    [IPC_CAP_WORD_OP] = 0
+    [IPC_CAP_WORD_CAP] = (uint64_t)server_cap,
+    [IPC_CAP_WORD_OP] = IPCCAP_MODE_CLIENT
   };
-  ipc_msg_t reply = sys_ipc_call((uint32_t)cap_endpoint, IPC_FLAG_CAP, 16, payload);
-  wait_info_t cap_status = sys_wait(cap_tid);
+  ipc_msg_t reply = sys_ipc_call((uint32_t)client_cap, IPC_FLAG_CAP, 16, payload);
+  wait_info_t client_status = sys_wait(client_tid);
+  wait_info_t server_status = sys_wait(server_tid);
   int ok = reply.status == 0 && reply.payload[0] == 1 &&
-           cap_status.reason == TASK_TERM_EXITED && cap_status.exit_code == 0;
-
-  int kill_result = sys_kill(pong_tid);
-  wait_info_t pong_poll = poll_until_done(pong_tid, 20, 50);
+           client_status.reason == TASK_TERM_EXITED && client_status.exit_code == 0 &&
+           server_status.reason == TASK_TERM_EXITED && server_status.exit_code == 0;
   printf("ipccap: %s reply=%lu\n", ok ? "ok" : "failed", reply.payload[1]);
-  print_wait_result(cap_status);
-  if (pong_poll.status == WAIT_STATUS_DONE) {
-    print_wait_result(sys_wait(pong_tid));
-  } else {
-    printf("ipccap: pong cleanup pending kill=%d\n", kill_result);
-  }
+  print_wait_result(client_status);
+  print_wait_result(server_status);
 }
 
 static int setup_ipckill_task(uint32_t tid, int endpoint_cap, uint64_t mode) {
@@ -997,7 +1034,10 @@ static void run_smoke_demo(void) {
 
   printf("smoke: starting\n");
   run_lazy_memory_check();
+  run_vfstest_demo();
+  run_vfsinject_demo();
   run_ipcfast_demo();
+  run_ipccap_demo();
   if (run_and_expect_exit(BADPTR_FILE) < 0) failures++;
   if (run_and_expect_exit(STACKGROW_FILE) < 0) failures++;
   if (run_and_expect_exit(SPEED_FILE) < 0) failures++;
@@ -1020,6 +1060,43 @@ static int get_fs_cap(void) {
     fs_cap = ns_resolve("fs");
   }
   return fs_cap;
+}
+
+static int ensure_vfs_bound(void) {
+  if (vfs_bound) {
+    return 0;
+  }
+
+  if (vfs_cap < 0) {
+    vfs_cap = ns_resolve("vfs");
+  }
+  if (vfs_cap < 0) {
+    return -1;
+  }
+  if (sys_vfs_bind(VFS_ID_FS, (uint32_t)vfs_cap) < 0) {
+    return -1;
+  }
+
+  vfs_bound = 1;
+  return 0;
+}
+
+static vfs_reply_t vfs_call_retry(uint64_t arg0, uint64_t arg1, uint64_t arg2) {
+  vfs_reply_t reply;
+  reply.status = -1;
+  reply.value0 = 0;
+  reply.value1 = 0;
+  reply.value2 = 0;
+
+  for (uint32_t attempt = 0; attempt < 20; attempt++) {
+    reply = sys_vfs_call(VFS_ID_FS, arg0, arg1, arg2);
+    if (reply.status >= 0) {
+      return reply;
+    }
+    sys_sleep(10);
+  }
+
+  return reply;
 }
 
 static void pack_fs_name(uint64_t out[3], const char *name) {
@@ -1052,26 +1129,15 @@ static int open_file_cap(const char *name) {
 
 static uint32_t spawn_program(const char *name, uint8_t priority) {
   last_spawn_endpoint_cap = -1;
-  int cap = get_fs_cap();
-  if (cap < 0) {
+
+  uint64_t elf_size = 0;
+  const uint8_t *elf = (const uint8_t *)vfs_load_file(name, &elf_size);
+  if (!elf || elf_size == 0) {
     return (uint32_t)-1;
   }
 
-  uint64_t packed[3];
-  pack_fs_name(packed, name);
-  uint64_t payload[IPC_INLINE_WORDS] = {
-    [IPC_WORD_OP] = FS_REQ_OPEN_EXEC,
-    [IPC_WORD_ARG0] = packed[0],
-    [IPC_WORD_ARG1] = packed[1],
-    [IPC_WORD_ARG2] = packed[2]
-  };
-  ipc_msg_t msg = sys_ipc_call((uint32_t)cap, 0, 32, payload);
-  int exec_cap = (int)msg.payload[0];
-  if (exec_cap < 0) {
-    return (uint32_t)-1;
-  }
-
-  spawn_result_t spawned = sys_spawn_exec2((uint32_t)exec_cap, priority);
+  spawn_result_t spawned = sys_spawn2(elf, elf_size, priority);
+  sys_munmap((void *)elf, page_align_size(elf_size));
   last_spawn_endpoint_cap = spawned.endpoint_cap;
   return spawned.tid;
 }
@@ -1108,6 +1174,243 @@ static void list_files(void) {
     unpack_fs_name(name, &msg);
     printf("%lu  %s\n", msg.payload[0], name);
   }
+}
+
+static void run_vfstest_demo(void) {
+  if (ensure_vfs_bound() < 0) {
+    printf("vfstest: vfs server unavailable\n");
+    return;
+  }
+
+  vfs_reply_t reply = vfs_call_retry(VFS_FS_REQ_PING, 41, 7);
+  int ok = reply.status == 0 && reply.value0 == 42 && reply.value1 == 7;
+  printf("vfstest: %s value=%lu echo=%lu client=%lu\n",
+         ok ? "ok" : "failed", reply.value0, reply.value1, reply.value2);
+}
+
+static void run_vfsinject_demo(void) {
+  if (ensure_vfs_bound() < 0) {
+    printf("vfsinject: vfs server unavailable\n");
+    return;
+  }
+
+  char *name = (char *)sys_mmap(PAGE_BYTES);
+  if (!name) {
+    printf("vfsinject: mmap failed\n");
+    return;
+  }
+
+  vfs_reply_t reply = vfs_call_retry(VFS_FS_REQ_LIST, 0, (uint64_t)name);
+  int ok = reply.status == 0 && reply.value0 != FS_RESP_END && name[0] != '\0';
+  printf("vfsinject: %s size=%lu name=%s client=0x%lx fs=0x%lx\n",
+         ok ? "ok" : "failed", reply.value0, name, reply.value1, reply.value2);
+  sys_munmap(name, PAGE_BYTES);
+}
+
+static void list_files_vfs(void) {
+  if (ensure_vfs_bound() < 0) {
+    printf("vfsls: vfs server unavailable\n");
+    return;
+  }
+
+  printf("SIZE      NAME\n");
+  for (uint32_t index = 0; index < 128; index++) {
+    char *name = (char *)sys_mmap(PAGE_BYTES);
+    if (!name) {
+      printf("vfsls: mmap failed\n");
+      return;
+    }
+
+    vfs_reply_t reply = vfs_call_retry(VFS_FS_REQ_LIST, index, (uint64_t)name);
+    if (reply.status < 0) {
+      sys_munmap(name, PAGE_BYTES);
+      printf("vfsls: call failed\n");
+      return;
+    }
+    if (reply.value0 == FS_RESP_END) {
+      sys_munmap(name, PAGE_BYTES);
+      return;
+    }
+
+    printf("%lu  %s\n", reply.value0, name);
+    sys_munmap(name, PAGE_BYTES);
+  }
+}
+
+static vfs_file_info_t vfs_open_file(const char *target) {
+  vfs_file_info_t info;
+  info.status = -1;
+  info.index = 0;
+  info.handle = 0;
+  info.size = 0;
+
+  if (ensure_vfs_bound() < 0) {
+    return info;
+  }
+
+  for (uint32_t index = 0; index < 128; index++) {
+    char *name = (char *)sys_mmap(PAGE_BYTES);
+    if (!name) {
+      return info;
+    }
+
+    vfs_reply_t reply = vfs_call_retry(VFS_FS_REQ_LIST, index, (uint64_t)name);
+    if (reply.status < 0 || reply.value0 == FS_RESP_END) {
+      sys_munmap(name, PAGE_BYTES);
+      return info;
+    }
+    if (_streq(name, target)) {
+      vfs_reply_t opened = vfs_call_retry(VFS_FS_REQ_OPEN_INDEX, index, 0);
+      sys_munmap(name, PAGE_BYTES);
+      if (opened.status < 0 || opened.value0 == 0) {
+        return info;
+      }
+      info.status = 0;
+      info.index = index;
+      info.handle = (uint32_t)opened.value0;
+      info.size = opened.value1;
+      return info;
+    }
+    sys_munmap(name, PAGE_BYTES);
+  }
+
+  return info;
+}
+
+static int64_t vfs_read_index(uint32_t index, void *buf) {
+  if (!buf || ensure_vfs_bound() < 0) {
+    return -1;
+  }
+
+  vfs_reply_t reply = vfs_call_retry(VFS_FS_REQ_READ_INDEX, index, (uint64_t)buf);
+  return reply.status < 0 ? -1 : (int64_t)reply.value0;
+}
+
+static int64_t vfs_read_handle_page(uint32_t handle, uint32_t page_index, void *buf) {
+  if (!buf || handle == 0 || ensure_vfs_bound() < 0) {
+    return -1;
+  }
+
+  uint64_t descriptor = ((uint64_t)handle << VFS_HANDLE_SHIFT) | page_index;
+  vfs_reply_t reply = vfs_call_retry(VFS_FS_REQ_READ_HANDLE_PAGE,
+                                     descriptor, (uint64_t)buf);
+  return reply.status < 0 ? -1 : (int64_t)reply.value0;
+}
+
+static void vfs_close_handle(uint32_t handle) {
+  if (handle == 0 || ensure_vfs_bound() < 0) {
+    return;
+  }
+  (void)vfs_call_retry(VFS_FS_REQ_CLOSE_HANDLE, handle, 0);
+}
+
+static void *vfs_load_file(const char *name, uint64_t *out_size) {
+  if (out_size) {
+    *out_size = 0;
+  }
+
+  vfs_file_info_t info = vfs_open_file(name);
+  if (info.status < 0 || info.size == 0) {
+    return 0;
+  }
+
+  uint64_t aligned_size = (info.size + PAGE_BYTES - 1) & ~(PAGE_BYTES - 1);
+  unsigned char *buf = (unsigned char *)sys_mmap(aligned_size);
+  if (!buf) {
+    vfs_close_handle(info.handle);
+    return 0;
+  }
+
+  uint32_t pages = (uint32_t)(aligned_size / PAGE_BYTES);
+  uint64_t loaded = 0;
+  for (uint32_t page = 0; page < pages; page++) {
+    int64_t got = vfs_read_handle_page(info.handle, page, buf + ((uint64_t)page * PAGE_BYTES));
+    if (got < 0) {
+      vfs_close_handle(info.handle);
+      return 0;
+    }
+    loaded += (uint64_t)got;
+    if ((uint64_t)got < PAGE_BYTES) {
+      break;
+    }
+  }
+
+  vfs_close_handle(info.handle);
+  if (loaded < info.size) {
+    return 0;
+  }
+
+  if (out_size) {
+    *out_size = info.size;
+  }
+  return buf;
+}
+
+static uint64_t page_align_size(uint64_t size) {
+  return (size + PAGE_BYTES - 1) & ~(PAGE_BYTES - 1);
+}
+
+static void run_vfsread_demo(void) {
+  if (ensure_vfs_bound() < 0) {
+    printf("vfsread: vfs server unavailable\n");
+    return;
+  }
+
+  unsigned char *buf = (unsigned char *)sys_mmap(PAGE_BYTES);
+  if (!buf) {
+    printf("vfsread: mmap failed\n");
+    return;
+  }
+
+  vfs_reply_t reply = vfs_call_retry(VFS_FS_REQ_READ_INDEX, 0, (uint64_t)buf);
+  int ok = reply.status == 0 && reply.value0 >= 4 &&
+           buf[0] == 0x7f && buf[1] == 'E' && buf[2] == 'L' && buf[3] == 'F';
+  printf("vfsread: %s bytes=%lu total=%lu magic=%x %c%c%c\n",
+         ok ? "ok" : "failed", reply.value0, reply.value2,
+         (uint32_t)buf[0], buf[1], buf[2], buf[3]);
+  sys_munmap(buf, PAGE_BYTES);
+}
+
+static int find_vfs_file_index(const char *target) {
+  vfs_file_info_t info = vfs_open_file(target);
+  return info.status < 0 ? -1 : (int)info.index;
+}
+
+static void run_vfsexec_demo(void) {
+  int index = find_vfs_file_index(BADPTR_FILE);
+  if (index < 0) {
+    printf("vfsexec: could not resolve %s through VFS\n", BADPTR_FILE);
+    return;
+  }
+
+  vfs_reply_t meta = vfs_call_retry(VFS_FS_REQ_EXEC_INDEX, (uint32_t)index, 0);
+  if (meta.status < 0) {
+    printf("vfsexec: metadata request failed\n");
+    return;
+  }
+
+  uint32_t tid = spawn_program(BADPTR_FILE, PONG_PRIORITY);
+  if ((int)tid < 0) {
+    printf("vfsexec: spawn failed\n");
+    return;
+  }
+
+  wait_info_t status = sys_wait(tid);
+  int ok = status.reason == TASK_TERM_EXITED && status.exit_code == 0;
+  printf("vfsexec: %s index=%lu size=%lu tid=%u\n",
+         ok ? "ok" : "failed", meta.value0, meta.value1, tid);
+  print_wait_result(status);
+}
+
+static void run_vfsopen_command(const char *name) {
+  vfs_file_info_t info = vfs_open_file(name);
+  if (info.status < 0) {
+    printf("vfsopen: '%s' not found\n", name);
+    return;
+  }
+
+  printf("vfsopen: %s index=%u size=%lu\n", name, info.index, info.size);
+  vfs_close_handle(info.handle);
 }
 
 static void print_prompt(void) { printf("\nNeptune> "); }
@@ -1154,7 +1457,8 @@ void _start(void) {
         printf("  run <file>    Ask FS for an executable cap and spawn it\n");
         printf("  clear         Clear the screen\n");
         printf("  echo <text>   Print text back to the terminal\n");
-        printf("  ls            List files from the FS server\n");
+        printf("  ls            List files through the VFS fast lane\n");
+        printf("  fsls          List files through legacy FS IPC\n");
         printf("  uptime        Show seconds elapsed since boot\n");
         printf("  mem           Show memory usage\n");
         printf("  vmmap         Show this task's VMAs\n");
@@ -1162,6 +1466,12 @@ void _start(void) {
         printf("  debug         Show kernel build/runtime debug info\n");
         printf("  smoke         Run core regression smoke checks\n");
         printf("  lazy          Check lazy mmap and syscall usercopy\n");
+        printf("  vfstest       Test the EL1 VFS fast lane\n");
+        printf("  vfsinject     Test VFS shared page injection\n");
+        printf("  vfsls         List files through the VFS fast lane\n");
+        printf("  vfsopen <file> Show VFS metadata for one file\n");
+        printf("  vfsread       Read one file page through VFS injection\n");
+        printf("  vfsexec       Resolve an executable through VFS, then spawn it\n");
         printf("  ipcfast       Test 0/8/64/128-byte register IPC\n");
         printf("  ipccap        Transfer an endpoint cap through IPC\n");
         printf("  ipckill       Test IPC cleanup across task kills\n");
@@ -1266,6 +1576,9 @@ void _start(void) {
         printf("\x1b[2J\x1b[H");
 
       } else if (_streq(cmd, "ls")) {
+        list_files_vfs();
+
+      } else if (_streq(cmd, "fsls")) {
         list_files();
 
       } else if (_starts_with(cmd, "echo ")) {
@@ -1300,6 +1613,24 @@ void _start(void) {
 
       } else if (_streq(cmd, "lazy")) {
         run_lazy_memory_check();
+
+      } else if (_streq(cmd, "vfstest")) {
+        run_vfstest_demo();
+
+      } else if (_streq(cmd, "vfsinject")) {
+        run_vfsinject_demo();
+
+      } else if (_streq(cmd, "vfsls")) {
+        list_files_vfs();
+
+      } else if (_starts_with(cmd, "vfsopen ")) {
+        run_vfsopen_command(cmd + 8);
+
+      } else if (_streq(cmd, "vfsread")) {
+        run_vfsread_demo();
+
+      } else if (_streq(cmd, "vfsexec")) {
+        run_vfsexec_demo();
 
       } else if (_streq(cmd, "ipcfast")) {
         run_ipcfast_demo();
