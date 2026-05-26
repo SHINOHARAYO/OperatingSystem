@@ -3,9 +3,7 @@
 
 #include "ipc_proto.h"
 
-#define FS_REQ_LIST 1
-#define FS_REQ_OPEN_EXEC 2
-#define FS_REQ_OPEN_FILE 3
+
 #define FS_RESP_END 0xFFFFFFFFFFFFFFFFUL
 
 #define VFS_ID_FS 1
@@ -16,8 +14,10 @@
 #define VFS_FS_REQ_OPEN_INDEX 5
 #define VFS_FS_REQ_READ_HANDLE_PAGE 6
 #define VFS_FS_REQ_CLOSE_HANDLE 7
+#define VFS_FS_REQ_WRITE_PAGE 8
 
 #define VFS_HANDLE_SHIFT 32
+#define VFS_WRITE_FLAG_TRUNCATE 1ULL
 
 #define USER_BOOT_INITRD_BASE 0xD0000000ULL
 #define USER_BOOT_INITRD_MAX_SIZE (8 * 1024 * 1024)
@@ -39,8 +39,15 @@ typedef struct {
     uint64_t size;
 } initrd_entry_t;
 
-// Boot grants the FS server one local exec cap per initrd index starting here.
-#define FS_BOOT_EXEC_CAP_BASE 64
-#define FS_BOOT_FILE_CAP_BASE 128
+#define FS_WRITE_DATA_OFFSET 80
+#define FS_WRITE_DATA_MAX (4096 - FS_WRITE_DATA_OFFSET)
+
+typedef struct {
+    char name[56];
+    uint64_t offset;
+    uint64_t size;
+    uint64_t flags;
+    unsigned char data[FS_WRITE_DATA_MAX];
+} fs_write_page_t;
 
 #endif

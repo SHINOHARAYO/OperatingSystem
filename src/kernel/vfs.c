@@ -183,7 +183,7 @@ void vfs_call_syscall(uint64_t *regs) {
     }
 
     tcb_t *fs = sched_find_task(caller->vfs_tids[route]);
-    if (!fs || fs->vfs_active_client_tid != 0) {
+    if (!fs) {
         regs[0] = (uint64_t)-1;
         return;
     }
@@ -206,6 +206,30 @@ void vfs_call_syscall(uint64_t *regs) {
 
     enqueue_vfs_caller(fs, caller);
     sched_reschedule();
+}
+
+int vfs_enqueue_kernel_call(tcb_t *caller, tcb_t *fs, uint32_t vfs_id, uint64_t arg0, uint64_t arg1, uint64_t arg2) {
+    if (!caller || !fs) return -1;
+    
+    caller->vfs_active_id = vfs_id;
+    caller->vfs_args[0] = arg0;
+    caller->vfs_args[1] = arg1;
+    caller->vfs_args[2] = arg2;
+    caller->vfs_reply_tid = fs->tid;
+    caller->state = TASK_STATE_BLOCKED_ON_VFS_CALL;
+    caller->ticks_remaining = 0;
+
+    if (fs->state == TASK_STATE_BLOCKED_ON_VFS_RECV) {
+        uint64_t *fs_tf = sched_task_trap_frame(fs);
+        deliver_vfs_call(caller, fs, fs_tf);
+        sched_make_ready(fs);
+        sched_handoff_to_task(fs);
+        return 0;
+    }
+
+    enqueue_vfs_caller(fs, caller);
+    sched_reschedule();
+    return 0;
 }
 
 void vfs_reply_syscall(uint64_t *regs) {
@@ -243,29 +267,26 @@ void vfs_reply_syscall(uint64_t *regs) {
     sched_handoff_to_task(client);
 }
 
-static int range_has_no_mappings(tcb_t *task, uint64_t start, uint64_t size) {
-    for (uint64_t off = 0; off < size; off += PAGE_SIZE) {
-        uint64_t pa = 0;
-        uint64_t entry = 0;
-        if (vmm_query_page(task->pgd, start + off, &pa, &entry) == 0 &&
-            (entry & PTE_USER) != 0) {
-            return -1;
-        }
-    }
-    return 0;
-}
-
-static int range_has_user_write_vmas(tcb_t *task, uint64_t start, uint64_t size) {
+static int get_vma_flags(tcb_t *task, uint64_t start, uint64_t size, uint64_t *out_flags) {
     uint64_t end = start + size;
+    uint64_t combined_flags = 0;
     for (uint64_t va = start; va < end; va += PAGE_SIZE) {
         vma_t *vma = vma_find(&task->vm, va);
-        if (!vma || va < vma->start || va >= vma->end ||
-            (vma->flags & VMA_GUARD) ||
-            (vma->flags & (VMA_USER | VMA_READ | VMA_WRITE)) !=
-                (VMA_USER | VMA_READ | VMA_WRITE)) {
+        if (!vma || va < vma->start || va >= vma->end || (vma->flags & VMA_GUARD)) {
+            return -1;
+        }
+        
+        uint64_t pt_flags = VMM_FLAG_USER_RO;
+        if (vma->flags & VMA_WRITE) pt_flags = VMM_FLAG_USER_RW;
+        
+        if (va == start) {
+            combined_flags = pt_flags;
+        } else if (combined_flags != pt_flags) {
+            // We require uniform permissions for the whole range for simplicity
             return -1;
         }
     }
+    if (out_flags) *out_flags = combined_flags;
     return 0;
 }
 
@@ -284,6 +305,14 @@ static uint64_t find_fs_shared_va(tcb_t *fs, uint64_t size) {
     return 0;
 }
 
+static void copy_page(uint64_t dst_paddr, uint64_t src_paddr) {
+    uint8_t *dst = (uint8_t *)(dst_paddr & PTE_ADDR_MASK);
+    uint8_t *src = (uint8_t *)(src_paddr & PTE_ADDR_MASK);
+    for (uint64_t i = 0; i < PAGE_SIZE; i++) {
+        dst[i] = src[i];
+    }
+}
+
 void vfs_inject_syscall(uint64_t *regs, uint32_t client_tid,
                         uint64_t client_va, uint64_t page_count) {
     tcb_t *fs = sched_current_task();
@@ -300,12 +329,14 @@ void vfs_inject_syscall(uint64_t *regs, uint32_t client_tid,
     uint64_t size = page_count * PAGE_SIZE;
     if (!client || !client->pgd || size > VMA_USER_LIMIT ||
         client_va > VMA_USER_LIMIT || size > VMA_USER_LIMIT - client_va ||
-        range_has_no_mappings(client, client_va, size) < 0) {
+        (vma_range_is_free(&client->vm, client_va, client_va + size) &&
+         get_vma_flags(client, client_va, size, 0) == 0)) {
         regs[0] = 0;
         return;
     }
 
     int client_vma_added = 0;
+    uint64_t client_pt_flags = VMM_FLAG_USER_RW;
     if (vma_range_is_free(&client->vm, client_va, client_va + size)) {
         if (vma_add_ex(&client->vm, client_va, client_va + size,
                        VMA_USER | VMA_READ | VMA_WRITE | VMA_MMAP,
@@ -315,7 +346,7 @@ void vfs_inject_syscall(uint64_t *regs, uint32_t client_tid,
             return;
         }
         client_vma_added = 1;
-    } else if (range_has_user_write_vmas(client, client_va, size) < 0) {
+    } else if (get_vma_flags(client, client_va, size, &client_pt_flags) < 0) {
         regs[0] = 0;
         return;
     }
@@ -339,11 +370,19 @@ void vfs_inject_syscall(uint64_t *regs, uint32_t client_tid,
         if (!frame) {
             break;
         }
-        zero_page(frame->paddr);
+
+        uint64_t old_pa = 0;
+        uint64_t old_entry = 0;
+        if (vmm_query_page(client->pgd, client_va + mapped, &old_pa, &old_entry) == 0 &&
+            (old_entry & PTE_USER) != 0) {
+            copy_page(frame->paddr, old_pa);
+        } else {
+            zero_page(frame->paddr);
+        }
 
         if (vmm_map_page_asid(client->pgd, client->asid,
                               client_va + mapped, frame->paddr,
-                              VMM_FLAG_USER_RW | VMM_FLAG_OWNED) < 0) {
+                              client_pt_flags | VMM_FLAG_OWNED) < 0) {
             frame_unref(frame->paddr);
             break;
         }

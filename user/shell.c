@@ -37,34 +37,18 @@ typedef struct {
   int active;
 } shell_job_t;
 
-typedef struct {
-  int status;
-  uint32_t index;
-  uint32_t handle;
-  uint64_t size;
-} vfs_file_info_t;
-
 static shell_job_t *jobs;
 static uint32_t job_capacity;
 static int keyboard_cap = -1;
-static int fs_cap = -1;
-static int vfs_cap = -1;
-static int vfs_bound = 0;
 static int last_spawn_endpoint_cap = -1;
 
 static void print_wait_result(wait_info_t info);
 static uint32_t spawn_program(const char *name, uint8_t priority);
-static int open_file_cap(const char *name);
 static wait_info_t poll_until_done(uint32_t tid, uint32_t attempts, uint64_t sleep_ms);
 static void run_vfstest_demo(void);
 static void run_vfsinject_demo(void);
+static void run_vfswrite_demo(void);
 static void list_files_vfs(void);
-static vfs_file_info_t vfs_open_file(const char *target);
-static int64_t vfs_read_index(uint32_t index, void *buf);
-static int64_t vfs_read_handle_page(uint32_t handle, uint32_t page_index, void *buf);
-static void vfs_close_handle(uint32_t handle);
-static void *vfs_load_file(const char *name, uint64_t *out_size);
-static uint64_t page_align_size(uint64_t size);
 
 static int ensure_job_capacity(uint32_t min_capacity) {
   if (job_capacity >= min_capacity) {
@@ -286,33 +270,6 @@ static void print_vmmap(void) {
     printf("  %lu/%lu %s\n", vma.committed_pages, vma.max_pages,
            vma_backing_name(vma.backing_type));
   }
-}
-
-static void run_lazy_memory_check(void) {
-  char *name = (char *)malloc(64);
-  if (!name) {
-    printf("lazy: malloc failed\n");
-    return;
-  }
-
-  int file_cap = open_file_cap("shell.elf");
-  int64_t size = file_cap < 0 ? -1 : sys_file_stat((uint32_t)file_cap, name, 64);
-  if (size < 0) {
-    printf("lazy: copy_to_user into lazy page failed\n");
-    return;
-  }
-
-  char *buf = (char *)malloc(8192);
-  if (!buf) {
-    printf("lazy: second malloc failed\n");
-    return;
-  }
-
-  buf[0] = 'N';
-  buf[4096] = 'P';
-  buf[8191] = '!';
-  printf("lazy: %s size=%ld touched=%c%c%c\n",
-         name, size, buf[0], buf[4096], buf[8191]);
 }
 
 static void write_literal(char *dst, const char *src) {
@@ -1033,9 +990,9 @@ static void run_smoke_demo(void) {
   int failures = 0;
 
   printf("smoke: starting\n");
-  run_lazy_memory_check();
   run_vfstest_demo();
   run_vfsinject_demo();
+  run_vfswrite_demo();
   run_ipcfast_demo();
   run_ipccap_demo();
   if (run_and_expect_exit(BADPTR_FILE) < 0) failures++;
@@ -1055,126 +1012,16 @@ static int get_keyboard_cap(void) {
   return keyboard_cap;
 }
 
-static int get_fs_cap(void) {
-  if (fs_cap < 0) {
-    fs_cap = ns_resolve("fs");
-  }
-  return fs_cap;
-}
-
-static int ensure_vfs_bound(void) {
-  if (vfs_bound) {
-    return 0;
-  }
-
-  if (vfs_cap < 0) {
-    vfs_cap = ns_resolve("vfs");
-  }
-  if (vfs_cap < 0) {
-    return -1;
-  }
-  if (sys_vfs_bind(VFS_ID_FS, (uint32_t)vfs_cap) < 0) {
-    return -1;
-  }
-
-  vfs_bound = 1;
-  return 0;
-}
-
-static vfs_reply_t vfs_call_retry(uint64_t arg0, uint64_t arg1, uint64_t arg2) {
-  vfs_reply_t reply;
-  reply.status = -1;
-  reply.value0 = 0;
-  reply.value1 = 0;
-  reply.value2 = 0;
-
-  for (uint32_t attempt = 0; attempt < 20; attempt++) {
-    reply = sys_vfs_call(VFS_ID_FS, arg0, arg1, arg2);
-    if (reply.status >= 0) {
-      return reply;
-    }
-    sys_sleep(10);
-  }
-
-  return reply;
-}
-
-static void pack_fs_name(uint64_t out[3], const char *name) {
-  char *dst = (char *)out;
-  out[0] = 0;
-  out[1] = 0;
-  out[2] = 0;
-  for (int i = 0; i < 23 && name[i]; i++) {
-    dst[i] = name[i];
-  }
-}
-
-static int open_file_cap(const char *name) {
-  int cap = get_fs_cap();
-  if (cap < 0) {
-    return -1;
-  }
-
-  uint64_t packed[3];
-  pack_fs_name(packed, name);
-  uint64_t payload[IPC_INLINE_WORDS] = {
-    [IPC_WORD_OP] = FS_REQ_OPEN_FILE,
-    [IPC_WORD_ARG0] = packed[0],
-    [IPC_WORD_ARG1] = packed[1],
-    [IPC_WORD_ARG2] = packed[2]
-  };
-  ipc_msg_t msg = sys_ipc_call((uint32_t)cap, 0, 32, payload);
-  return msg.status < 0 ? -1 : (int)msg.payload[0];
-}
 
 static uint32_t spawn_program(const char *name, uint8_t priority) {
   last_spawn_endpoint_cap = -1;
-
-  uint64_t elf_size = 0;
-  const uint8_t *elf = (const uint8_t *)vfs_load_file(name, &elf_size);
-  if (!elf || elf_size == 0) {
-    return (uint32_t)-1;
+  spawn_result_t spawned = vfs_spawn_program(name, priority);
+  if (spawned.tid != (uint32_t)-1) {
+    last_spawn_endpoint_cap = spawned.endpoint_cap;
   }
-
-  spawn_result_t spawned = sys_spawn2(elf, elf_size, priority);
-  sys_munmap((void *)elf, page_align_size(elf_size));
-  last_spawn_endpoint_cap = spawned.endpoint_cap;
   return spawned.tid;
 }
 
-static void unpack_fs_name(char *name, const ipc_msg_t *msg) {
-  const char *src = (const char *)&msg->payload[1];
-  int i = 0;
-  for (; i < 23 && src[i]; i++) {
-    name[i] = src[i];
-  }
-  name[i] = '\0';
-}
-
-static void list_files(void) {
-  printf("SIZE      NAME\n");
-
-  for (uint32_t index = 0; index < 128; index++) {
-    int cap = get_fs_cap();
-    uint64_t payload[IPC_INLINE_WORDS] = {
-      [IPC_WORD_OP] = FS_REQ_LIST,
-      [IPC_WORD_ARG0] = index
-    };
-    ipc_msg_t msg = cap < 0 ? (ipc_msg_t){.status = -1} :
-                    sys_ipc_call((uint32_t)cap, 0, 16, payload);
-    if (msg.status < 0) {
-      printf("fs: server unavailable\n");
-      return;
-    }
-    if (msg.payload[0] == FS_RESP_END) {
-      return;
-    }
-
-    char name[24];
-    unpack_fs_name(name, &msg);
-    printf("%lu  %s\n", msg.payload[0], name);
-  }
-}
 
 static void run_vfstest_demo(void) {
   if (ensure_vfs_bound() < 0) {
@@ -1237,118 +1084,6 @@ static void list_files_vfs(void) {
   }
 }
 
-static vfs_file_info_t vfs_open_file(const char *target) {
-  vfs_file_info_t info;
-  info.status = -1;
-  info.index = 0;
-  info.handle = 0;
-  info.size = 0;
-
-  if (ensure_vfs_bound() < 0) {
-    return info;
-  }
-
-  for (uint32_t index = 0; index < 128; index++) {
-    char *name = (char *)sys_mmap(PAGE_BYTES);
-    if (!name) {
-      return info;
-    }
-
-    vfs_reply_t reply = vfs_call_retry(VFS_FS_REQ_LIST, index, (uint64_t)name);
-    if (reply.status < 0 || reply.value0 == FS_RESP_END) {
-      sys_munmap(name, PAGE_BYTES);
-      return info;
-    }
-    if (_streq(name, target)) {
-      vfs_reply_t opened = vfs_call_retry(VFS_FS_REQ_OPEN_INDEX, index, 0);
-      sys_munmap(name, PAGE_BYTES);
-      if (opened.status < 0 || opened.value0 == 0) {
-        return info;
-      }
-      info.status = 0;
-      info.index = index;
-      info.handle = (uint32_t)opened.value0;
-      info.size = opened.value1;
-      return info;
-    }
-    sys_munmap(name, PAGE_BYTES);
-  }
-
-  return info;
-}
-
-static int64_t vfs_read_index(uint32_t index, void *buf) {
-  if (!buf || ensure_vfs_bound() < 0) {
-    return -1;
-  }
-
-  vfs_reply_t reply = vfs_call_retry(VFS_FS_REQ_READ_INDEX, index, (uint64_t)buf);
-  return reply.status < 0 ? -1 : (int64_t)reply.value0;
-}
-
-static int64_t vfs_read_handle_page(uint32_t handle, uint32_t page_index, void *buf) {
-  if (!buf || handle == 0 || ensure_vfs_bound() < 0) {
-    return -1;
-  }
-
-  uint64_t descriptor = ((uint64_t)handle << VFS_HANDLE_SHIFT) | page_index;
-  vfs_reply_t reply = vfs_call_retry(VFS_FS_REQ_READ_HANDLE_PAGE,
-                                     descriptor, (uint64_t)buf);
-  return reply.status < 0 ? -1 : (int64_t)reply.value0;
-}
-
-static void vfs_close_handle(uint32_t handle) {
-  if (handle == 0 || ensure_vfs_bound() < 0) {
-    return;
-  }
-  (void)vfs_call_retry(VFS_FS_REQ_CLOSE_HANDLE, handle, 0);
-}
-
-static void *vfs_load_file(const char *name, uint64_t *out_size) {
-  if (out_size) {
-    *out_size = 0;
-  }
-
-  vfs_file_info_t info = vfs_open_file(name);
-  if (info.status < 0 || info.size == 0) {
-    return 0;
-  }
-
-  uint64_t aligned_size = (info.size + PAGE_BYTES - 1) & ~(PAGE_BYTES - 1);
-  unsigned char *buf = (unsigned char *)sys_mmap(aligned_size);
-  if (!buf) {
-    vfs_close_handle(info.handle);
-    return 0;
-  }
-
-  uint32_t pages = (uint32_t)(aligned_size / PAGE_BYTES);
-  uint64_t loaded = 0;
-  for (uint32_t page = 0; page < pages; page++) {
-    int64_t got = vfs_read_handle_page(info.handle, page, buf + ((uint64_t)page * PAGE_BYTES));
-    if (got < 0) {
-      vfs_close_handle(info.handle);
-      return 0;
-    }
-    loaded += (uint64_t)got;
-    if ((uint64_t)got < PAGE_BYTES) {
-      break;
-    }
-  }
-
-  vfs_close_handle(info.handle);
-  if (loaded < info.size) {
-    return 0;
-  }
-
-  if (out_size) {
-    *out_size = info.size;
-  }
-  return buf;
-}
-
-static uint64_t page_align_size(uint64_t size) {
-  return (size + PAGE_BYTES - 1) & ~(PAGE_BYTES - 1);
-}
 
 static void run_vfsread_demo(void) {
   if (ensure_vfs_bound() < 0) {
@@ -1371,23 +1106,60 @@ static void run_vfsread_demo(void) {
   sys_munmap(buf, PAGE_BYTES);
 }
 
-static int find_vfs_file_index(const char *target) {
-  vfs_file_info_t info = vfs_open_file(target);
-  return info.status < 0 ? -1 : (int)info.index;
+static void run_vfswrite_demo(void) {
+  fs_write_page_t *request = (fs_write_page_t *)sys_mmap(PAGE_BYTES);
+  char *readback = (char *)sys_mmap(PAGE_BYTES);
+  if (!request || !readback) {
+    printf("vfswrite: mmap failed\n");
+    if (request) sys_munmap(request, PAGE_BYTES);
+    if (readback) sys_munmap(readback, PAGE_BYTES);
+    return;
+  }
+
+  for (uint32_t i = 0; i < PAGE_BYTES; i++) {
+    ((char *)request)[i] = 0;
+    readback[i] = 0;
+  }
+
+  const char *name = "notes.txt";
+  const char *text = "Neptune writable FatFs path is alive.";
+  write_literal(request->name, name);
+  write_literal((char *)request->data, text);
+  request->offset = 0;
+  request->size = 0;
+  while (text[request->size]) {
+    request->size++;
+  }
+  request->flags = VFS_WRITE_FLAG_TRUNCATE;
+
+  int64_t wrote = vfs_write_page(request);
+  vfs_file_info_t info = vfs_open_file(name);
+  int64_t read = -1;
+  if (info.status == 0) {
+    read = vfs_read_handle_page(info.handle, 0, readback);
+    vfs_close_handle(info.handle);
+  }
+
+  int ok = wrote == (int64_t)request->size &&
+           read >= wrote &&
+           streq(readback, text);
+  printf("vfswrite: %s wrote=%ld read=%ld file=%s size=%lu\n",
+         ok ? "ok" : "failed", wrote, read, name,
+         info.status == 0 ? info.size : 0);
+
+  sys_munmap(request, PAGE_BYTES);
+  sys_munmap(readback, PAGE_BYTES);
 }
 
 static void run_vfsexec_demo(void) {
-  int index = find_vfs_file_index(BADPTR_FILE);
-  if (index < 0) {
+  vfs_file_info_t info = vfs_open_file(BADPTR_FILE);
+  if (info.status < 0) {
     printf("vfsexec: could not resolve %s through VFS\n", BADPTR_FILE);
     return;
   }
-
-  vfs_reply_t meta = vfs_call_retry(VFS_FS_REQ_EXEC_INDEX, (uint32_t)index, 0);
-  if (meta.status < 0) {
-    printf("vfsexec: metadata request failed\n");
-    return;
-  }
+  uint32_t index = info.index;
+  uint64_t size = info.size;
+  vfs_close_handle(info.handle);
 
   uint32_t tid = spawn_program(BADPTR_FILE, PONG_PRIORITY);
   if ((int)tid < 0) {
@@ -1398,7 +1170,7 @@ static void run_vfsexec_demo(void) {
   wait_info_t status = sys_wait(tid);
   int ok = status.reason == TASK_TERM_EXITED && status.exit_code == 0;
   printf("vfsexec: %s index=%lu size=%lu tid=%u\n",
-         ok ? "ok" : "failed", meta.value0, meta.value1, tid);
+         ok ? "ok" : "failed", (uint64_t)index, size, tid);
   print_wait_result(status);
 }
 
@@ -1454,23 +1226,22 @@ void _start(void) {
         printf("  spawn fault   Spawn fault test, leave status for wait <tid>\n");
         printf("  spawn spin    Spawn a child that runs until killed\n");
         printf("  badptr        Verify bad syscall pointers are rejected\n");
-        printf("  run <file>    Ask FS for an executable cap and spawn it\n");
+        printf("  run <file>    Spawn through a kernel-owned VFS exec object\n");
         printf("  clear         Clear the screen\n");
         printf("  echo <text>   Print text back to the terminal\n");
         printf("  ls            List files through the VFS fast lane\n");
-        printf("  fsls          List files through legacy FS IPC\n");
         printf("  uptime        Show seconds elapsed since boot\n");
         printf("  mem           Show memory usage\n");
         printf("  vmmap         Show this task's VMAs\n");
         printf("  capstat       Show this task's capability slots\n");
         printf("  debug         Show kernel build/runtime debug info\n");
         printf("  smoke         Run core regression smoke checks\n");
-        printf("  lazy          Check lazy mmap and syscall usercopy\n");
         printf("  vfstest       Test the EL1 VFS fast lane\n");
         printf("  vfsinject     Test VFS shared page injection\n");
         printf("  vfsls         List files through the VFS fast lane\n");
         printf("  vfsopen <file> Show VFS metadata for one file\n");
         printf("  vfsread       Read one file page through VFS injection\n");
+        printf("  vfswrite      Create and verify notes.txt through writable FatFs\n");
         printf("  vfsexec       Resolve an executable through VFS, then spawn it\n");
         printf("  ipcfast       Test 0/8/64/128-byte register IPC\n");
         printf("  ipccap        Transfer an endpoint cap through IPC\n");
@@ -1482,9 +1253,9 @@ void _start(void) {
         printf("  memrevoke     Lend then revoke a child mapping\n");
         printf("  munmap        Unmap one lazy mmap page\n");
         printf("  forkcow       Fork shell and verify copy-on-write\n");
-        printf("  filelazy      Lazily map an initrd file and read it\n");
+        printf("  filelazy      Read one file page through the VFS page path\n");
         printf("  vmstress      Grow and shrink the VMA table\n");
-        printf("  lazyexec      Spawn an initrd ELF through lazy VM objects\n");
+        printf("  lazyexec      Spawn badptr.elf through the VFS executable path\n");
         printf("  taskstress    Grow the kernel task table with spin tasks\n");
         printf("  ps            Show task scheduler state\n");
         printf("  jobs          Show shell child jobs\n");
@@ -1578,8 +1349,6 @@ void _start(void) {
       } else if (_streq(cmd, "ls")) {
         list_files_vfs();
 
-      } else if (_streq(cmd, "fsls")) {
-        list_files();
 
       } else if (_starts_with(cmd, "echo ")) {
         printf("%s\n", cmd + 5);
@@ -1611,8 +1380,6 @@ void _start(void) {
       } else if (_streq(cmd, "smoke")) {
         run_smoke_demo();
 
-      } else if (_streq(cmd, "lazy")) {
-        run_lazy_memory_check();
 
       } else if (_streq(cmd, "vfstest")) {
         run_vfstest_demo();
@@ -1628,6 +1395,9 @@ void _start(void) {
 
       } else if (_streq(cmd, "vfsread")) {
         run_vfsread_demo();
+
+      } else if (_streq(cmd, "vfswrite")) {
+        run_vfswrite_demo();
 
       } else if (_streq(cmd, "vfsexec")) {
         run_vfsexec_demo();

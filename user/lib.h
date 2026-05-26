@@ -7,6 +7,8 @@ typedef unsigned int   uint32_t;
 typedef unsigned short uint16_t;
 typedef unsigned char  uint8_t;
 
+#include "fs_proto.h"
+
 typedef struct {
     uint32_t present;
     uint32_t tid;
@@ -702,6 +704,20 @@ static inline int sys_munmap(void *addr, uint64_t size) {
     return (int)x0;
 }
 
+static inline uint64_t sys_dma_paddr(void *addr) {
+    register uint64_t x0 asm("x0") = (uint64_t)addr;
+    register uint64_t x8 asm("x8") = 48;
+
+    asm volatile(
+        "svc #0"
+        : "+r" (x0)
+        : "r" (x8)
+        : "memory"
+    );
+
+    return x0;
+}
+
 static inline void *sys_mem_lend(uint32_t target_tid, uint32_t mem_cap, uint64_t dst_hint) {
     register uint64_t x0 asm("x0") = target_tid;
     register uint64_t x1 asm("x1") = mem_cap;
@@ -940,6 +956,26 @@ static inline vfs_request_t sys_vfs_recv(void) {
     return request;
 }
 
+static inline int sys_vfs_exec_create(uint32_t client_tid,
+                                      const void *elf_data,
+                                      uint64_t elf_size,
+                                      uint32_t file_index) {
+    register uint64_t x0 asm("x0") = client_tid;
+    register uint64_t x1 asm("x1") = (uint64_t)elf_data;
+    register uint64_t x2 asm("x2") = elf_size;
+    register uint64_t x3 asm("x3") = file_index;
+    register uint64_t x8 asm("x8") = 47;
+
+    asm volatile(
+        "svc #0"
+        : "+r" (x0)
+        : "r" (x1), "r" (x2), "r" (x3), "r" (x8)
+        : "memory"
+    );
+
+    return (int)x0;
+}
+
 static inline wait_info_t sys_wait(uint32_t tid) {
     register uint64_t x0 asm("x0") = (uint64_t)tid;
     register uint64_t x1 asm("x1");
@@ -995,5 +1031,24 @@ static inline wait_info_t sys_poll(uint32_t tid) {
     info.far = x6;
     return info;
 }
+#define VFS_HANDLE_SHIFT 32
+
+typedef struct {
+    int status;
+    uint32_t index;
+    uint32_t handle;
+    uint64_t size;
+} vfs_file_info_t;
+
+int streq(const char *a, const char *b);
+int ensure_vfs_bound(void);
+vfs_reply_t vfs_call_retry(uint64_t arg0, uint64_t arg1, uint64_t arg2);
+vfs_file_info_t vfs_open_file(const char *target);
+int64_t vfs_read_index(uint32_t index, void *buf);
+int64_t vfs_read_handle_page(uint32_t handle, uint32_t page_index, void *buf);
+int64_t vfs_write_page(fs_write_page_t *request);
+void vfs_close_handle(uint32_t handle);
+spawn_result_t vfs_spawn_program(const char *name, uint8_t priority);
+uint64_t page_align_size(uint64_t size);
 
 #endif

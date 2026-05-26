@@ -31,9 +31,10 @@ Useful targets:
 | Target | Purpose |
 | --- | --- |
 | `make` | Build the kernel EFI image, user ELFs, and initrd |
-| `make image` | Create `build/fat.img` with `BOOTAA64.EFI` and `initrd.bin` |
-| `make run` | Boot QEMU in `-nographic` mode |
-| `make run_g` | Boot QEMU with a graphical display |
+| `make image` | Create `build/fat.img`, `initrd.bin`, and create `build/storage.fat` only if missing |
+| `make run` | Rebuild the image targets and boot QEMU in `-nographic` mode |
+| `make run_g` | Rebuild the image targets and boot QEMU with a graphical display |
+| `make reset-storage` | Replace `build/storage.fat` with a fresh copy of `apps.fat` |
 | `make clean` | Remove generated build output |
 
 The default QEMU memory size is `2048M`.
@@ -72,14 +73,18 @@ Neptune currently boots this service stack:
 | `uart_server` | EL0 | Serial output service |
 | `keyboard_server` | EL0 | Keyboard input service |
 | `name_server` | EL0 | Service registry and endpoint lookup |
-| `fs_server` | EL0 | Initrd-backed filesystem service |
+| `block_server` | EL0 | Virtio-mmio block driver with RAM fallback |
+| `fs_server` | EL0 | FatFs-backed filesystem and VFS service |
 | `shell` | EL0 | Interactive command shell |
 
 The kernel keeps authority, scheduling, memory mappings, faults, and IPC
 handoff. Filesystem metadata and directory state now live in `fs.elf` user
-memory. The boot initrd is mapped read-only into the FS task at
-`0xD0000000`; inside it, `fs.elf` mounts `apps.fat` with FatFs and serves file
-operations from that real FAT volume.
+memory. `block.elf` first probes the QEMU virtio-mmio transport bank and, when
+present, exposes `build/storage.fat` as a persistent sector device over
+capability IPC. If no virtio block device is available, it falls back to a RAM
+copy of `apps.fat` from the boot initrd mapped at `0xD0000000`. `fs.elf` mounts
+the block service with FatFs and serves file operations through the VFS fast
+channel.
 
 ## Implemented Features
 
@@ -92,6 +97,7 @@ operations from that real FAT volume.
 - 39-bit lower-half virtual address layout.
 - 40-bit physical-address support.
 - ASID-aware user address spaces with targeted TLB invalidation.
+- QEMU virtio-mmio block window mapping for the EL0 block driver.
 
 ### Scheduler
 
@@ -121,10 +127,11 @@ operations from that real FAT volume.
 - VMA split/remove/coalesce support.
 - Lazy anonymous `mmap`.
 - Lazy file-backed mappings.
-- Lazy executable loading for initrd-backed spawns.
+- Lazy executable segment loading for kernel initrd-backed spawn paths.
 - Dynamic stack growth up to 64 KiB with a moving guard page.
 - `fork` with copy-on-write for writable frame-backed user pages.
 - Public `munmap`.
+- `sys_dma_paddr()` helper for EL0 drivers that need guest physical addresses.
 - `vmmap` inspection from the shell.
 
 ### Fault And User Safety
@@ -135,7 +142,7 @@ operations from that real FAT volume.
 - Invalid user pointers are rejected.
 - User faults kill only the faulting task.
 
-### Orange Cat Capabilities
+### Object Capabilities
 
 - Unified per-task capability table.
 - Typed slots with object IDs, rights, and flags.
@@ -143,8 +150,6 @@ operations from that real FAT volume.
 - Reserved `CAP_SELF = 1` and `CAP_NS = 2`.
 - Capability checks for IPC, spawn, file access, and memory mapping.
 - `capstat` shell command.
-- Compatibility boot grants for FS file/exec caps are still installed for
-  legacy FS IPC paths.
 
 ### IPC
 
@@ -165,12 +170,25 @@ operations from that real FAT volume.
   `SYS_VFS_INJECT`.
 - Direct handoff from client to FS service for VFS calls.
 - Shared page injection maps pages into both client and FS address spaces.
+- Injection preserves already-mapped client page contents, so the same path can
+  move data FS-to-client or client-to-FS.
 - FatFs is vendored in `third_party/fatfs`.
 - The build creates an `apps.fat` FAT volume containing the user ELFs.
-- `fs.elf` mounts `apps.fat` in EL0 and owns directory/open-handle state.
+- The build creates `build/storage.fat` from `apps.fat` only when it is missing,
+  so filesystem writes survive normal rebuilds.
+- `block.elf` implements a userspace virtio-mmio block driver and exposes
+  512-byte sectors over IPC.
+- `block.elf` falls back to a writable RAM copy of boot `apps.fat` when the
+  virtio device is absent.
+- `fs.elf` talks to `block.elf` through IPC-backed shared memory and mounts the
+  result in EL0 with FatFs.
+- `fs.elf` owns directory and open-handle state.
+- `fs.elf` can create or replace files through FatFs writes.
 - `ls` uses the VFS path.
-- `fsls` remains as the legacy FS-over-IPC fallback.
-- `run <file>` loads executables through VFS and spawns them from shell memory.
+- `run <file>` asks `fs.elf` to read the executable, creates a kernel-owned
+  VFS exec object, and spawns through an `OCAP_EXEC` handle.
+- VFS exec caps are one-shot spawn tickets; the kernel releases the backing
+  exec object after the spawn attempt.
 
 ### Task Lifecycle
 
@@ -212,15 +230,15 @@ File and VFS commands:
 | Command | Purpose |
 | --- | --- |
 | `ls` | List files through the VFS fast channel |
-| `fsls` | List files through legacy FS IPC |
 | `vfstest` | Test VFS call/reply handoff |
 | `vfsinject` | Test shared page injection |
 | `vfsls` | Explicit VFS file listing |
 | `vfsopen <file>` | Show VFS metadata for one file |
 | `vfsread` | Read one file page through VFS injection |
-| `vfsexec` | Resolve an executable through VFS and spawn it |
-| `run <file>` | Load and spawn an initrd ELF through VFS |
-| `filelazy` | Read a file page through the lazy/VFS path |
+| `vfswrite` | Create and verify `notes.txt` through writable FatFs |
+| `vfsexec` | Resolve an executable through VFS, create an exec cap, and spawn it |
+| `run <file>` | Spawn an ELF through a kernel-owned VFS exec object |
+| `filelazy` | Read a file page through the VFS page path |
 | `vmstress` | Stress VMA growth with file mappings |
 
 IPC and memory commands:
@@ -242,8 +260,7 @@ Regression and demo commands:
 | Command | Purpose |
 | --- | --- |
 | `smoke` | Run bounded core regression checks |
-| `lazy` | Test lazy mmap and usercopy |
-| `lazyexec` | Test lazy executable VM objects |
+| `lazyexec` | Spawn `badptr.elf` through the VFS executable path |
 | `taskstress` | Grow the kernel task table |
 | `speed` | Benchmark syscalls, yield, faults, memory, and IPC |
 | `pong` | Run the IPC pong demo |
@@ -272,6 +289,7 @@ ls
 vfstest
 vfsinject
 vfsread
+vfswrite
 run badptr.elf
 wait 7
 ```
@@ -282,8 +300,8 @@ Run core smoke checks:
 smoke
 ```
 
-The current smoke path covers lazy memory, VFS call/injection, register IPC,
-invalid pointers, stack growth, and the speed benchmark.
+The current smoke path covers lazy memory, VFS call/injection, VFS writeback,
+register IPC, invalid pointers, stack growth, and the speed benchmark.
 
 ## User Programs
 
@@ -295,7 +313,8 @@ The current initrd contains:
 | `uart.elf` | `user/uart.c` | UART service |
 | `keyboard.elf` | `user/keyboard.c` | Keyboard service |
 | `ns.elf` | `user/ns.c` | Name server |
-| `fs.elf` | `user/fs.c` | Initrd FS and VFS service |
+| `block.elf` | `user/block.c` | Virtio-mmio/RAM FAT block service |
+| `fs.elf` | `user/fs.c` | FatFs and VFS service |
 | `pong.elf` | `user/pong.c` | IPC demo |
 | `fault.elf` | `user/fault.c` | Deliberate fault test |
 | `spin.elf` | `user/spin.c` | Long-running task |
@@ -314,12 +333,11 @@ The current initrd contains:
 
 - Single-core CPU0 scheduling only; the structures are ready for later SMP.
 - User programs are still packaged into `initrd.bin` at build time.
-- The current public FS backend is a read-only FAT12 boot volume inside initrd.
-- No persistent filesystem or file writes yet.
-- No user-space block driver or DMA path yet.
-- VFS currently fronts the FatFs-backed boot volume only.
-- FS-over-IPC compatibility still exists while the VFS path finishes taking
-  over every file operation.
+- `make clean` removes the whole `build` directory, including `storage.fat`.
+- The block driver supports QEMU virtio-mmio only; no PCI virtio discovery yet.
+- DMA is exposed through a narrow physical-address helper, not a full
+  capability-scoped DMA subsystem yet.
+- VFS currently fronts one FatFs-backed volume only.
 - The initrd page cache and VM object tables are fixed-size v1 tables.
 - Memory-cap object and mapping tables are fixed-size v1 tables.
 - Copy-on-write currently covers forked, writable, frame-backed user pages.
@@ -328,11 +346,9 @@ The current initrd contains:
 
 ## Good Next Steps
 
-- Remove the remaining legacy FS-over-IPC path once VFS covers every command.
-- Move executable spawning to a cleaner kernel-owned VFS exec object instead of
-  shell-loaded bytes.
-- Add a writable user-space filesystem service.
-- Add a user-space block driver and connect it to VFS injected buffers.
+- Add PCI/ACPI discovery for virtio devices instead of relying on the QEMU
+  virtio-mmio transport bank.
+- Replace `sys_dma_paddr()` with capability-scoped DMA memory objects.
 - Add host-side automated QEMU smoke scripts.
 - Extend the per-core scheduler work toward SMP.
 - Replace fixed-size v1 object tables with growable or reclaiming allocators.

@@ -106,3 +106,7 @@ int initrd_get_file(uint32_t index, const uint8_t **data, uint64_t *size) {
     *size = initrd_entries[index].size;
     return 0;
 }
+
+const initrd_header_t *initrd_get_header(void) {
+    return initrd_header;
+}

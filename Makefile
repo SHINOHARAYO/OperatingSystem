@@ -21,7 +21,7 @@ USER_HEADERS   := $(wildcard user/*.h)
 USER_ELFS      := $(BUILD)/shell.elf $(BUILD)/pong.elf $(BUILD)/fault.elf $(BUILD)/spin.elf $(BUILD)/badptr.elf \
                   $(BUILD)/stackgrow.elf $(BUILD)/memshare.elf $(BUILD)/memxfer.elf $(BUILD)/memrevoke.elf \
                   $(BUILD)/ipcfast.elf $(BUILD)/ipccap.elf $(BUILD)/ipckill.elf $(BUILD)/speed.elf $(BUILD)/speedipc.elf \
-                  $(BUILD)/uart.elf $(BUILD)/keyboard.elf $(BUILD)/ns.elf $(BUILD)/fs.elf
+                  $(BUILD)/uart.elf $(BUILD)/keyboard.elf $(BUILD)/ns.elf $(BUILD)/block.elf $(BUILD)/fs.elf
 
 USER_CFLAGS = -target aarch64-linux-gnu -ffreestanding -nostdlib -static -fno-builtin \
               -Ithird_party/fatfs -Wl,-Ttext=0x80000000 -Wl,--entry=_start
@@ -30,6 +30,8 @@ USER_CFLAGS = -target aarch64-linux-gnu -ffreestanding -nostdlib -static -fno-bu
 
 all: $(TARGET) $(BUILD)/initrd.bin
 	@echo "Build successful: $(TARGET)"
+
+.PHONY: all user_apps image run run_g runwin reset-storage clean
 
 $(BUILD):
 	mkdir -p $(BUILD)
@@ -93,6 +95,9 @@ $(BUILD)/keyboard.elf: user/keyboard.c user/lib.h user/lib.c user/ns_proto.h use
 $(BUILD)/ns.elf: user/ns.c user/ns_proto.h user/ipc_proto.h user/lib.h user/lib.c | $(BUILD)
 	clang $(USER_CFLAGS) user/ns.c user/lib.c -o $(BUILD)/ns.elf
 
+$(BUILD)/block.elf: user/block.c user/block_proto.h user/fs_proto.h user/ns_proto.h user/ipc_proto.h user/lib.h user/lib.c | $(BUILD)
+	clang $(USER_CFLAGS) user/block.c user/lib.c -o $(BUILD)/block.elf
+
 $(BUILD)/fs.elf: user/fs.c user/fat_diskio.c user/fat_diskio.h user/fat_unicode.c user/fs_proto.h user/ns_proto.h user/ipc_proto.h user/lib.h user/lib.c user/malloc.h user/malloc.c third_party/fatfs/ff.c third_party/fatfs/ff.h third_party/fatfs/diskio.h third_party/fatfs/ffconf.h | $(BUILD)
 	clang $(USER_CFLAGS) user/fs.c user/fat_diskio.c user/fat_unicode.c user/lib.c user/malloc.c third_party/fatfs/ff.c -o $(BUILD)/fs.elf
 
@@ -111,6 +116,7 @@ $(BUILD)/initrd.bin: $(BUILD)/mkinitrd user_apps $(BUILD)/apps.fat | $(BUILD)
 		$(BUILD)/uart.elf \
 		$(BUILD)/keyboard.elf \
 		$(BUILD)/ns.elf \
+		$(BUILD)/block.elf \
 		$(BUILD)/fs.elf \
 		$(BUILD)/pong.elf \
 		$(BUILD)/fault.elf \
@@ -205,7 +211,10 @@ $(TARGET): $(OBJ) | $(BUILD)
 
 # ── Image & Run ───────────────────────────────────────────────────────────────
 
-image: $(TARGET) $(BUILD)/initrd.bin
+$(BUILD)/storage.fat: | $(BUILD)/apps.fat
+	cp $(BUILD)/apps.fat $(BUILD)/storage.fat
+
+image: $(TARGET) $(BUILD)/initrd.bin | $(BUILD)/storage.fat
 	@echo "Creating FAT32 image..."
 	dd if=/dev/zero of=$(BUILD)/fat.img bs=1M count=64
 	mkfs.fat -F 32 $(BUILD)/fat.img
@@ -215,6 +224,10 @@ image: $(TARGET) $(BUILD)/initrd.bin
 	mcopy -i $(BUILD)/fat.img $(BUILD)/initrd.bin ::/initrd.bin
 	@echo "Image created: $(BUILD)/fat.img"
 
+reset-storage:
+	rm -f $(BUILD)/storage.fat
+	$(MAKE) $(BUILD)/storage.fat
+
 run: image
 	qemu-system-aarch64 \
 		-M virt \
@@ -222,6 +235,9 @@ run: image
 		-m $(QEMU_MEM) \
 		-bios /usr/share/qemu-efi-aarch64/QEMU_EFI.fd \
 		-drive file=$(BUILD)/fat.img,format=raw,if=virtio \
+		-drive file=$(BUILD)/storage.fat,format=raw,if=none,id=storage \
+		-device virtio-blk-device,drive=storage \
+		-global virtio-mmio.force-legacy=false \
 		-nographic
 
 run_g: image
@@ -230,7 +246,10 @@ run_g: image
 		-cpu $(QEMU_CPU) \
 		-m $(QEMU_MEM) \
 		-bios /usr/share/qemu-efi-aarch64/QEMU_EFI.fd \
-		-drive file=$(BUILD)/fat.img,format=raw,if=virtio
+		-drive file=$(BUILD)/fat.img,format=raw,if=virtio \
+		-drive file=$(BUILD)/storage.fat,format=raw,if=none,id=storage \
+		-device virtio-blk-device,drive=storage \
+		-global virtio-mmio.force-legacy=false
 
 runwin: image
 	mingw-w64-clang-aarch64-qemu \
@@ -238,7 +257,10 @@ runwin: image
 		-cpu $(QEMU_WIN_CPU) \
 		-m $(QEMU_MEM) \
 		-bios /usr/share/qemu-efi-aarch64/QEMU_EFI.fd \
-		-drive file=$(BUILD)/fat.img,format=raw,if=virtio
+		-drive file=$(BUILD)/fat.img,format=raw,if=virtio \
+		-drive file=$(BUILD)/storage.fat,format=raw,if=none,id=storage \
+		-device virtio-blk-device,drive=storage \
+		-global virtio-mmio.force-legacy=false
 
 clean:
 	rm -rf $(BUILD) user/*_elf.h

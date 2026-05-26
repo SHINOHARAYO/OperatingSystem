@@ -18,6 +18,9 @@
 
 #define UART_MMIO_PA 0x09000000ULL
 #define USER_UART_MMIO_VA 0xB0000000ULL
+#define USER_VIRTIO_BLK_MMIO_VA 0xB0010000ULL
+#define VIRTIO_BLK_MMIO_PA 0x0A000000ULL
+#define VIRTIO_BLK_MMIO_SIZE 0x4000ULL
 
 #define PANIC(msg)                                                             \
   do {                                                                         \
@@ -165,6 +168,35 @@ void neptune_kmain(void *memory_map, uint64_t map_size, uint64_t desc_size,
     }
   }
 
+  const uint8_t *block_elf = 0;
+  uint64_t block_elf_len = 0;
+  if (initrd_find("block.elf", &block_elf, &block_elf_len) < 0) {
+    LOG_FAIL("INITRD: Missing block.elf.");
+    while (1) __asm__ volatile("wfi");
+  }
+
+  LOG_DEBUG_HEX("Creating Block Server ELF Blob Size: ", block_elf_len);
+  int block_tid = sched_create_user_task(block_elf, block_elf_len, 5);
+  if (block_tid < 0) {
+    LOG_FAIL("Failed to create block server.");
+    while (1) __asm__ volatile("wfi");
+  }
+  if (sched_map_boot_data((uint32_t)block_tid, initrd_data, initrd_size,
+                          USER_BOOT_INITRD_BASE) < 0) {
+    LOG_FAIL("Failed to map boot initrd into block server.");
+    while (1) __asm__ volatile("wfi");
+  }
+  uint64_t *block_pgd = sched_get_task_pgd(block_tid);
+  uint16_t block_asid = sched_get_task_asid(block_tid);
+  if (block_pgd) {
+    for (uint64_t off = 0; off < VIRTIO_BLK_MMIO_SIZE; off += 4096) {
+      if (vmm_map_page_asid(block_pgd, block_asid, USER_VIRTIO_BLK_MMIO_VA + off,
+                            VIRTIO_BLK_MMIO_PA + off, VMM_FLAG_USER_DEVICE) < 0) {
+        LOG_WARN("Failed to map virtio-blk MMIO page for block server.");
+      }
+    }
+  }
+
   const uint8_t *fs_elf = 0;
   uint64_t fs_elf_len = 0;
   if (initrd_find("fs.elf", &fs_elf, &fs_elf_len) < 0) {
@@ -177,26 +209,6 @@ void neptune_kmain(void *memory_map, uint64_t map_size, uint64_t desc_size,
   if (fs_tid < 0) {
     LOG_FAIL("Failed to create FS server.");
     while (1) __asm__ volatile("wfi");
-  }
-  if (sched_map_boot_data((uint32_t)fs_tid, initrd_data, initrd_size,
-                          USER_BOOT_INITRD_BASE) < 0) {
-    LOG_FAIL("Failed to map boot initrd into FS server.");
-    while (1) __asm__ volatile("wfi");
-  }
-  uint64_t initrd_count = initrd_file_count();
-  for (uint32_t i = 0; i < initrd_count; i++) {
-    if (sched_install_exec_cap_at((uint32_t)fs_tid,
-                                  FS_BOOT_EXEC_CAP_BASE + i,
-                                  i) < 0) {
-      LOG_FAIL("Failed to bootstrap legacy FS executable capability.");
-      while (1) __asm__ volatile("wfi");
-    }
-    if (sched_install_file_cap_at((uint32_t)fs_tid,
-                                  FS_BOOT_FILE_CAP_BASE + i,
-                                  i) < 0) {
-      LOG_FAIL("Failed to bootstrap legacy FS file capability.");
-      while (1) __asm__ volatile("wfi");
-    }
   }
 
   const uint8_t *shell_elf = 0;

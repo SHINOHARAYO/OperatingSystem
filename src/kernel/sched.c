@@ -32,6 +32,7 @@ extern uint64_t l1_table[512];
 #define SCHED_LEVELS 32
 #define SCHED_TIMER_WHEEL_SIZE 1024
 #define SCHED_BOOST_INTERVAL 1000
+#define MAX_VFS_EXEC_OBJECTS 32
 
 static tcb_t *tasks = NULL;
 static uint32_t task_capacity = 0;
@@ -55,8 +56,19 @@ typedef struct {
     uint64_t far;
 } termination_record_t;
 
+typedef struct {
+    uint32_t present;
+    uint32_t owner_tid;
+    uint32_t fs_tid;
+    uint32_t file_index;
+    uint64_t size;
+    uint32_t pages;
+    uint8_t *data;
+} vfs_exec_object_t;
+
 static termination_record_t *termination_records = NULL;
 static uint32_t termination_table_pages = 0;
+static vfs_exec_object_t vfs_exec_objects[MAX_VFS_EXEC_OBJECTS];
 static void clear_caps(tcb_t *task);
 static void clear_termination_record(termination_record_t *record);
 static int install_cap(tcb_t *task, uint32_t type, uint32_t object_id,
@@ -409,10 +421,47 @@ static int ensure_cap_capacity(tcb_t *task, uint32_t min_capacity) {
     return ocap_ensure(&task->caps, min_capacity);
 }
 
+static void clear_vfs_exec_object(vfs_exec_object_t *object) {
+    if (!object) {
+        return;
+    }
+    if (object->data && object->pages) {
+        pmm_free_contiguous_pages(object->data, object->pages);
+    }
+    object->present = 0;
+    object->owner_tid = 0;
+    object->fs_tid = 0;
+    object->file_index = 0;
+    object->size = 0;
+    object->pages = 0;
+    object->data = NULL;
+}
+
+static void release_vfs_exec_object(uint32_t object_id) {
+    if (object_id == 0 || object_id >= MAX_VFS_EXEC_OBJECTS) {
+        return;
+    }
+    clear_vfs_exec_object(&vfs_exec_objects[object_id]);
+}
+
+static void release_vfs_exec_caps(tcb_t *task) {
+    if (!task || !task->caps.entries) {
+        return;
+    }
+
+    for (uint32_t i = 0; i < task->caps.capacity; i++) {
+        ocap_t *cap = &task->caps.entries[i];
+        if (cap->type == OCAP_EXEC && (cap->flags & OCAP_FLAG_VFS_EXEC)) {
+            release_vfs_exec_object(cap->object_id);
+        }
+    }
+}
+
 static void clear_caps(tcb_t *task) {
     if (!task) {
         return;
     }
+    release_vfs_exec_caps(task);
     ocap_clear(&task->caps);
 }
 
@@ -2082,6 +2131,87 @@ int sched_map_boot_data(uint32_t tid, const void *data, uint64_t size, uint64_t 
     return 0;
 }
 
+static int find_free_vfs_exec_object(void) {
+    for (uint32_t i = 1; i < MAX_VFS_EXEC_OBJECTS; i++) {
+        if (!vfs_exec_objects[i].present) {
+            return (int)i;
+        }
+    }
+    return -1;
+}
+
+int sched_vfs_exec_create_syscall(uint64_t *regs, uint32_t client_tid,
+                                  uint64_t elf_data, uint64_t elf_size,
+                                  uint32_t file_index) {
+    tcb_t *fs = current_task;
+    if (!regs || !fs || !fs->pgd || client_tid == 0 || elf_data == 0 ||
+        elf_size < sizeof(Elf64_Ehdr) || elf_size > MAX_USER_SPAWN_ELF_SIZE) {
+        if (regs) regs[0] = (uint64_t)-1;
+        return -1;
+    }
+
+    tcb_t *client = sched_find_task(client_tid);
+    if (!client || client->state != TASK_STATE_BLOCKED_ON_VFS_CALL ||
+        client->vfs_reply_tid != fs->tid ||
+        fs->vfs_active_client_tid != client_tid ||
+        fs->vfs_active_id != VFS_ID_FS) {
+        regs[0] = (uint64_t)-1;
+        return -1;
+    }
+
+    if (user_range_readable(elf_data, (size_t)elf_size) < 0) {
+        regs[0] = (uint64_t)-1;
+        return -1;
+    }
+
+    uint64_t pages64 = (elf_size + PAGE_SIZE - 1) / PAGE_SIZE;
+    if (pages64 == 0 || pages64 > UINT32_MAX) {
+        regs[0] = (uint64_t)-1;
+        return -1;
+    }
+
+    int object_id = find_free_vfs_exec_object();
+    if (object_id < 0) {
+        regs[0] = (uint64_t)-1;
+        return -1;
+    }
+
+    uint8_t *copy = (uint8_t *)pmm_alloc_contiguous_pages(pages64);
+    if (!copy) {
+        regs[0] = (uint64_t)-1;
+        return -1;
+    }
+
+    if (copy_from_user(copy, elf_data, (size_t)elf_size) < 0 ||
+        copy[0] != 0x7f || copy[1] != 'E' || copy[2] != 'L' || copy[3] != 'F') {
+        pmm_free_contiguous_pages(copy, pages64);
+        regs[0] = (uint64_t)-1;
+        return -1;
+    }
+
+    vfs_exec_object_t *object = &vfs_exec_objects[object_id];
+    object->present = 1;
+    object->owner_tid = client_tid;
+    object->fs_tid = fs->tid;
+    object->file_index = file_index;
+    object->size = elf_size;
+    object->pages = (uint32_t)pages64;
+    object->data = copy;
+
+    int cap_slot = install_cap(client, OCAP_EXEC, (uint32_t)object_id,
+                               OCAP_RIGHT_SPAWN, OCAP_FLAG_VFS_EXEC);
+    if (cap_slot < 0) {
+        clear_vfs_exec_object(object);
+        regs[0] = (uint64_t)-1;
+        return -1;
+    }
+
+    regs[0] = (uint64_t)cap_slot;
+    regs[1] = (uint64_t)object_id;
+    regs[2] = elf_size;
+    return cap_slot;
+}
+
 int sched_spawn_exec_syscall(uint64_t *regs, uint32_t exec_cap, uint8_t priority) {
     ocap_t cap;
     if (!current_task ||
@@ -2093,13 +2223,32 @@ int sched_spawn_exec_syscall(uint64_t *regs, uint32_t exec_cap, uint8_t priority
 
     const uint8_t *elf_data = 0;
     uint64_t elf_size = 0;
-    if (initrd_get_file(cap.object_id, &elf_data, &elf_size) < 0) {
-        if (regs) regs[0] = (uint64_t)-1;
-        return -1;
+    int tid = -1;
+    if (cap.flags & OCAP_FLAG_VFS_EXEC) {
+        if (cap.object_id == 0 || cap.object_id >= MAX_VFS_EXEC_OBJECTS ||
+            !vfs_exec_objects[cap.object_id].present) {
+            if (regs) regs[0] = (uint64_t)-1;
+            return -1;
+        }
+
+        vfs_exec_object_t *object = &vfs_exec_objects[cap.object_id];
+        elf_data = object->data;
+        elf_size = object->size;
+        tid = sched_create_user_task(elf_data, elf_size, priority);
+    } else {
+        if (initrd_get_file(cap.object_id, &elf_data, &elf_size) < 0) {
+            if (regs) regs[0] = (uint64_t)-1;
+            return -1;
+        }
+        tid = sched_create_user_task_from_file(elf_data, elf_size, priority,
+                                               cap.object_id);
     }
 
-    int tid = sched_create_user_task_from_file(elf_data, elf_size, priority,
-                                               cap.object_id);
+    if (cap.flags & OCAP_FLAG_VFS_EXEC) {
+        release_vfs_exec_object(cap.object_id);
+        ocap_revoke_slot(&current_task->caps, exec_cap);
+    }
+
     if (tid >= 0) {
         tcb_t *child = get_tcb((uint32_t)tid);
         if (child) {
@@ -2460,6 +2609,24 @@ void sched_fault_current_task(uint64_t esr, uint64_t elr, uint64_t far) {
 int sched_resolve_user_page(uint64_t user_va, int write) {
     return sched_current_is_user() ?
            sched_resolve_task_page(current_task, user_va, write) : -1;
+}
+
+void sched_dma_paddr_syscall(uint64_t *regs, uint64_t user_va) {
+    if (!regs || !sched_current_is_user() ||
+        sched_resolve_task_page(current_task, user_va, 1) < 0) {
+        if (regs) regs[0] = 0;
+        return;
+    }
+
+    uint64_t pa = 0;
+    uint64_t entry = 0;
+    if (vmm_query_page(current_task->pgd, user_va, &pa, &entry) < 0 ||
+        (entry & PTE_USER) == 0) {
+        regs[0] = 0;
+        return;
+    }
+
+    regs[0] = pa;
 }
 
 void sched_exit_syscall(uint64_t *regs, int exit_code) {

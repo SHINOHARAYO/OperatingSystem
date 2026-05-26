@@ -25,6 +25,8 @@ typedef enum {
 #define OCAP_RIGHT_LEND     (1ULL << 8)
 #define OCAP_RIGHT_REVOKE   (1ULL << 9)
 
+#define OCAP_FLAG_VFS_EXEC  (1ULL << 0)
+
 typedef struct {
     uint32_t type;
     uint32_t object_id;

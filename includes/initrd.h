@@ -26,3 +26,4 @@ int initrd_find_index(const char *name, uint32_t *index);
 uint32_t initrd_file_count(void);
 const initrd_entry_t *initrd_get_entry(uint32_t index);
 int initrd_get_file(uint32_t index, const uint8_t **data, uint64_t *size);
+const initrd_header_t *initrd_get_header(void);

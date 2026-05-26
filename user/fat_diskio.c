@@ -1,11 +1,13 @@
 #include "fat_diskio.h"
+#include "block_proto.h"
 #include "ff.h"
 #include "diskio.h"
+#include "ipc_proto.h"
+#include "ns_proto.h"
 
-#define FAT_SECTOR_SIZE 512ULL
-
-static const unsigned char *fat_image;
-static uint64_t fat_image_size;
+static int block_cap = -1;
+static char *bounce;
+static int bounce_cap = -1;
 
 static void copy_bytes_local(void *dst, const void *src, uint64_t size) {
     unsigned char *d = (unsigned char *)dst;
@@ -15,50 +17,123 @@ static void copy_bytes_local(void *dst, const void *src, uint64_t size) {
     }
 }
 
-void fat_disk_set_image(const void *data, uint64_t size) {
-    fat_image = (const unsigned char *)data;
-    fat_image_size = size;
+int fat_disk_init(void) {
+    if (block_cap < 0) {
+        for (uint32_t attempt = 0; attempt < 50 && block_cap < 0; attempt++) {
+            block_cap = ns_resolve(BLOCK_SERVICE_NAME);
+            if (block_cap < 0) {
+                sys_sleep(10);
+            }
+        }
+    }
+    if (block_cap < 0) {
+        return -1;
+    }
+
+    if (!bounce) {
+        bounce = (char *)sys_mmap(4096);
+        if (!bounce) {
+            return -1;
+        }
+        for (uint32_t i = 0; i < 4096; i += BLOCK_SECTOR_SIZE) {
+            bounce[i] = 0;
+        }
+    }
+
+    if (bounce_cap < 0) {
+        bounce_cap = sys_mem_export(bounce, 4096,
+                                    MEM_RIGHT_READ | MEM_RIGHT_WRITE | MEM_RIGHT_SHARE);
+        if (bounce_cap < 0) {
+            return -1;
+        }
+    }
+
+    return 0;
 }
 
 DSTATUS disk_initialize(BYTE pdrv) {
-    if (pdrv != 0 || !fat_image || fat_image_size < FAT_SECTOR_SIZE) {
-        return STA_NOINIT;
-    }
-    return 0;
+    return pdrv == 0 && fat_disk_init() == 0 ? 0 : STA_NOINIT;
 }
 
 DSTATUS disk_status(BYTE pdrv) {
-    if (pdrv != 0 || !fat_image || fat_image_size < FAT_SECTOR_SIZE) {
-        return STA_NOINIT;
-    }
-    return 0;
+    return pdrv == 0 && fat_disk_init() == 0 ? 0 : STA_NOINIT;
 }
 
 DRESULT disk_read(BYTE pdrv, BYTE *buff, LBA_t sector, UINT count) {
-    if (pdrv != 0 || !buff || !fat_image || count == 0) {
+    if (pdrv != 0 || !buff || count == 0 || fat_disk_init() < 0) {
         return RES_PARERR;
     }
 
-    uint64_t offset = (uint64_t)sector * FAT_SECTOR_SIZE;
-    uint64_t bytes = (uint64_t)count * FAT_SECTOR_SIZE;
-    if (offset > fat_image_size || bytes > fat_image_size - offset) {
-        return RES_PARERR;
+    UINT done = 0;
+    while (done < count) {
+        UINT chunk = count - done;
+        if (chunk > 8) {
+            chunk = 8;
+        }
+
+        uint64_t payload[IPC_INLINE_WORDS] = {0};
+        payload[0] = (uint64_t)bounce_cap;
+        payload[1] = 0;
+        payload[2] = 4096;
+        payload[3] = MEM_RIGHT_READ | MEM_RIGHT_WRITE | IPC_MEM_MODE_SHARE;
+        payload[4] = BLOCK_REQ_READ;
+        payload[5] = (uint64_t)sector + done;
+        payload[6] = chunk;
+
+        ipc_msg_t reply = sys_ipc_call((uint32_t)block_cap, IPC_FLAG_MEM,
+                                       7 * sizeof(uint64_t), payload);
+        if (reply.status < 0 ||
+            reply.payload[0] != (uint64_t)chunk * BLOCK_SECTOR_SIZE) {
+            return RES_ERROR;
+        }
+
+        copy_bytes_local(buff + ((uint64_t)done * BLOCK_SECTOR_SIZE),
+                         bounce,
+                         (uint64_t)chunk * BLOCK_SECTOR_SIZE);
+        done += chunk;
     }
 
-    copy_bytes_local(buff, fat_image + offset, bytes);
     return RES_OK;
 }
 
 DRESULT disk_write(BYTE pdrv, const BYTE *buff, LBA_t sector, UINT count) {
-    (void)pdrv;
-    (void)buff;
-    (void)sector;
-    (void)count;
-    return RES_WRPRT;
+    if (pdrv != 0 || !buff || count == 0 || fat_disk_init() < 0) {
+        return RES_PARERR;
+    }
+
+    UINT done = 0;
+    while (done < count) {
+        UINT chunk = count - done;
+        if (chunk > 8) {
+            chunk = 8;
+        }
+
+        uint64_t bytes = (uint64_t)chunk * BLOCK_SECTOR_SIZE;
+        copy_bytes_local(bounce, buff + ((uint64_t)done * BLOCK_SECTOR_SIZE), bytes);
+
+        uint64_t payload[IPC_INLINE_WORDS] = {0};
+        payload[0] = (uint64_t)bounce_cap;
+        payload[1] = 0;
+        payload[2] = 4096;
+        payload[3] = MEM_RIGHT_READ | MEM_RIGHT_WRITE | IPC_MEM_MODE_SHARE;
+        payload[4] = BLOCK_REQ_WRITE;
+        payload[5] = (uint64_t)sector + done;
+        payload[6] = chunk;
+
+        ipc_msg_t reply = sys_ipc_call((uint32_t)block_cap, IPC_FLAG_MEM,
+                                       7 * sizeof(uint64_t), payload);
+        if (reply.status < 0 || reply.payload[0] != bytes) {
+            return RES_ERROR;
+        }
+
+        done += chunk;
+    }
+
+    return RES_OK;
 }
 
 DRESULT disk_ioctl(BYTE pdrv, BYTE cmd, void *buff) {
-    if (pdrv != 0 || !fat_image) {
+    if (pdrv != 0 || fat_disk_init() < 0) {
         return RES_PARERR;
     }
 
@@ -67,11 +142,11 @@ DRESULT disk_ioctl(BYTE pdrv, BYTE cmd, void *buff) {
         return RES_OK;
     case GET_SECTOR_COUNT:
         if (!buff) return RES_PARERR;
-        *(LBA_t *)buff = (LBA_t)(fat_image_size / FAT_SECTOR_SIZE);
+        *(LBA_t *)buff = 8192;
         return RES_OK;
     case GET_SECTOR_SIZE:
         if (!buff) return RES_PARERR;
-        *(WORD *)buff = (WORD)FAT_SECTOR_SIZE;
+        *(WORD *)buff = (WORD)BLOCK_SECTOR_SIZE;
         return RES_OK;
     case GET_BLOCK_SIZE:
         if (!buff) return RES_PARERR;

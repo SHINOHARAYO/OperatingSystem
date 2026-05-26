@@ -1,5 +1,6 @@
 #include "lib.h"
 #include "ns_proto.h"
+#include "fs_proto.h"
 #include <stdarg.h>
 
 static int uart_cap = -1;
@@ -182,4 +183,146 @@ void printf(const char *fmt, ...) {
 
     if (pos > 0) _flush_buf(buf, pos);
     va_end(args);
+}
+
+int streq(const char *a, const char *b) {
+    while (*a && *b && (*a == *b)) {
+        a++;
+        b++;
+    }
+    return *a == '\0' && *b == '\0';
+}
+
+static int vfs_bound = 0;
+static int vfs_cap = -1;
+#define PAGE_BYTES 4096ULL
+
+int ensure_vfs_bound(void) {
+    if (vfs_bound) {
+        return 0;
+    }
+    if (vfs_cap < 0) {
+        vfs_cap = ns_resolve("vfs");
+    }
+    if (vfs_cap < 0) {
+        return -1;
+    }
+    if (sys_vfs_bind(VFS_ID_FS, (uint32_t)vfs_cap) < 0) {
+        return -1;
+    }
+    vfs_bound = 1;
+    return 0;
+}
+
+vfs_reply_t vfs_call_retry(uint64_t arg0, uint64_t arg1, uint64_t arg2) {
+    vfs_reply_t reply;
+    reply.status = -1;
+    reply.value0 = 0;
+    reply.value1 = 0;
+    reply.value2 = 0;
+
+    for (uint32_t attempt = 0; attempt < 20; attempt++) {
+        reply = sys_vfs_call(VFS_ID_FS, arg0, arg1, arg2);
+        if (reply.status >= 0) {
+            return reply;
+        }
+        sys_sleep(10);
+    }
+    return reply;
+}
+
+vfs_file_info_t vfs_open_file(const char *target) {
+    vfs_file_info_t info;
+    info.status = -1;
+    info.index = 0;
+    info.handle = 0;
+    info.size = 0;
+
+    if (ensure_vfs_bound() < 0) {
+        return info;
+    }
+
+    for (uint32_t index = 0; index < 128; index++) {
+        char *name = (char *)sys_mmap(PAGE_BYTES);
+        if (!name) {
+            return info;
+        }
+
+        vfs_reply_t reply = vfs_call_retry(VFS_FS_REQ_LIST, index, (uint64_t)name);
+        if (reply.status < 0 || reply.value0 == 0xFFFFFFFFFFFFFFFFUL) {
+            sys_munmap(name, PAGE_BYTES);
+            return info;
+        }
+        if (streq(name, target)) {
+            vfs_reply_t opened = vfs_call_retry(VFS_FS_REQ_OPEN_INDEX, index, 0);
+            sys_munmap(name, PAGE_BYTES);
+            if (opened.status < 0 || opened.value0 == 0) {
+                return info;
+            }
+            info.status = 0;
+            info.index = index;
+            info.handle = (uint32_t)opened.value0;
+            info.size = opened.value1;
+            return info;
+        }
+        sys_munmap(name, PAGE_BYTES);
+    }
+    return info;
+}
+
+int64_t vfs_read_index(uint32_t index, void *buf) {
+    if (!buf || ensure_vfs_bound() < 0) {
+        return -1;
+    }
+    vfs_reply_t reply = vfs_call_retry(VFS_FS_REQ_READ_INDEX, index, (uint64_t)buf);
+    return reply.status < 0 ? -1 : (int64_t)reply.value0;
+}
+
+int64_t vfs_read_handle_page(uint32_t handle, uint32_t page_index, void *buf) {
+    if (!buf || handle == 0 || ensure_vfs_bound() < 0) {
+        return -1;
+    }
+    uint64_t descriptor = ((uint64_t)handle << VFS_HANDLE_SHIFT) | page_index;
+    vfs_reply_t reply = vfs_call_retry(VFS_FS_REQ_READ_HANDLE_PAGE, descriptor, (uint64_t)buf);
+    return reply.status < 0 ? -1 : (int64_t)reply.value0;
+}
+
+int64_t vfs_write_page(fs_write_page_t *request) {
+    if (!request || request->name[0] == '\0' ||
+        request->size > FS_WRITE_DATA_MAX ||
+        ensure_vfs_bound() < 0) {
+        return -1;
+    }
+
+    vfs_reply_t reply = vfs_call_retry(VFS_FS_REQ_WRITE_PAGE, (uint64_t)request, 0);
+    return reply.status < 0 ? -1 : (int64_t)reply.value0;
+}
+
+void vfs_close_handle(uint32_t handle) {
+    if (handle == 0 || ensure_vfs_bound() < 0) {
+        return;
+    }
+    (void)vfs_call_retry(VFS_FS_REQ_CLOSE_HANDLE, handle, 0);
+}
+
+spawn_result_t vfs_spawn_program(const char *name, uint8_t priority) {
+    spawn_result_t fail = { .tid = (uint32_t)-1, .endpoint_cap = -1 };
+
+    vfs_file_info_t info = vfs_open_file(name);
+    if (info.status < 0 || info.size == 0) {
+        return fail;
+    }
+
+    vfs_close_handle(info.handle);
+
+    vfs_reply_t exec = vfs_call_retry(VFS_FS_REQ_EXEC_INDEX, info.index, 0);
+    if (exec.status < 0 || exec.value0 == 0) {
+        return fail;
+    }
+
+    return sys_spawn_exec2((uint32_t)exec.value0, priority);
+}
+
+uint64_t page_align_size(uint64_t size) {
+    return (size + PAGE_BYTES - 1) & ~(PAGE_BYTES - 1);
 }

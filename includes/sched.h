@@ -8,8 +8,6 @@
 #define TASK_STACK_SIZE 4096
 #define CAP_SELF 1
 #define CAP_NS 2
-#define FS_BOOT_EXEC_CAP_BASE 64
-#define FS_BOOT_FILE_CAP_BASE 128
 #define USER_STACK_TOP 0x90001000ULL
 #define USER_STACK_BASE (USER_STACK_TOP - TASK_STACK_SIZE)
 #define USER_STACK_GUARD_BASE (USER_STACK_BASE - TASK_STACK_SIZE)
@@ -129,6 +127,9 @@ void sched_sleep_syscall(uint64_t *regs, uint64_t ms);
 int sched_spawn_syscall(uint64_t *regs, uint64_t elf_data, uint64_t elf_size, uint8_t priority);
 int sched_spawn_file_syscall(uint64_t *regs, uint64_t name_ptr, uint8_t priority);
 int sched_spawn_exec_syscall(uint64_t *regs, uint32_t exec_cap, uint8_t priority);
+int sched_vfs_exec_create_syscall(uint64_t *regs, uint32_t client_tid,
+                                  uint64_t elf_data, uint64_t elf_size,
+                                  uint32_t file_index);
 int sched_install_exec_cap_at(uint32_t tid, uint32_t cap, uint32_t initrd_index);
 int sched_install_file_cap_at(uint32_t tid, uint32_t cap, uint32_t initrd_index);
 int sched_map_boot_data(uint32_t tid, const void *data, uint64_t size, uint64_t user_va);
@@ -139,6 +140,7 @@ void sched_ps_syscall(uint64_t *regs, uint32_t index);
 void sched_task_capacity_syscall(uint64_t *regs);
 void sched_capstat_syscall(uint64_t *regs, uint32_t slot);
 void sched_debug_info_syscall(uint64_t *regs);
+void sched_dma_paddr_syscall(uint64_t *regs, uint64_t user_va);
 int  sched_kill_syscall(uint64_t *regs, uint32_t tid);
 void sched_wait_syscall(uint64_t *regs, uint32_t tid);
 void sched_poll_syscall(uint64_t *regs, uint32_t tid);

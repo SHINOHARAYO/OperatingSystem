@@ -8,7 +8,6 @@
 #define BENCH_NS 1000000000ULL
 
 static volatile uint64_t sink;
-static int fs_cap = -1;
 
 static uint64_t now_ns(void) {
     return sys_uptime_ns();
@@ -117,49 +116,10 @@ static void bench_memory(void) {
     print_rate("mem-write", bytes, elapsed, "bytes");
 }
 
-static int get_fs_cap(void) {
-    if (fs_cap < 0) {
-        fs_cap = ns_resolve("fs");
-    }
-    return fs_cap;
-}
-
-static void pack_fs_name(uint64_t out[3], const char *name) {
-    char *dst = (char *)out;
-    out[0] = 0;
-    out[1] = 0;
-    out[2] = 0;
-    for (int i = 0; i < 23 && name[i]; i++) {
-        dst[i] = name[i];
-    }
-}
-
-static int open_exec_cap(const char *name) {
-    int cap = get_fs_cap();
-    if (cap < 0) {
-        return -1;
-    }
-
-    uint64_t packed[3];
-    pack_fs_name(packed, name);
-    uint64_t payload[IPC_INLINE_WORDS] = {
-        [IPC_WORD_OP] = FS_REQ_OPEN_EXEC,
-        [IPC_WORD_ARG0] = packed[0],
-        [IPC_WORD_ARG1] = packed[1],
-        [IPC_WORD_ARG2] = packed[2]
-    };
-    ipc_msg_t msg = sys_ipc_call((uint32_t)cap, 0, 32, payload);
-    return msg.status < 0 ? -1 : (int)msg.payload[0];
-}
 
 static void bench_ipc(void) {
-    int exec_cap = open_exec_cap(SPEEDIPC_FILE);
-    if (exec_cap < 0) {
-        printf("ipc-call: helper exec cap unavailable\n");
-        return;
-    }
+    spawn_result_t helper = vfs_spawn_program(SPEEDIPC_FILE, 5);
 
-    spawn_result_t helper = sys_spawn_exec2((uint32_t)exec_cap, 5);
     if ((int)helper.tid < 0 || helper.endpoint_cap < 0) {
         printf("ipc-call: helper spawn failed\n");
         return;

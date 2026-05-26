@@ -9,12 +9,10 @@
 #define FS_MAX_FILES 128
 #define FS_MAX_HANDLES 128
 #define PAGE_BYTES 4096ULL
-
+#define FS_EXEC_MAX_SIZE (1024ULL * 1024ULL)
 typedef struct {
     char name[FS_NAME_MAX];
     uint64_t size;
-    int file_cap;
-    int exec_cap;
 } fs_entry_t;
 
 typedef struct {
@@ -26,6 +24,7 @@ typedef struct {
 static fs_entry_t *entries;
 static fs_handle_t *handles;
 static uint32_t entry_count;
+static int table_loaded;
 static FATFS fat_fs;
 static int fat_mounted;
 
@@ -58,90 +57,17 @@ static void copy_lower_string(char *dst, const char *src, uint32_t cap) {
     dst[i] = '\0';
 }
 
-static int streq(const char *a, const char *b) {
-    while (*a && *b && *a == *b) {
-        a++;
-        b++;
-    }
-    return *a == '\0' && *b == '\0';
-}
 
-static const initrd_header_t *outer_header(void) {
-    const unsigned char *image = (const unsigned char *)USER_BOOT_INITRD_BASE;
-    const initrd_header_t *header = (const initrd_header_t *)image;
-    if (header->magic != INITRD_MAGIC ||
-        header->version != INITRD_VERSION ||
-        header->file_count == 0 ||
-        header->file_count > FS_MAX_FILES ||
-        header->header_size < sizeof(initrd_header_t) +
-                              ((uint64_t)header->file_count * sizeof(initrd_entry_t)) ||
-        header->header_size > USER_BOOT_INITRD_MAX_SIZE) {
-        return 0;
-    }
-    return header;
-}
-
-static const initrd_entry_t *outer_entries(const initrd_header_t *header) {
-    if (!header) {
-        return 0;
-    }
-    return (const initrd_entry_t *)((const unsigned char *)USER_BOOT_INITRD_BASE +
-                                   sizeof(initrd_header_t));
-}
-
-static int outer_find_file(const char *name, const unsigned char **data,
-                           uint64_t *size, uint32_t *index_out) {
-    const initrd_header_t *header = outer_header();
-    const initrd_entry_t *rd_entries = outer_entries(header);
-    if (!header || !rd_entries || !name) {
-        return -1;
-    }
-
-    for (uint32_t index = 0; index < header->file_count; index++) {
-        const initrd_entry_t *rd = &rd_entries[index];
-        if (rd->offset > USER_BOOT_INITRD_MAX_SIZE ||
-            rd->size > USER_BOOT_INITRD_MAX_SIZE - rd->offset ||
-            rd->name[0] == '\0') {
-            return -1;
-        }
-        if (streq(name, rd->name)) {
-            if (data) {
-                *data = (const unsigned char *)USER_BOOT_INITRD_BASE + rd->offset;
-            }
-            if (size) {
-                *size = rd->size;
-            }
-            if (index_out) {
-                *index_out = index;
-            }
-            return 0;
-        }
-    }
-
-    return -1;
-}
-
-static uint32_t outer_index_for_name(const char *name) {
-    uint32_t index = (uint32_t)-1;
-    if (outer_find_file(name, 0, 0, &index) < 0) {
-        return (uint32_t)-1;
-    }
-    return index;
-}
 
 static int mount_fat_volume(void) {
     if (fat_mounted) {
         return 0;
     }
 
-    const unsigned char *fat_data = 0;
-    uint64_t fat_size = 0;
-    if (outer_find_file("apps.fat", &fat_data, &fat_size, 0) < 0 ||
-        !fat_data || fat_size < 512) {
+    if (fat_disk_init() < 0) {
         return -1;
     }
 
-    fat_disk_set_image(fat_data, fat_size);
     if (f_mount(&fat_fs, "", 1) != FR_OK) {
         return -1;
     }
@@ -196,34 +122,17 @@ static int read_fat_file_page(const char *name, uint64_t offset,
     return 0;
 }
 
-static void pack_name(uint64_t out[3], const char *name) {
-    char *dst = (char *)out;
-
-    out[0] = 0;
-    out[1] = 0;
-    out[2] = 0;
-
-    for (int i = 0; i < 23 && name[i]; i++) {
-        dst[i] = name[i];
-    }
-}
-
-static void unpack_name(char *name, const uint64_t in[3]) {
-    const char *src = (const char *)in;
-    int i = 0;
-    for (; i < 23 && src[i]; i++) {
-        name[i] = src[i];
-    }
-    name[i] = '\0';
-}
-
 static int build_fs_table(void) {
-    if (entries) {
+    if (table_loaded) {
         return 0;
     }
 
-    entries = (fs_entry_t *)malloc(sizeof(fs_entry_t) * FS_MAX_FILES);
-    handles = (fs_handle_t *)malloc(sizeof(fs_handle_t) * FS_MAX_HANDLES);
+    if (!entries) {
+        entries = (fs_entry_t *)malloc(sizeof(fs_entry_t) * FS_MAX_FILES);
+    }
+    if (!handles) {
+        handles = (fs_handle_t *)malloc(sizeof(fs_handle_t) * FS_MAX_HANDLES);
+    }
     if (!entries || !handles) {
         return -1;
     }
@@ -259,76 +168,38 @@ static int build_fs_table(void) {
         fs_entry_t *entry = &entries[entry_count];
         copy_lower_string(entry->name, info.fname, sizeof(entry->name));
         entry->size = (uint64_t)info.fsize;
-
-        uint32_t raw_index = outer_index_for_name(entry->name);
-        if (raw_index == (uint32_t)-1) {
-            entry->file_cap = -1;
-            entry->exec_cap = -1;
-        } else {
-            entry->file_cap = FS_BOOT_FILE_CAP_BASE + (int)raw_index;
-            entry->exec_cap = FS_BOOT_EXEC_CAP_BASE + (int)raw_index;
-        }
         entry_count++;
     }
 
     f_closedir(&dir);
-    return entry_count == 0 ? -1 : 0;
+    table_loaded = 1;
+    return 0;
 }
 
-static void handle_list(uint32_t reply_cap, uint32_t index) {
-    if (build_fs_table() < 0 || index >= entry_count) {
-        uint64_t reply[IPC_REPLY_INLINE_WORDS] = {FS_RESP_END};
-        sys_ipc_reply(reply_cap, 0, 0, 8, reply);
+static void update_table_entry(const char *name, uint64_t size) {
+    if (!name) {
+        return;
+    }
+    if (build_fs_table() < 0) {
         return;
     }
 
-    uint64_t packed[3];
-    pack_name(packed, entries[index].name);
-    uint64_t reply[IPC_REPLY_INLINE_WORDS] = {
-        entries[index].size, packed[0], packed[1], packed[2]
-    };
-    sys_ipc_reply(reply_cap, 0, 0, 32, reply);
-}
-
-static void handle_open_exec(uint32_t reply_cap, const uint64_t packed_name[3]) {
-    char requested[24];
-    unpack_name(requested, packed_name);
-
-    if (build_fs_table() == 0) {
-        for (uint32_t index = 0; index < entry_count; index++) {
-            if (streq(requested, entries[index].name) && entries[index].exec_cap >= 0) {
-                uint64_t reply[IPC_REPLY_INLINE_WORDS] = {
-                    (uint64_t)entries[index].exec_cap
-                };
-                sys_ipc_reply(reply_cap, 0, IPC_FLAG_CAP, 8, reply);
-                return;
-            }
+    char lowered[FS_NAME_MAX];
+    copy_lower_string(lowered, name, sizeof(lowered));
+    for (uint32_t i = 0; i < entry_count; i++) {
+        if (streq(entries[i].name, lowered)) {
+            entries[i].size = size;
+            return;
         }
     }
 
-    uint64_t reply[IPC_REPLY_INLINE_WORDS] = {(uint64_t)-1};
-    sys_ipc_reply(reply_cap, -1, 0, 8, reply);
-}
-
-static void handle_open_file(uint32_t reply_cap, const uint64_t packed_name[3]) {
-    char requested[24];
-    unpack_name(requested, packed_name);
-
-    if (build_fs_table() == 0) {
-        for (uint32_t index = 0; index < entry_count; index++) {
-            if (streq(requested, entries[index].name) && entries[index].file_cap >= 0) {
-                uint64_t reply[IPC_REPLY_INLINE_WORDS] = {
-                    (uint64_t)entries[index].file_cap
-                };
-                sys_ipc_reply(reply_cap, 0, IPC_FLAG_CAP, 8, reply);
-                return;
-            }
-        }
+    if (entry_count < FS_MAX_FILES) {
+        copy_string(entries[entry_count].name, lowered, sizeof(entries[entry_count].name));
+        entries[entry_count].size = size;
+        entry_count++;
     }
-
-    uint64_t reply[IPC_REPLY_INLINE_WORDS] = {(uint64_t)-1};
-    sys_ipc_reply(reply_cap, -1, 0, 8, reply);
 }
+
 
 static void handle_vfs_list(vfs_request_t request) {
     if (build_fs_table() < 0 || request.arg1 >= entry_count || request.arg2 == 0) {
@@ -350,12 +221,15 @@ static void handle_vfs_list(vfs_request_t request) {
 }
 
 static void handle_vfs_read(vfs_request_t request) {
-    if (build_fs_table() < 0 || request.arg1 >= entry_count || request.arg2 == 0) {
+    uint32_t file_index = (uint32_t)(request.arg1 >> 32);
+    uint64_t offset = (uint64_t)(request.arg1 & 0xFFFFFFFF) * PAGE_BYTES;
+
+    if (build_fs_table() < 0 || file_index >= entry_count || request.arg2 == 0) {
         sys_vfs_reply(-1, 0, 0, 0);
         return;
     }
 
-    fs_entry_t *entry = &entries[(uint32_t)request.arg1];
+    fs_entry_t *entry = &entries[file_index];
     char *remote = (char *)sys_vfs_inject(request.client_tid,
                                           (void *)request.arg2, 1);
     if (!remote) {
@@ -365,7 +239,7 @@ static void handle_vfs_read(vfs_request_t request) {
 
     uint64_t copy_len = 0;
     uint64_t file_size = 0;
-    if (read_fat_file_page(entry->name, 0, remote, PAGE_BYTES,
+    if (read_fat_file_page(entry->name, offset, remote, PAGE_BYTES,
                            &copy_len, &file_size) < 0) {
         sys_munmap(remote, PAGE_BYTES);
         sys_vfs_reply(-1, 0, 0, 0);
@@ -480,6 +354,52 @@ static void handle_vfs_close_handle(vfs_request_t request) {
     sys_vfs_reply(0, 0, 0, 0);
 }
 
+static void handle_vfs_write_page(vfs_request_t request) {
+    if (request.arg1 == 0) {
+        sys_vfs_reply(-1, 0, 0, 0);
+        return;
+    }
+
+    fs_write_page_t *remote = (fs_write_page_t *)sys_vfs_inject(request.client_tid,
+                                                               (void *)request.arg1, 1);
+    if (!remote) {
+        sys_vfs_reply(-1, 0, 0, 0);
+        return;
+    }
+
+    int ok = 0;
+    uint64_t written64 = 0;
+    uint64_t file_size = 0;
+
+    if (mount_fat_volume() == 0 &&
+        remote->name[0] != '\0' &&
+        remote->size <= FS_WRITE_DATA_MAX) {
+        BYTE mode = FA_WRITE | FA_OPEN_ALWAYS;
+        if (remote->flags & VFS_WRITE_FLAG_TRUNCATE) {
+            mode = FA_WRITE | FA_CREATE_ALWAYS;
+        }
+
+        FIL file;
+        if (f_open(&file, remote->name, mode) == FR_OK) {
+            if (f_lseek(&file, remote->offset) == FR_OK) {
+                UINT wrote = 0;
+                if (f_write(&file, remote->data, (UINT)remote->size, &wrote) == FR_OK &&
+                    wrote == (UINT)remote->size &&
+                    f_sync(&file) == FR_OK) {
+                    written64 = wrote;
+                    file_size = (uint64_t)f_size(&file);
+                    update_table_entry(remote->name, file_size);
+                    ok = 1;
+                }
+            }
+            f_close(&file);
+        }
+    }
+
+    sys_munmap(remote, PAGE_BYTES);
+    sys_vfs_reply(ok ? 0 : -1, written64, file_size, 0);
+}
+
 static void handle_vfs_exec_index(vfs_request_t request) {
     if (build_fs_table() < 0 || request.arg1 >= entry_count) {
         sys_vfs_reply(-1, 0, 0, 0);
@@ -487,7 +407,50 @@ static void handle_vfs_exec_index(vfs_request_t request) {
     }
 
     fs_entry_t *entry = &entries[(uint32_t)request.arg1];
-    sys_vfs_reply(0, request.arg1, entry->size, 0);
+    if (entry->size == 0 || entry->size > FS_EXEC_MAX_SIZE) {
+        sys_vfs_reply(-1, 0, 0, 0);
+        return;
+    }
+
+    uint64_t aligned_size = (entry->size + PAGE_BYTES - 1) & ~(PAGE_BYTES - 1);
+    uint8_t *elf = (uint8_t *)malloc((size_t)aligned_size);
+    if (!elf) {
+        sys_vfs_reply(-1, 0, 0, 0);
+        return;
+    }
+
+    uint64_t loaded = 0;
+    for (uint64_t offset = 0; offset < aligned_size; offset += PAGE_BYTES) {
+        uint64_t got = 0;
+        uint64_t file_size = 0;
+        if (read_fat_file_page(entry->name, offset, elf + offset, PAGE_BYTES,
+                               &got, &file_size) < 0) {
+            free(elf);
+            sys_vfs_reply(-1, 0, 0, 0);
+            return;
+        }
+        loaded += got;
+        if (got < PAGE_BYTES) {
+            break;
+        }
+    }
+
+    if (loaded < entry->size ||
+        elf[0] != 0x7f || elf[1] != 'E' || elf[2] != 'L' || elf[3] != 'F') {
+        free(elf);
+        sys_vfs_reply(-1, 0, 0, 0);
+        return;
+    }
+
+    int exec_cap = sys_vfs_exec_create(request.client_tid, elf, entry->size,
+                                       (uint32_t)request.arg1);
+    free(elf);
+    if (exec_cap < 0) {
+        sys_vfs_reply(-1, 0, 0, 0);
+        return;
+    }
+
+    sys_vfs_reply(0, (uint32_t)exec_cap, entry->size, request.arg1);
 }
 
 static void run_vfs_server(void) {
@@ -515,41 +478,15 @@ static void run_vfs_server(void) {
             handle_vfs_read_handle_page(request);
         } else if (request.arg0 == VFS_FS_REQ_CLOSE_HANDLE) {
             handle_vfs_close_handle(request);
+        } else if (request.arg0 == VFS_FS_REQ_WRITE_PAGE) {
+            handle_vfs_write_page(request);
         } else {
             sys_vfs_reply(-1, 0, 0, 0);
         }
     }
 }
 
-static void run_ipc_server(void) {
-    while (ns_register("fs") < 0) {
-        sys_sleep(10);
-    }
-
-    while (1) {
-        ipc_msg_t msg = sys_ipc_recv(CAP_SELF);
-
-        uint64_t request = msg.payload[IPC_WORD_OP];
-        if (request == FS_REQ_LIST) {
-            handle_list(msg.reply_cap, (uint32_t)msg.payload[IPC_WORD_ARG0]);
-        } else if (request == FS_REQ_OPEN_EXEC) {
-            handle_open_exec(msg.reply_cap, &msg.payload[IPC_WORD_ARG0]);
-        } else if (request == FS_REQ_OPEN_FILE) {
-            handle_open_file(msg.reply_cap, &msg.payload[IPC_WORD_ARG0]);
-        } else {
-            uint64_t reply[IPC_REPLY_INLINE_WORDS] = {FS_RESP_END};
-            sys_ipc_reply(msg.reply_cap, -1, 0, 8, reply);
-        }
-    }
-}
-
 void _start(void) {
     (void)build_fs_table();
-
-    int forked = sys_fork();
-    if (forked == 0) {
-        run_vfs_server();
-    }
-
-    run_ipc_server();
+    run_vfs_server();
 }
