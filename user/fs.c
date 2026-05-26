@@ -200,6 +200,42 @@ static void update_table_entry(const char *name, uint64_t size) {
     }
 }
 
+static void remove_table_entry(const char *name) {
+    if (!name || build_fs_table() < 0) {
+        return;
+    }
+
+    char lowered[FS_NAME_MAX];
+    copy_lower_string(lowered, name, sizeof(lowered));
+    for (uint32_t i = 0; i < entry_count; i++) {
+        if (!streq(entries[i].name, lowered)) {
+            continue;
+        }
+
+        for (uint32_t h = 0; h < FS_MAX_HANDLES; h++) {
+            if (!handles[h].used) {
+                continue;
+            }
+            if (handles[h].entry_index == i) {
+                handles[h].used = 0;
+                handles[h].offset = 0;
+            } else if (handles[h].entry_index > i) {
+                handles[h].entry_index--;
+            }
+        }
+
+        for (uint32_t j = i + 1; j < entry_count; j++) {
+            entries[j - 1] = entries[j];
+        }
+        entry_count--;
+        if (entry_count < FS_MAX_FILES) {
+            entries[entry_count].name[0] = '\0';
+            entries[entry_count].size = 0;
+        }
+        return;
+    }
+}
+
 
 static void handle_vfs_list(vfs_request_t request) {
     if (build_fs_table() < 0 || request.arg1 >= entry_count || request.arg2 == 0) {
@@ -400,6 +436,33 @@ static void handle_vfs_write_page(vfs_request_t request) {
     sys_vfs_reply(ok ? 0 : -1, written64, file_size, 0);
 }
 
+static void handle_vfs_delete(vfs_request_t request) {
+    if (request.arg1 == 0) {
+        sys_vfs_reply(-1, 0, 0, 0);
+        return;
+    }
+
+    char *remote = (char *)sys_vfs_inject(request.client_tid,
+                                          (void *)request.arg1, 1);
+    if (!remote) {
+        sys_vfs_reply(-1, 0, 0, 0);
+        return;
+    }
+
+    char name[FS_NAME_MAX];
+    copy_string(name, remote, sizeof(name));
+    sys_munmap(remote, PAGE_BYTES);
+
+    int ok = 0;
+    if (mount_fat_volume() == 0 && name[0] != '\0' &&
+        f_unlink(name) == FR_OK) {
+        remove_table_entry(name);
+        ok = 1;
+    }
+
+    sys_vfs_reply(ok ? 0 : -1, 0, 0, 0);
+}
+
 static void handle_vfs_exec_index(vfs_request_t request) {
     if (build_fs_table() < 0 || request.arg1 >= entry_count) {
         sys_vfs_reply(-1, 0, 0, 0);
@@ -480,6 +543,8 @@ static void run_vfs_server(void) {
             handle_vfs_close_handle(request);
         } else if (request.arg0 == VFS_FS_REQ_WRITE_PAGE) {
             handle_vfs_write_page(request);
+        } else if (request.arg0 == VFS_FS_REQ_DELETE) {
+            handle_vfs_delete(request);
         } else {
             sys_vfs_reply(-1, 0, 0, 0);
         }

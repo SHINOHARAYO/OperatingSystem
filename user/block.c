@@ -119,6 +119,28 @@ static void zero_bytes(void *ptr, uint64_t size) {
     }
 }
 
+static int dma_export_range(void *addr, uint64_t size, uint64_t *out_pa,
+                            uint32_t *out_cap) {
+    int cap = sys_dma_export(addr, size, OCAP_RIGHT_READ | OCAP_RIGHT_WRITE);
+    if (cap < 0) {
+        return -1;
+    }
+
+    uint64_t pa = sys_dma_paddr((uint32_t)cap, 0);
+    if (!pa) {
+        sys_dma_release((uint32_t)cap);
+        return -1;
+    }
+
+    if (out_pa) {
+        *out_pa = pa;
+    }
+    if (out_cap) {
+        *out_cap = (uint32_t)cap;
+    }
+    return 0;
+}
+
 static void *dma_page(uint64_t *out_pa) {
     unsigned char *page = (unsigned char *)sys_mmap(4096);
     if (!page) {
@@ -126,14 +148,12 @@ static void *dma_page(uint64_t *out_pa) {
     }
 
     page[0] = 0;
-    uint64_t pa = sys_dma_paddr(page);
-    if (!pa) {
+    if (dma_export_range(page, 4096, out_pa, 0) < 0) {
         sys_munmap(page, 4096);
         return 0;
     }
 
     zero_bytes(page, 4096);
-    *out_pa = pa;
     return page;
 }
 
@@ -144,16 +164,18 @@ static void *dma_pages(uint64_t page_count, uint64_t *out_pa) {
     }
 
     uint64_t base_pa = 0;
+    uint32_t dma_cap = 0;
+    if (dma_export_range(mem, page_count * 4096, &base_pa, &dma_cap) < 0) {
+        sys_munmap(mem, page_count * 4096);
+        return 0;
+    }
+
     for (uint64_t i = 0; i < page_count; i++) {
-        unsigned char *page = mem + (i * 4096);
-        page[0] = 0;
-        uint64_t pa = sys_dma_paddr(page);
+        uint64_t pa = sys_dma_paddr(dma_cap, i * 4096);
         if (!pa || (i > 0 && pa != base_pa + (i * 4096))) {
+            sys_dma_release(dma_cap);
             sys_munmap(mem, page_count * 4096);
             return 0;
-        }
-        if (i == 0) {
-            base_pa = pa;
         }
     }
 
@@ -291,8 +313,14 @@ static int virtio_blk_init(void) {
 }
 
 static int virtio_blk_rw(uint64_t sector, uint64_t bytes, char *remote, int write) {
-    uint64_t data_pa = sys_dma_paddr(remote);
+    uint64_t export_size = page_align_size(bytes);
+    uint32_t data_cap = 0;
+    uint64_t data_pa = 0;
+    if (dma_export_range(remote, export_size, &data_pa, &data_cap) < 0) {
+        return -1;
+    }
     if (!virtio_ready || !data_pa || bytes == 0 || (bytes & (BLOCK_SECTOR_SIZE - 1)) != 0) {
+        sys_dma_release(data_cap);
         return -1;
     }
 
@@ -331,10 +359,13 @@ static int virtio_blk_rw(uint64_t sector, uint64_t bytes, char *remote, int writ
             if (irq_status) {
                 mmio_write32(VIRTIO_MMIO_IRQ_ACK, irq_status);
             }
-            return *vq_status == VIRTIO_BLK_S_OK ? 0 : -1;
+            int ok = *vq_status == VIRTIO_BLK_S_OK ? 0 : -1;
+            sys_dma_release(data_cap);
+            return ok;
         }
     }
 
+    sys_dma_release(data_cap);
     return -1;
 }
 

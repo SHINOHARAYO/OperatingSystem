@@ -54,7 +54,9 @@
 #define SYS_VFS_INJECT   45
 #define SYS_VFS_RECV     46
 #define SYS_VFS_EXEC_CREATE 47
-#define SYS_DMA_PADDR    48
+#define SYS_DMA_EXPORT   48
+#define SYS_DMA_PADDR    49
+#define SYS_DMA_RELEASE  50
 
 #define EC_IABORT_LOWER_EL 0x20
 #define EC_PC_ALIGN_FAULT  0x22
@@ -175,8 +177,12 @@ void handle_sync(uint64_t *regs) {
         } else if (syscall_num == SYS_VFS_EXEC_CREATE) {
             sched_vfs_exec_create_syscall(regs, (uint32_t)arg0, arg1, arg2,
                                           (uint32_t)regs[3]);
+        } else if (syscall_num == SYS_DMA_EXPORT) {
+            sched_dma_export_syscall(regs, arg0, arg1, arg2);
         } else if (syscall_num == SYS_DMA_PADDR) {
-            sched_dma_paddr_syscall(regs, arg0);
+            sched_dma_paddr_syscall(regs, (uint32_t)arg0, arg1);
+        } else if (syscall_num == SYS_DMA_RELEASE) {
+            sched_dma_release_syscall(regs, (uint32_t)arg0);
         } else {
             uart_puts("Unknown Syscall: ");
             uart_hex(syscall_num);

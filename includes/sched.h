@@ -140,7 +140,10 @@ void sched_ps_syscall(uint64_t *regs, uint32_t index);
 void sched_task_capacity_syscall(uint64_t *regs);
 void sched_capstat_syscall(uint64_t *regs, uint32_t slot);
 void sched_debug_info_syscall(uint64_t *regs);
-void sched_dma_paddr_syscall(uint64_t *regs, uint64_t user_va);
+void sched_dma_export_syscall(uint64_t *regs, uint64_t user_va, uint64_t size,
+                              uint64_t rights);
+void sched_dma_paddr_syscall(uint64_t *regs, uint32_t dma_cap, uint64_t offset);
+void sched_dma_release_syscall(uint64_t *regs, uint32_t dma_cap);
 int  sched_kill_syscall(uint64_t *regs, uint32_t tid);
 void sched_wait_syscall(uint64_t *regs, uint32_t tid);
 void sched_poll_syscall(uint64_t *regs, uint32_t tid);

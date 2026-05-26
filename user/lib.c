@@ -298,6 +298,101 @@ int64_t vfs_write_page(fs_write_page_t *request) {
     return reply.status < 0 ? -1 : (int64_t)reply.value0;
 }
 
+static void vfs_copy_name(char *dst, const char *src, uint64_t cap) {
+    uint64_t i = 0;
+    if (!dst || cap == 0) {
+        return;
+    }
+    for (; i + 1 < cap && src && src[i]; i++) {
+        dst[i] = src[i];
+    }
+    dst[i] = '\0';
+}
+
+int vfs_delete_file(const char *name) {
+    if (!name || name[0] == '\0' || ensure_vfs_bound() < 0) {
+        return -1;
+    }
+
+    char *remote_name = (char *)sys_mmap(PAGE_BYTES);
+    if (!remote_name) {
+        return -1;
+    }
+
+    memset(remote_name, 0, PAGE_BYTES);
+    vfs_copy_name(remote_name, name, PAGE_BYTES);
+    vfs_reply_t reply = vfs_call_retry(VFS_FS_REQ_DELETE, (uint64_t)remote_name, 0);
+    sys_munmap(remote_name, PAGE_BYTES);
+    return reply.status < 0 ? -1 : 0;
+}
+
+int64_t vfs_copy_file(const char *src, const char *dst) {
+    if (!src || !dst || src[0] == '\0' || dst[0] == '\0' || streq(src, dst)) {
+        return -1;
+    }
+
+    vfs_file_info_t info = vfs_open_file(src);
+    if (info.status < 0 || info.size == 0) {
+        return -1;
+    }
+
+    uint8_t *read_page = (uint8_t *)sys_mmap(PAGE_BYTES);
+    fs_write_page_t *write = (fs_write_page_t *)sys_mmap(PAGE_BYTES);
+    if (!read_page || !write) {
+        if (read_page) sys_munmap(read_page, PAGE_BYTES);
+        if (write) sys_munmap(write, PAGE_BYTES);
+        vfs_close_handle(info.handle);
+        return -1;
+    }
+
+    uint64_t copied = 0;
+    uint32_t page_index = 0;
+    while (copied < info.size) {
+        int64_t got = vfs_read_handle_page(info.handle, page_index, read_page);
+        if (got <= 0) {
+            copied = (uint64_t)-1;
+            break;
+        }
+
+        uint64_t page_offset = 0;
+        while (page_offset < (uint64_t)got && copied < info.size) {
+            uint64_t chunk = (uint64_t)got - page_offset;
+            if (chunk > FS_WRITE_DATA_MAX) {
+                chunk = FS_WRITE_DATA_MAX;
+            }
+            if (chunk > info.size - copied) {
+                chunk = info.size - copied;
+            }
+
+            memset(write, 0, PAGE_BYTES);
+            vfs_copy_name(write->name, dst, sizeof(write->name));
+            write->offset = copied;
+            write->size = chunk;
+            write->flags = copied == 0 ? VFS_WRITE_FLAG_TRUNCATE : 0;
+            memcpy(write->data, read_page + page_offset, chunk);
+
+            int64_t wrote = vfs_write_page(write);
+            if (wrote != (int64_t)chunk) {
+                copied = (uint64_t)-1;
+                break;
+            }
+
+            copied += chunk;
+            page_offset += chunk;
+        }
+
+        if (copied == (uint64_t)-1) {
+            break;
+        }
+        page_index++;
+    }
+
+    vfs_close_handle(info.handle);
+    sys_munmap(read_page, PAGE_BYTES);
+    sys_munmap(write, PAGE_BYTES);
+    return copied == (uint64_t)-1 ? -1 : (int64_t)copied;
+}
+
 void vfs_close_handle(uint32_t handle) {
     if (handle == 0 || ensure_vfs_bound() < 0) {
         return;

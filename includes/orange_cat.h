@@ -11,7 +11,8 @@ typedef enum {
     OCAP_FRAME = 3,
     OCAP_VMA = 4,
     OCAP_REPLY = 5,
-    OCAP_FILE = 6
+    OCAP_FILE = 6,
+    OCAP_DMA = 7
 } ocap_type_t;
 
 #define OCAP_RIGHT_READ     (1ULL << 0)
@@ -24,6 +25,7 @@ typedef enum {
 #define OCAP_RIGHT_TRANSFER (1ULL << 7)
 #define OCAP_RIGHT_LEND     (1ULL << 8)
 #define OCAP_RIGHT_REVOKE   (1ULL << 9)
+#define OCAP_RIGHT_DMA      (1ULL << 10)
 
 #define OCAP_FLAG_VFS_EXEC  (1ULL << 0)
 

@@ -33,6 +33,8 @@ extern uint64_t l1_table[512];
 #define SCHED_TIMER_WHEEL_SIZE 1024
 #define SCHED_BOOST_INTERVAL 1000
 #define MAX_VFS_EXEC_OBJECTS 32
+#define MAX_DMA_OBJECTS 64
+#define DMA_OBJECT_MAX_PAGES 16
 
 static tcb_t *tasks = NULL;
 static uint32_t task_capacity = 0;
@@ -66,9 +68,20 @@ typedef struct {
     uint8_t *data;
 } vfs_exec_object_t;
 
+typedef struct {
+    uint32_t present;
+    uint32_t owner_tid;
+    uint64_t user_va;
+    uint64_t size;
+    uint32_t page_count;
+    uint64_t rights;
+    uint64_t pages[DMA_OBJECT_MAX_PAGES];
+} dma_object_t;
+
 static termination_record_t *termination_records = NULL;
 static uint32_t termination_table_pages = 0;
 static vfs_exec_object_t vfs_exec_objects[MAX_VFS_EXEC_OBJECTS];
+static dma_object_t dma_objects[MAX_DMA_OBJECTS];
 static void clear_caps(tcb_t *task);
 static void clear_termination_record(termination_record_t *record);
 static int install_cap(tcb_t *task, uint32_t type, uint32_t object_id,
@@ -457,11 +470,56 @@ static void release_vfs_exec_caps(tcb_t *task) {
     }
 }
 
+static void clear_dma_object(dma_object_t *object) {
+    if (!object) {
+        return;
+    }
+
+    if (object->present) {
+        for (uint32_t i = 0; i < object->page_count; i++) {
+            if (object->pages[i]) {
+                frame_unref(object->pages[i]);
+            }
+        }
+    }
+
+    object->present = 0;
+    object->owner_tid = 0;
+    object->user_va = 0;
+    object->size = 0;
+    object->page_count = 0;
+    object->rights = 0;
+    for (uint32_t i = 0; i < DMA_OBJECT_MAX_PAGES; i++) {
+        object->pages[i] = 0;
+    }
+}
+
+static void release_dma_object(uint32_t object_id) {
+    if (object_id == 0 || object_id >= MAX_DMA_OBJECTS) {
+        return;
+    }
+    clear_dma_object(&dma_objects[object_id]);
+}
+
+static void release_dma_caps(tcb_t *task) {
+    if (!task || !task->caps.entries) {
+        return;
+    }
+
+    for (uint32_t i = 0; i < task->caps.capacity; i++) {
+        ocap_t *cap = &task->caps.entries[i];
+        if (cap->type == OCAP_DMA) {
+            release_dma_object(cap->object_id);
+        }
+    }
+}
+
 static void clear_caps(tcb_t *task) {
     if (!task) {
         return;
     }
     release_vfs_exec_caps(task);
+    release_dma_caps(task);
     ocap_clear(&task->caps);
 }
 
@@ -2611,22 +2669,122 @@ int sched_resolve_user_page(uint64_t user_va, int write) {
            sched_resolve_task_page(current_task, user_va, write) : -1;
 }
 
-void sched_dma_paddr_syscall(uint64_t *regs, uint64_t user_va) {
-    if (!regs || !sched_current_is_user() ||
-        sched_resolve_task_page(current_task, user_va, 1) < 0) {
+static int find_free_dma_object(void) {
+    for (uint32_t i = 1; i < MAX_DMA_OBJECTS; i++) {
+        if (!dma_objects[i].present) {
+            return (int)i;
+        }
+    }
+    return -1;
+}
+
+void sched_dma_export_syscall(uint64_t *regs, uint64_t user_va, uint64_t size,
+                              uint64_t rights) {
+    if (!regs || !sched_current_is_user() || !current_task->pgd ||
+        user_va == 0 || size == 0 ||
+        (user_va & (PAGE_SIZE - 1)) != 0 ||
+        (size & (PAGE_SIZE - 1)) != 0 ||
+        size > (uint64_t)DMA_OBJECT_MAX_PAGES * PAGE_SIZE ||
+        user_va > VMA_USER_LIMIT || size > VMA_USER_LIMIT - user_va) {
+        if (regs) regs[0] = (uint64_t)-1;
+        return;
+    }
+
+    uint32_t page_count = (uint32_t)(size / PAGE_SIZE);
+    int object_id = find_free_dma_object();
+    if (object_id < 0) {
+        regs[0] = (uint64_t)-1;
+        return;
+    }
+
+    dma_object_t *object = &dma_objects[object_id];
+    object->present = 1;
+    object->owner_tid = current_task->tid;
+    object->user_va = user_va;
+    object->size = size;
+    object->page_count = page_count;
+    object->rights = rights;
+    for (uint32_t i = 0; i < DMA_OBJECT_MAX_PAGES; i++) {
+        object->pages[i] = 0;
+    }
+
+    for (uint32_t i = 0; i < page_count; i++) {
+        uint64_t va = user_va + ((uint64_t)i * PAGE_SIZE);
+        if (sched_resolve_task_page(current_task, va, 1) < 0) {
+            clear_dma_object(object);
+            regs[0] = (uint64_t)-1;
+            return;
+        }
+
+        uint64_t pa = 0;
+        uint64_t entry = 0;
+        if (vmm_query_page(current_task->pgd, va, &pa, &entry) < 0 ||
+            (entry & PTE_USER) == 0 ||
+            !frame_from_paddr(pa & ~(PAGE_SIZE - 1)) ||
+            frame_ref(pa & ~(PAGE_SIZE - 1)) < 0) {
+            clear_dma_object(object);
+            regs[0] = (uint64_t)-1;
+            return;
+        }
+        object->pages[i] = pa & ~(PAGE_SIZE - 1);
+    }
+
+    int cap = install_cap(current_task, OCAP_DMA, (uint32_t)object_id,
+                          OCAP_RIGHT_DMA | OCAP_RIGHT_MAP, 0);
+    if (cap < 0) {
+        clear_dma_object(object);
+        regs[0] = (uint64_t)-1;
+        return;
+    }
+
+    regs[0] = (uint64_t)cap;
+    regs[1] = size;
+}
+
+void sched_dma_paddr_syscall(uint64_t *regs, uint32_t dma_cap, uint64_t offset) {
+    ocap_t cap;
+    if (!regs || !current_task ||
+        ocap_lookup(&current_task->caps, dma_cap, OCAP_DMA,
+                    OCAP_RIGHT_DMA | OCAP_RIGHT_MAP, &cap) < 0 ||
+        cap.object_id == 0 || cap.object_id >= MAX_DMA_OBJECTS ||
+        !dma_objects[cap.object_id].present ||
+        dma_objects[cap.object_id].owner_tid != current_task->tid) {
         if (regs) regs[0] = 0;
         return;
     }
 
-    uint64_t pa = 0;
-    uint64_t entry = 0;
-    if (vmm_query_page(current_task->pgd, user_va, &pa, &entry) < 0 ||
-        (entry & PTE_USER) == 0) {
+    dma_object_t *object = &dma_objects[cap.object_id];
+    if (offset >= object->size) {
         regs[0] = 0;
         return;
     }
 
-    regs[0] = pa;
+    uint32_t page = (uint32_t)(offset / PAGE_SIZE);
+    uint64_t page_off = offset & (PAGE_SIZE - 1);
+    if (page >= object->page_count || !object->pages[page]) {
+        regs[0] = 0;
+        return;
+    }
+
+    regs[0] = object->pages[page] + page_off;
+    regs[1] = object->size - offset;
+}
+
+void sched_dma_release_syscall(uint64_t *regs, uint32_t dma_cap) {
+    if (!regs || !current_task) {
+        return;
+    }
+
+    ocap_t cap;
+    if (ocap_lookup(&current_task->caps, dma_cap, OCAP_DMA,
+                    OCAP_RIGHT_DMA, &cap) < 0) {
+        regs[0] = (uint64_t)-1;
+        return;
+    }
+
+    release_dma_object(cap.object_id);
+    ocap_revoke_slot(&current_task->caps, dma_cap);
+    regs[0] = 0;
 }
 
 void sched_exit_syscall(uint64_t *regs, int exit_code) {

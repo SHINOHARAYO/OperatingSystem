@@ -95,6 +95,7 @@ typedef struct {
 #define OCAP_VMA      4
 #define OCAP_REPLY    5
 #define OCAP_FILE     6
+#define OCAP_DMA      7
 
 #define OCAP_RIGHT_READ     (1ULL << 0)
 #define OCAP_RIGHT_WRITE    (1ULL << 1)
@@ -106,6 +107,7 @@ typedef struct {
 #define OCAP_RIGHT_TRANSFER (1ULL << 7)
 #define OCAP_RIGHT_LEND     (1ULL << 8)
 #define OCAP_RIGHT_REVOKE   (1ULL << 9)
+#define OCAP_RIGHT_DMA      (1ULL << 10)
 
 #define CAP_SELF 1
 #define CAP_NS 2
@@ -704,9 +706,40 @@ static inline int sys_munmap(void *addr, uint64_t size) {
     return (int)x0;
 }
 
-static inline uint64_t sys_dma_paddr(void *addr) {
+static inline int sys_dma_export(void *addr, uint64_t size, uint64_t rights) {
     register uint64_t x0 asm("x0") = (uint64_t)addr;
+    register uint64_t x1 asm("x1") = size;
+    register uint64_t x2 asm("x2") = rights;
     register uint64_t x8 asm("x8") = 48;
+
+    asm volatile(
+        "svc #0"
+        : "+r" (x0)
+        : "r" (x1), "r" (x2), "r" (x8)
+        : "memory"
+    );
+
+    return (int)x0;
+}
+
+static inline uint64_t sys_dma_paddr(uint32_t dma_cap, uint64_t offset) {
+    register uint64_t x0 asm("x0") = dma_cap;
+    register uint64_t x1 asm("x1") = offset;
+    register uint64_t x8 asm("x8") = 49;
+
+    asm volatile(
+        "svc #0"
+        : "+r" (x0), "+r" (x1)
+        : "r" (x8)
+        : "memory"
+    );
+
+    return x0;
+}
+
+static inline int sys_dma_release(uint32_t dma_cap) {
+    register uint64_t x0 asm("x0") = dma_cap;
+    register uint64_t x8 asm("x8") = 50;
 
     asm volatile(
         "svc #0"
@@ -715,7 +748,7 @@ static inline uint64_t sys_dma_paddr(void *addr) {
         : "memory"
     );
 
-    return x0;
+    return (int)x0;
 }
 
 static inline void *sys_mem_lend(uint32_t target_tid, uint32_t mem_cap, uint64_t dst_hint) {
@@ -1047,6 +1080,8 @@ vfs_file_info_t vfs_open_file(const char *target);
 int64_t vfs_read_index(uint32_t index, void *buf);
 int64_t vfs_read_handle_page(uint32_t handle, uint32_t page_index, void *buf);
 int64_t vfs_write_page(fs_write_page_t *request);
+int vfs_delete_file(const char *name);
+int64_t vfs_copy_file(const char *src, const char *dst);
 void vfs_close_handle(uint32_t handle);
 spawn_result_t vfs_spawn_program(const char *name, uint8_t priority);
 uint64_t page_align_size(uint64_t size);

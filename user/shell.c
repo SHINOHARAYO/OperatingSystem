@@ -48,6 +48,7 @@ static wait_info_t poll_until_done(uint32_t tid, uint32_t attempts, uint64_t sle
 static void run_vfstest_demo(void);
 static void run_vfsinject_demo(void);
 static void run_vfswrite_demo(void);
+static void run_vfsinstall_demo(void);
 static void list_files_vfs(void);
 
 static int ensure_job_capacity(uint32_t min_capacity) {
@@ -120,6 +121,35 @@ static uint32_t _parse_u32(const char *s, int *ok) {
   return value;
 }
 
+static int split_two_args(char *s, char **a, char **b) {
+  while (*s == ' ') {
+    s++;
+  }
+  if (*s == '\0') {
+    return -1;
+  }
+  *a = s;
+  while (*s && *s != ' ') {
+    s++;
+  }
+  if (*s == '\0') {
+    return -1;
+  }
+  *s++ = '\0';
+  while (*s == ' ') {
+    s++;
+  }
+  if (*s == '\0') {
+    return -1;
+  }
+  *b = s;
+  while (*s && *s != ' ') {
+    s++;
+  }
+  *s = '\0';
+  return 0;
+}
+
 static const char *task_state_name(uint32_t state) {
   switch (state) {
     case 1: return "ready";
@@ -171,6 +201,7 @@ static const char *cap_type_name(uint32_t type) {
     case OCAP_VMA: return "vma";
     case OCAP_REPLY: return "reply";
     case OCAP_FILE: return "file";
+    case OCAP_DMA: return "dma";
     default: return "none";
   }
 }
@@ -187,6 +218,7 @@ static void print_cap_rights(uint64_t rights) {
   if (rights & OCAP_RIGHT_TRANSFER) { printf("%stransfer", any ? "," : ""); any = 1; }
   if (rights & OCAP_RIGHT_LEND) { printf("%slend", any ? "," : ""); any = 1; }
   if (rights & OCAP_RIGHT_REVOKE) { printf("%srevoke", any ? "," : ""); any = 1; }
+  if (rights & OCAP_RIGHT_DMA) { printf("%sdma", any ? "," : ""); any = 1; }
   if (!any) {
     printf("-");
   }
@@ -993,6 +1025,7 @@ static void run_smoke_demo(void) {
   run_vfstest_demo();
   run_vfsinject_demo();
   run_vfswrite_demo();
+  run_vfsinstall_demo();
   run_ipcfast_demo();
   run_ipccap_demo();
   if (run_and_expect_exit(BADPTR_FILE) < 0) failures++;
@@ -1185,6 +1218,103 @@ static void run_vfsopen_command(const char *name) {
   vfs_close_handle(info.handle);
 }
 
+static void run_cat_command(const char *name) {
+  vfs_file_info_t info = vfs_open_file(name);
+  if (info.status < 0) {
+    printf("cat: '%s' not found\n", name);
+    return;
+  }
+
+  unsigned char *buf = (unsigned char *)sys_mmap(PAGE_BYTES);
+  if (!buf) {
+    vfs_close_handle(info.handle);
+    printf("cat: mmap failed\n");
+    return;
+  }
+
+  uint32_t page = 0;
+  uint64_t shown = 0;
+  while (shown < info.size) {
+    int64_t got = vfs_read_handle_page(info.handle, page, buf);
+    if (got < 0) {
+      printf("\ncat: read failed\n");
+      break;
+    }
+    if (got == 0) {
+      break;
+    }
+
+    char out[129];
+    uint32_t out_len = 0;
+    for (uint64_t i = 0; i < (uint64_t)got && shown < info.size; i++, shown++) {
+      unsigned char c = buf[i];
+      if (c == '\n' || c == '\r' || c == '\t' || (c >= 32 && c <= 126)) {
+        out[out_len++] = (char)c;
+      } else {
+        out[out_len++] = '.';
+      }
+      if (out_len == 128) {
+        out[out_len] = '\0';
+        puts(out);
+        out_len = 0;
+      }
+    }
+    if (out_len) {
+      out[out_len] = '\0';
+      puts(out);
+    }
+    page++;
+  }
+
+  if (shown == 0 || (shown && buf[(shown - 1) & (PAGE_BYTES - 1)] != '\n')) {
+    printf("\n");
+  }
+  sys_munmap(buf, PAGE_BYTES);
+  vfs_close_handle(info.handle);
+}
+
+static void run_rm_command(const char *name) {
+  if (vfs_delete_file(name) < 0) {
+    printf("rm: could not remove '%s'\n", name);
+    return;
+  }
+  printf("removed %s\n", name);
+}
+
+static void run_copy_command(const char *src, const char *dst, const char *verb) {
+  int64_t copied = vfs_copy_file(src, dst);
+  if (copied < 0) {
+    printf("%s: failed %s -> %s\n", verb, src, dst);
+    return;
+  }
+  printf("%s: %s -> %s (%ld bytes)\n", verb, src, dst, copied);
+}
+
+static void run_vfsinstall_demo(void) {
+  const char *dst = "badcopy.elf";
+  (void)vfs_delete_file(dst);
+  int64_t copied = vfs_copy_file(BADPTR_FILE, dst);
+  if (copied < 0) {
+    printf("vfsinstall: copy failed\n");
+    return;
+  }
+
+  uint32_t tid = spawn_program(dst, PONG_PRIORITY);
+  if ((int)tid < 0) {
+    printf("vfsinstall: run failed after copy\n");
+    return;
+  }
+
+  wait_info_t status = sys_wait(tid);
+  int ok = status.reason == TASK_TERM_EXITED && status.exit_code == 0;
+  printf("vfsinstall: %s copied=%ld file=%s tid=%u\n",
+         ok ? "ok" : "failed", copied, dst, tid);
+  print_wait_result(status);
+  if (vfs_delete_file(dst) < 0) {
+    printf("vfsinstall: cleanup rm failed\n");
+  }
+}
+
 static void print_prompt(void) { printf("\nNeptune> "); }
 
 void _start(void) {
@@ -1227,6 +1357,10 @@ void _start(void) {
         printf("  spawn spin    Spawn a child that runs until killed\n");
         printf("  badptr        Verify bad syscall pointers are rejected\n");
         printf("  run <file>    Spawn through a kernel-owned VFS exec object\n");
+        printf("  cat <file>    Print a file through VFS\n");
+        printf("  cp <src> <dst> Copy a file through VFS\n");
+        printf("  install <src> <dst> Copy an executable into the FS\n");
+        printf("  rm <file>     Remove a file through VFS\n");
         printf("  clear         Clear the screen\n");
         printf("  echo <text>   Print text back to the terminal\n");
         printf("  ls            List files through the VFS fast lane\n");
@@ -1242,6 +1376,7 @@ void _start(void) {
         printf("  vfsopen <file> Show VFS metadata for one file\n");
         printf("  vfsread       Read one file page through VFS injection\n");
         printf("  vfswrite      Create and verify notes.txt through writable FatFs\n");
+        printf("  vfsinstall    Copy and run an ELF from the writable FS\n");
         printf("  vfsexec       Resolve an executable through VFS, then spawn it\n");
         printf("  ipcfast       Test 0/8/64/128-byte register IPC\n");
         printf("  ipccap        Transfer an endpoint cap through IPC\n");
@@ -1343,6 +1478,30 @@ void _start(void) {
           printf("Started %s as TID %u\n", name, tid);
         }
 
+      } else if (_starts_with(cmd, "cat ")) {
+        run_cat_command(cmd + 4);
+
+      } else if (_starts_with(cmd, "rm ")) {
+        run_rm_command(cmd + 3);
+
+      } else if (_starts_with(cmd, "cp ")) {
+        char *src = 0;
+        char *dst = 0;
+        if (split_two_args(cmd + 3, &src, &dst) < 0) {
+          printf("usage: cp <src> <dst>\n");
+        } else {
+          run_copy_command(src, dst, "cp");
+        }
+
+      } else if (_starts_with(cmd, "install ")) {
+        char *src = 0;
+        char *dst = 0;
+        if (split_two_args(cmd + 8, &src, &dst) < 0) {
+          printf("usage: install <src> <dst>\n");
+        } else {
+          run_copy_command(src, dst, "install");
+        }
+
       } else if (_streq(cmd, "clear")) {
         printf("\x1b[2J\x1b[H");
 
@@ -1398,6 +1557,9 @@ void _start(void) {
 
       } else if (_streq(cmd, "vfswrite")) {
         run_vfswrite_demo();
+
+      } else if (_streq(cmd, "vfsinstall")) {
+        run_vfsinstall_demo();
 
       } else if (_streq(cmd, "vfsexec")) {
         run_vfsexec_demo();

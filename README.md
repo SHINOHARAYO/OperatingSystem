@@ -131,7 +131,8 @@ channel.
 - Dynamic stack growth up to 64 KiB with a moving guard page.
 - `fork` with copy-on-write for writable frame-backed user pages.
 - Public `munmap`.
-- `sys_dma_paddr()` helper for EL0 drivers that need guest physical addresses.
+- Capability-scoped DMA export objects for EL0 drivers that need device-visible
+  physical addresses.
 - `vmmap` inspection from the shell.
 
 ### Fault And User Safety
@@ -146,9 +147,10 @@ channel.
 
 - Unified per-task capability table.
 - Typed slots with object IDs, rights, and flags.
-- Endpoint, reply, exec, file, VMA, and frame cap types.
+- Endpoint, reply, exec, file, VMA, frame, and DMA cap types.
 - Reserved `CAP_SELF = 1` and `CAP_NS = 2`.
-- Capability checks for IPC, spawn, file access, and memory mapping.
+- Capability checks for IPC, spawn, file access, memory mapping, and DMA
+  address resolution.
 - `capstat` shell command.
 
 ### IPC
@@ -178,15 +180,19 @@ channel.
   so filesystem writes survive normal rebuilds.
 - `block.elf` implements a userspace virtio-mmio block driver and exposes
   512-byte sectors over IPC.
+- `block.elf` uses DMA caps to pin and resolve only explicitly exported buffers
+  before programming virtio descriptors.
 - `block.elf` falls back to a writable RAM copy of boot `apps.fat` when the
   virtio device is absent.
 - `fs.elf` talks to `block.elf` through IPC-backed shared memory and mounts the
   result in EL0 with FatFs.
 - `fs.elf` owns directory and open-handle state.
 - `fs.elf` can create or replace files through FatFs writes.
+- The shell can inspect, copy, install, and remove files through VFS.
 - `ls` uses the VFS path.
 - `run <file>` asks `fs.elf` to read the executable, creates a kernel-owned
   VFS exec object, and spawns through an `OCAP_EXEC` handle.
+- Copied executables can be launched directly from `storage.fat`.
 - VFS exec caps are one-shot spawn tickets; the kernel releases the backing
   exec object after the spawn attempt.
 
@@ -230,12 +236,17 @@ File and VFS commands:
 | Command | Purpose |
 | --- | --- |
 | `ls` | List files through the VFS fast channel |
+| `cat <file>` | Print a file through VFS |
+| `cp <src> <dst>` | Copy a file through VFS |
+| `install <src> <dst>` | Copy an executable into the writable filesystem |
+| `rm <file>` | Remove a file through VFS |
 | `vfstest` | Test VFS call/reply handoff |
 | `vfsinject` | Test shared page injection |
 | `vfsls` | Explicit VFS file listing |
 | `vfsopen <file>` | Show VFS metadata for one file |
 | `vfsread` | Read one file page through VFS injection |
 | `vfswrite` | Create and verify `notes.txt` through writable FatFs |
+| `vfsinstall` | Copy an ELF, run it from the writable FS, then remove it |
 | `vfsexec` | Resolve an executable through VFS, create an exec cap, and spawn it |
 | `run <file>` | Spawn an ELF through a kernel-owned VFS exec object |
 | `filelazy` | Read a file page through the VFS page path |
@@ -290,6 +301,7 @@ vfstest
 vfsinject
 vfsread
 vfswrite
+vfsinstall
 run badptr.elf
 wait 7
 ```
@@ -335,8 +347,8 @@ The current initrd contains:
 - User programs are still packaged into `initrd.bin` at build time.
 - `make clean` removes the whole `build` directory, including `storage.fat`.
 - The block driver supports QEMU virtio-mmio only; no PCI virtio discovery yet.
-- DMA is exposed through a narrow physical-address helper, not a full
-  capability-scoped DMA subsystem yet.
+- DMA caps pin frame-backed user pages, but there is still no IOMMU or device
+  isolation layer.
 - VFS currently fronts one FatFs-backed volume only.
 - The initrd page cache and VM object tables are fixed-size v1 tables.
 - Memory-cap object and mapping tables are fixed-size v1 tables.
@@ -348,7 +360,7 @@ The current initrd contains:
 
 - Add PCI/ACPI discovery for virtio devices instead of relying on the QEMU
   virtio-mmio transport bank.
-- Replace `sys_dma_paddr()` with capability-scoped DMA memory objects.
+- Add IOMMU-style device domains and per-device DMA authority.
 - Add host-side automated QEMU smoke scripts.
 - Extend the per-core scheduler work toward SMP.
 - Replace fixed-size v1 object tables with growable or reclaiming allocators.
