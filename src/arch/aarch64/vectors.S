@@ -183,3 +183,20 @@ ret_from_fork:
     
     restore_all
     eret
+
+.global smp_secondary_entry
+.extern smp_secondary_stacks
+.extern smp_secondary_main
+smp_secondary_entry:
+    mov x19, x0
+    adrp x1, smp_secondary_stacks
+    add x1, x1, :lo12:smp_secondary_stacks
+    mov x2, #4096
+    madd x1, x19, x2, x1
+    add x1, x1, x2
+    mov sp, x1
+    mov x0, x19
+    bl smp_secondary_main
+1:
+    wfi
+    b 1b

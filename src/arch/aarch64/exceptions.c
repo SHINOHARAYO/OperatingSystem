@@ -176,7 +176,8 @@ void handle_sync(uint64_t *regs) {
             vfs_recv_syscall(regs);
         } else if (syscall_num == SYS_VFS_EXEC_CREATE) {
             sched_vfs_exec_create_syscall(regs, (uint32_t)arg0, arg1, arg2,
-                                          (uint32_t)regs[3]);
+                                          (uint32_t)regs[3],
+                                          (uint32_t)regs[4]);
         } else if (syscall_num == SYS_DMA_EXPORT) {
             sched_dma_export_syscall(regs, arg0, arg1, arg2);
         } else if (syscall_num == SYS_DMA_PADDR) {
@@ -217,8 +218,11 @@ void handle_irq(void) {
     uint32_t int_id = gic_acknowledge_interrupt();
     int timer_tick = 0;
     int should_reschedule = 0;
+    int reschedule_ipi = 0;
 
-    if (int_id == 30) {
+    if (int_id == 1) {
+        reschedule_ipi = 1;
+    } else if (int_id == 30) {
         timer_handle_interrupt();
         timer_tick = 1;
     } else if (int_id > 31 && int_id < 1020) {
@@ -235,7 +239,9 @@ void handle_irq(void) {
         gic_end_of_interrupt(int_id);
     }
 
-    if (timer_tick) {
+    if (reschedule_ipi) {
+        sched_handle_reschedule_ipi();
+    } else if (timer_tick) {
         sched_tick();
     } else if (should_reschedule) {
         sched_reschedule();

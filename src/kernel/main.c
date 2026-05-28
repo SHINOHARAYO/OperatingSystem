@@ -13,6 +13,7 @@
 #include "timer.h"
 #include "acpi.h"
 #include "sched.h"
+#include "smp.h"
 #include "elf.h"
 #include "initrd.h"
 
@@ -31,8 +32,9 @@
       ;                                                                        \
   } while (0)
 
-#define INITRD_MAX_SIZE (8 * 1024 * 1024)
-static uint8_t initrd_storage[INITRD_MAX_SIZE] __attribute__((aligned(4096)));
+#define BOOT_ARCHIVE_MAX_SIZE (8 * 1024 * 1024)
+#define BOOT_FILE_COUNT 4
+static uint8_t boot_archive_storage[BOOT_ARCHIVE_MAX_SIZE] __attribute__((aligned(4096)));
 
 void neptune_kmain(void *memory_map, uint64_t map_size, uint64_t desc_size,
                    void *rsdp_ptr, void *initrd_data, uint64_t initrd_size) {
@@ -53,7 +55,7 @@ void neptune_kmain(void *memory_map, uint64_t map_size, uint64_t desc_size,
   }
 
   if (initrd_init(initrd_data, initrd_size) < 0) {
-    LOG_FAIL("Cannot continue without initrd.");
+    LOG_FAIL("Cannot continue without boot archive.");
     while (1) {
       __asm__ volatile("wfi");
     }
@@ -116,110 +118,18 @@ void neptune_kmain(void *memory_map, uint64_t map_size, uint64_t desc_size,
   LOG_DEBUG("Starting Task Scheduler...");
   sched_init();
 
-  // TID assignment order matters for bootstrap: name server=1.
+  LOG_DEBUG("Starting secondary cores...");
+  smp_init();
 
-  const uint8_t *ns_elf = 0;
-  uint64_t ns_elf_len = 0;
-  if (initrd_find("ns.elf", &ns_elf, &ns_elf_len) < 0) {
-    LOG_FAIL("INITRD: Missing ns.elf.");
+  const uint8_t *init_elf = 0;
+  uint64_t init_elf_len = 0;
+  if (initrd_find("init.elf", &init_elf, &init_elf_len) < 0) {
+    LOG_FAIL("BOOTFS: Missing init.elf.");
     while (1) __asm__ volatile("wfi");
   }
 
-  LOG_DEBUG_HEX("Creating Name Server ELF Blob Size: ", ns_elf_len);
-  sched_create_user_task(ns_elf, ns_elf_len, 5);
-
-  const uint8_t *uart_elf = 0;
-  uint64_t uart_elf_len = 0;
-  if (initrd_find("uart.elf", &uart_elf, &uart_elf_len) < 0) {
-    LOG_FAIL("INITRD: Missing uart.elf.");
-    while (1) __asm__ volatile("wfi");
-  }
-
-  LOG_DEBUG_HEX("Creating UART Server ELF Blob Size: ", uart_elf_len);
-  int uart_tid = sched_create_user_task(uart_elf, uart_elf_len, 5);
-
-  // Grant the UART server EL0 access to the PL011 UART MMIO page.
-  uint64_t *uart_pgd = sched_get_task_pgd(uart_tid);
-  uint16_t uart_asid = sched_get_task_asid(uart_tid);
-  if (uart_pgd) {
-    if (vmm_map_page_asid(uart_pgd, uart_asid, USER_UART_MMIO_VA, UART_MMIO_PA,
-                          VMM_FLAG_USER_DEVICE) < 0) {
-      LOG_FAIL("Failed to map UART MMIO page for UART server.");
-    }
-  }
-
-  const uint8_t *keyboard_elf = 0;
-  uint64_t keyboard_elf_len = 0;
-  if (initrd_find("keyboard.elf", &keyboard_elf, &keyboard_elf_len) < 0) {
-    LOG_FAIL("INITRD: Missing keyboard.elf.");
-    while (1) __asm__ volatile("wfi");
-  }
-
-  LOG_DEBUG_HEX("Creating Keyboard Server ELF Blob Size: ", keyboard_elf_len);
-  int kb_tid = sched_create_user_task(keyboard_elf, keyboard_elf_len, 5);
-
-  // Grant the Keyboard server EL0 access to the PL011 UART MMIO page.
-  uint64_t *kb_pgd = sched_get_task_pgd(kb_tid);
-  uint16_t kb_asid = sched_get_task_asid(kb_tid);
-  if (kb_pgd) {
-    if (vmm_map_page_asid(kb_pgd, kb_asid, USER_UART_MMIO_VA, UART_MMIO_PA,
-                          VMM_FLAG_USER_DEVICE) < 0) {
-      LOG_FAIL("Failed to map UART MMIO page for keyboard server.");
-    }
-  }
-
-  const uint8_t *block_elf = 0;
-  uint64_t block_elf_len = 0;
-  if (initrd_find("block.elf", &block_elf, &block_elf_len) < 0) {
-    LOG_FAIL("INITRD: Missing block.elf.");
-    while (1) __asm__ volatile("wfi");
-  }
-
-  LOG_DEBUG_HEX("Creating Block Server ELF Blob Size: ", block_elf_len);
-  int block_tid = sched_create_user_task(block_elf, block_elf_len, 5);
-  if (block_tid < 0) {
-    LOG_FAIL("Failed to create block server.");
-    while (1) __asm__ volatile("wfi");
-  }
-  if (sched_map_boot_data((uint32_t)block_tid, initrd_data, initrd_size,
-                          USER_BOOT_INITRD_BASE) < 0) {
-    LOG_FAIL("Failed to map boot initrd into block server.");
-    while (1) __asm__ volatile("wfi");
-  }
-  uint64_t *block_pgd = sched_get_task_pgd(block_tid);
-  uint16_t block_asid = sched_get_task_asid(block_tid);
-  if (block_pgd) {
-    for (uint64_t off = 0; off < VIRTIO_BLK_MMIO_SIZE; off += 4096) {
-      if (vmm_map_page_asid(block_pgd, block_asid, USER_VIRTIO_BLK_MMIO_VA + off,
-                            VIRTIO_BLK_MMIO_PA + off, VMM_FLAG_USER_DEVICE) < 0) {
-        LOG_WARN("Failed to map virtio-blk MMIO page for block server.");
-      }
-    }
-  }
-
-  const uint8_t *fs_elf = 0;
-  uint64_t fs_elf_len = 0;
-  if (initrd_find("fs.elf", &fs_elf, &fs_elf_len) < 0) {
-    LOG_FAIL("INITRD: Missing fs.elf.");
-    while (1) __asm__ volatile("wfi");
-  }
-
-  LOG_DEBUG_HEX("Creating FS Server ELF Blob Size: ", fs_elf_len);
-  int fs_tid = sched_create_user_task(fs_elf, fs_elf_len, 5);
-  if (fs_tid < 0) {
-    LOG_FAIL("Failed to create FS server.");
-    while (1) __asm__ volatile("wfi");
-  }
-
-  const uint8_t *shell_elf = 0;
-  uint64_t shell_elf_len = 0;
-  if (initrd_find("shell.elf", &shell_elf, &shell_elf_len) < 0) {
-    LOG_FAIL("INITRD: Missing shell.elf.");
-    while (1) __asm__ volatile("wfi");
-  }
-
-  LOG_DEBUG_HEX("Creating Shell ELF Blob Size: ", shell_elf_len);
-  sched_create_user_task(shell_elf, shell_elf_len, 10);
+  LOG_DEBUG_HEX("Creating Init ELF Blob Size: ", init_elf_len);
+  sched_create_user_task(init_elf, init_elf_len, 10);
 
   LOG_INFO("Starting ARM Generic Timer (1kHz)...");
   timer_init();
@@ -230,10 +140,20 @@ void neptune_kmain(void *memory_map, uint64_t map_size, uint64_t desc_size,
   }
 }
 
-static EFI_STATUS load_initrd(EFI_HANDLE ImageHandle,
-                              EFI_SYSTEM_TABLE *SystemTable,
-                              void *buffer,
-                              uint64_t *buffer_size) {
+static void ascii_copy(char *dst, const char *src, uint64_t cap) {
+  uint64_t i = 0;
+  if (!dst || cap == 0) {
+    return;
+  }
+  for (; i + 1 < cap && src && src[i]; i++) {
+    dst[i] = src[i];
+  }
+  dst[i] = '\0';
+}
+
+static EFI_STATUS open_boot_volume(EFI_HANDLE ImageHandle,
+                                   EFI_SYSTEM_TABLE *SystemTable,
+                                   EFI_FILE_PROTOCOL **root_out) {
   EFI_GUID loaded_image_guid = {
       0x5b1b31a1,
       0x9562,
@@ -244,6 +164,9 @@ static EFI_STATUS load_initrd(EFI_HANDLE ImageHandle,
       0x6459,
       0x11d2,
       {0x8e, 0x39, 0x00, 0xa0, 0xc9, 0x69, 0x72, 0x3b}};
+  if (!root_out) {
+    return 1;
+  }
 
   EFI_LOADED_IMAGE_PROTOCOL *loaded = 0;
   EFI_STATUS status = SystemTable->BootServices->HandleProtocol(
@@ -259,24 +182,87 @@ static EFI_STATUS load_initrd(EFI_HANDLE ImageHandle,
     return status;
   }
 
-  EFI_FILE_PROTOCOL *root = 0;
-  status = fs->OpenVolume(fs, &root);
-  if (status != EFI_SUCCESS) {
-    return status;
+  return fs->OpenVolume(fs, root_out);
+}
+
+static EFI_STATUS read_boot_file(EFI_FILE_PROTOCOL *root, CHAR16 *path,
+                                 void *buffer, uint64_t *size) {
+  if (!root || !path || !buffer || !size || *size == 0) {
+    return 1;
   }
 
   EFI_FILE_PROTOCOL *file = 0;
-  status = root->Open(root, &file, (CHAR16 *)L"initrd.bin",
-                      EFI_FILE_MODE_READ, 0);
+  EFI_STATUS status = root->Open(root, &file, path, EFI_FILE_MODE_READ, 0);
   if (status != EFI_SUCCESS) {
-    root->Close(root);
+    return status;
+  }
+  status = file->Read(file, size, buffer);
+  file->Close(file);
+  return status;
+}
+
+static EFI_STATUS load_boot_archive(EFI_HANDLE ImageHandle,
+                                    EFI_SYSTEM_TABLE *SystemTable,
+                                    void *buffer,
+                                    uint64_t *buffer_size) {
+  typedef struct {
+    CHAR16 *path;
+    const char *name;
+  } boot_file_t;
+
+  static boot_file_t files[BOOT_FILE_COUNT] = {
+      {(CHAR16 *)L"\\boot\\init.elf", "init.elf"},
+      {(CHAR16 *)L"\\boot\\ns.elf", "ns.elf"},
+      {(CHAR16 *)L"\\boot\\block.elf", "block.elf"},
+      {(CHAR16 *)L"\\boot\\fs.elf", "fs.elf"},
+  };
+
+  if (!buffer || !buffer_size || *buffer_size < sizeof(initrd_header_t) +
+                                                BOOT_FILE_COUNT * sizeof(initrd_entry_t)) {
+    return 1;
+  }
+
+  EFI_FILE_PROTOCOL *root = 0;
+  EFI_STATUS status = open_boot_volume(ImageHandle, SystemTable, &root);
+  if (status != EFI_SUCCESS) {
     return status;
   }
 
-  status = file->Read(file, buffer_size, buffer);
-  file->Close(file);
+  initrd_header_t *header = (initrd_header_t *)buffer;
+  initrd_entry_t *entries =
+      (initrd_entry_t *)((uint8_t *)buffer + sizeof(initrd_header_t));
+  uint64_t header_size = sizeof(initrd_header_t) +
+                         BOOT_FILE_COUNT * sizeof(initrd_entry_t);
+  uint64_t offset = header_size;
+
+  for (uint32_t i = 0; i < BOOT_FILE_COUNT; i++) {
+    if (offset >= *buffer_size) {
+      root->Close(root);
+      return 1;
+    }
+    uint64_t remaining = *buffer_size - offset;
+    uint64_t read_size = remaining;
+    status = read_boot_file(root, files[i].path, (uint8_t *)buffer + offset,
+                            &read_size);
+    if (status != EFI_SUCCESS || read_size == 0) {
+      root->Close(root);
+      return status != EFI_SUCCESS ? status : 1;
+    }
+
+    ascii_copy(entries[i].name, files[i].name, INITRD_NAME_LEN);
+    entries[i].offset = offset;
+    entries[i].size = read_size;
+    offset += read_size;
+  }
+
   root->Close(root);
-  return status;
+
+  header->magic = INITRD_MAGIC;
+  header->version = INITRD_VERSION;
+  header->file_count = BOOT_FILE_COUNT;
+  header->header_size = (uint32_t)header_size;
+  *buffer_size = offset;
+  return EFI_SUCCESS;
 }
 
 EFI_STATUS efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable) {
@@ -309,11 +295,12 @@ EFI_STATUS efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable) {
     PANIC(L"Failed to find ACPI 2.0 RSDP!\r\n");
   }
 
-  uint64_t initrd_size = INITRD_MAX_SIZE;
-  EFI_STATUS initrd_status =
-      load_initrd(ImageHandle, SystemTable, initrd_storage, &initrd_size);
-  if (initrd_status != EFI_SUCCESS) {
-    PANIC(L"Failed to load initrd.bin!\r\n");
+  uint64_t boot_archive_size = BOOT_ARCHIVE_MAX_SIZE;
+  EFI_STATUS boot_status =
+      load_boot_archive(ImageHandle, SystemTable, boot_archive_storage,
+                        &boot_archive_size);
+  if (boot_status != EFI_SUCCESS) {
+    PANIC(L"Failed to load /boot seed files!\r\n");
   }
   uint64_t MemoryMapSize = 0;
   EFI_MEMORY_DESCRIPTOR *MemoryMap = NULL;
@@ -348,7 +335,7 @@ EFI_STATUS efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable) {
     }
   }
   neptune_kmain(MemoryMap, MemoryMapSize, DescriptorSize, rsdp_ptr,
-                initrd_storage, initrd_size);
+                boot_archive_storage, boot_archive_size);
 
   return EFI_SUCCESS;
 }

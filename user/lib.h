@@ -20,6 +20,7 @@ typedef struct {
     uint32_t ipc_target_tid;
     uint32_t awaiting_irq;
     uint32_t parent_tid;
+    uint32_t core_id;
 } task_info_t;
 
 typedef struct {
@@ -63,6 +64,7 @@ typedef struct {
     uint32_t active_mem_mappings;
     uint32_t current_vma_count;
     uint32_t current_vma_capacity;
+    uint32_t online_cores;
 } debug_info_t;
 
 #define VMA_READ       (1ULL << 0)
@@ -534,11 +536,13 @@ static inline task_info_t sys_ps(uint32_t index) {
     register uint64_t x4 asm("x4");
     register uint64_t x5 asm("x5");
     register uint64_t x6 asm("x6");
+    register uint64_t x7 asm("x7");
     register uint64_t x8 asm("x8") = 10;
 
     asm volatile(
         "svc #0"
-        : "+r" (x0), "=r" (x1), "=r" (x2), "=r" (x3), "=r" (x4), "=r" (x5), "=r" (x6)
+        : "+r" (x0), "=r" (x1), "=r" (x2), "=r" (x3), "=r" (x4),
+          "=r" (x5), "=r" (x6), "=r" (x7)
         : "r" (x8)
         : "memory"
     );
@@ -554,6 +558,7 @@ static inline task_info_t sys_ps(uint32_t index) {
     info.ipc_target_tid = (uint32_t)x5;
     info.awaiting_irq = (uint32_t)x6;
     info.parent_tid = (uint32_t)(x6 >> 32);
+    info.core_id = (uint32_t)x7;
     return info;
 }
 
@@ -874,6 +879,7 @@ static inline debug_info_t sys_debug_info(void) {
     debug_info_t info;
     info.log_level = (uint32_t)x0;
     info.tick_hz = (uint32_t)x1;
+    info.online_cores = (uint32_t)(x1 >> 32);
     info.task_capacity = (uint32_t)x2;
     info.max_user_asids = (uint32_t)x3;
     info.user_stack_max_size = x4;
@@ -992,17 +998,19 @@ static inline vfs_request_t sys_vfs_recv(void) {
 static inline int sys_vfs_exec_create(uint32_t client_tid,
                                       const void *elf_data,
                                       uint64_t elf_size,
-                                      uint32_t file_index) {
+                                      uint32_t file_index,
+                                      uint32_t boot_flags) {
     register uint64_t x0 asm("x0") = client_tid;
     register uint64_t x1 asm("x1") = (uint64_t)elf_data;
     register uint64_t x2 asm("x2") = elf_size;
     register uint64_t x3 asm("x3") = file_index;
+    register uint64_t x4 asm("x4") = boot_flags;
     register uint64_t x8 asm("x8") = 47;
 
     asm volatile(
         "svc #0"
         : "+r" (x0)
-        : "r" (x1), "r" (x2), "r" (x3), "r" (x8)
+        : "r" (x1), "r" (x2), "r" (x3), "r" (x4), "r" (x8)
         : "memory"
     );
 
@@ -1073,14 +1081,23 @@ typedef struct {
     uint64_t size;
 } vfs_file_info_t;
 
+typedef struct {
+    int status;
+    uint64_t total_kib;
+    uint64_t free_kib;
+    uint64_t cluster_bytes;
+} vfs_statfs_t;
+
 int streq(const char *a, const char *b);
 int ensure_vfs_bound(void);
 vfs_reply_t vfs_call_retry(uint64_t arg0, uint64_t arg1, uint64_t arg2);
 vfs_file_info_t vfs_open_file(const char *target);
+vfs_statfs_t vfs_statfs(void);
 int64_t vfs_read_index(uint32_t index, void *buf);
 int64_t vfs_read_handle_page(uint32_t handle, uint32_t page_index, void *buf);
 int64_t vfs_write_page(fs_write_page_t *request);
 int vfs_delete_file(const char *name);
+int vfs_mkdir(const char *name);
 int64_t vfs_copy_file(const char *src, const char *dst);
 void vfs_close_handle(uint32_t handle);
 spawn_result_t vfs_spawn_program(const char *name, uint8_t priority);

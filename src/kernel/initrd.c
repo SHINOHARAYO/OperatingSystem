@@ -16,20 +16,20 @@ static int streq(const char *a, const char *b) {
 
 int initrd_init(const void *data, uint64_t size) {
     if (!data || size < sizeof(initrd_header_t)) {
-        LOG_FAIL("INITRD: Missing image.");
+        LOG_FAIL("BOOTFS: Missing image.");
         return -1;
     }
 
     const initrd_header_t *header = (const initrd_header_t *)data;
     if (header->magic != INITRD_MAGIC || header->version != INITRD_VERSION) {
-        LOG_FAIL("INITRD: Bad header.");
+        LOG_FAIL("BOOTFS: Bad header.");
         return -1;
     }
 
     uint64_t table_size = sizeof(initrd_header_t) +
                           ((uint64_t)header->file_count * sizeof(initrd_entry_t));
     if (header->header_size < table_size || header->header_size > size) {
-        LOG_FAIL("INITRD: Bad table size.");
+        LOG_FAIL("BOOTFS: Bad table size.");
         return -1;
     }
 
@@ -37,7 +37,7 @@ int initrd_init(const void *data, uint64_t size) {
         (const initrd_entry_t *)((const uint8_t *)data + sizeof(initrd_header_t));
     for (uint32_t i = 0; i < header->file_count; i++) {
         if (entries[i].offset > size || entries[i].size > size - entries[i].offset) {
-            LOG_FAIL("INITRD: File outside image.");
+            LOG_FAIL("BOOTFS: File outside image.");
             return -1;
         }
     }
@@ -47,8 +47,8 @@ int initrd_init(const void *data, uint64_t size) {
     initrd_header = header;
     initrd_entries = entries;
 
-    LOG_DEBUG_HEX("INITRD: Loaded image bytes: ", initrd_size);
-    LOG_OK_HEX("INITRD: File count: ", header->file_count);
+    LOG_DEBUG_HEX("BOOTFS: Loaded archive bytes: ", initrd_size);
+    LOG_OK_HEX("BOOTFS: File count: ", header->file_count);
     return 0;
 }
 

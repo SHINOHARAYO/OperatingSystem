@@ -147,10 +147,14 @@ int vm_object_resolve_page(uint32_t object_id, uint64_t object_offset,
     }
 
     if (object->type == VM_OBJECT_ANON ||
-        (object->type == VM_OBJECT_INITRD && object_offset >= object->size)) {
+        (object->type == VM_OBJECT_INITRD && object_offset >= object->data_size)) {
         frame_t *frame = frame_alloc(owner_tid, FRAME_FLAG_USER);
         if (!frame) {
             return -1;
+        }
+        uint8_t *dst = (uint8_t *)frame->paddr;
+        for (uint64_t i = 0; i < PAGE_SIZE; i++) {
+            dst[i] = 0;
         }
         *out_paddr = frame->paddr;
         return 0;

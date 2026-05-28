@@ -4,7 +4,8 @@
 #include "vmm.h"
 
 static int translate_user_byte(uint64_t user_va, uint8_t **kernel_ptr, int write) {
-    if (!current_task || !current_task->pgd || !kernel_ptr) {
+    tcb_t *task = sched_current_task();
+    if (!task || !task->pgd || !kernel_ptr) {
         return -1;
     }
 
@@ -14,7 +15,7 @@ static int translate_user_byte(uint64_t user_va, uint8_t **kernel_ptr, int write
 
     uint64_t pa = 0;
     uint64_t entry = 0;
-    if (vmm_query_page(current_task->pgd, user_va, &pa, &entry) < 0) {
+    if (vmm_query_page(task->pgd, user_va, &pa, &entry) < 0) {
         return -1;
     }
     if ((entry & PTE_USER) == 0) {

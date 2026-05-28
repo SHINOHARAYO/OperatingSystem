@@ -14,6 +14,7 @@
 #define USER_SHARED_BASE 0xC0000000ULL
 #define USER_BOOT_INITRD_BASE 0xD0000000ULL
 #define MAX_VFS_ROUTES 8
+#define MAX_SCHED_CORES 4
 
 #define IPC_INLINE_BYTES 128
 #define IPC_INLINE_WORDS 16
@@ -70,6 +71,7 @@ typedef struct tcb_t {
     uint8_t sched_queued;
     uint8_t timer_queued;
     uint16_t sched_padding;
+    uint32_t sched_core_id;
     uint64_t wake_tick;
     struct tcb_t *sched_next;
     struct tcb_t *sched_prev;
@@ -113,6 +115,10 @@ typedef struct tcb_t {
 
 void sched_init(void);
 
+void sched_secondary_core_online(uint32_t core_id);
+uint32_t sched_online_core_count(void);
+void sched_handle_reschedule_ipi(void);
+
 int sched_create_task(void (*entry_point)(void), uint8_t priority);
 
 int sched_create_user_task(const uint8_t *elf_data, uint64_t elf_size, uint8_t priority);
@@ -129,7 +135,7 @@ int sched_spawn_file_syscall(uint64_t *regs, uint64_t name_ptr, uint8_t priority
 int sched_spawn_exec_syscall(uint64_t *regs, uint32_t exec_cap, uint8_t priority);
 int sched_vfs_exec_create_syscall(uint64_t *regs, uint32_t client_tid,
                                   uint64_t elf_data, uint64_t elf_size,
-                                  uint32_t file_index);
+                                  uint32_t file_index, uint32_t boot_flags);
 int sched_install_exec_cap_at(uint32_t tid, uint32_t cap, uint32_t initrd_index);
 int sched_install_file_cap_at(uint32_t tid, uint32_t cap, uint32_t initrd_index);
 int sched_map_boot_data(uint32_t tid, const void *data, uint64_t size, uint64_t user_va);
@@ -167,5 +173,3 @@ void sched_fault_current_task(uint64_t esr, uint64_t elr, uint64_t far);
 
 uint64_t* sched_get_task_pgd(uint32_t tid);
 uint16_t sched_get_task_asid(uint32_t tid);
-
-extern tcb_t *current_task;

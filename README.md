@@ -3,7 +3,7 @@
 Neptune is an experimental AArch64 microkernel-style OS that boots as a UEFI
 application under QEMU. It has isolated EL0 user tasks, capability-based IPC,
 lazy virtual memory, zero-copy memory sharing, a user-space service model, an
-EL1 VFS fast channel, and a CPU0 O(1) MLFQ scheduler.
+EL1 VFS fast channel, and an SMP-shaped per-core O(1) MLFQ scheduler.
 
 This is a teaching and research OS. It is not production software.
 
@@ -30,14 +30,16 @@ Useful targets:
 
 | Target | Purpose |
 | --- | --- |
-| `make` | Build the kernel EFI image, user ELFs, and initrd |
-| `make image` | Create `build/fat.img`, `initrd.bin`, and create `build/storage.fat` only if missing |
+| `make` | Build the kernel EFI image |
+| `make image` | Create `build/fat.img`, copy the `/boot` seed into it, create `build/storage.fat` only if missing, and refresh app ELFs in place |
+| `make update-storage-apps` | Copy freshly built user ELFs into existing `build/storage.fat` without formatting it |
 | `make run` | Rebuild the image targets and boot QEMU in `-nographic` mode |
 | `make run_g` | Rebuild the image targets and boot QEMU with a graphical display |
 | `make reset-storage` | Replace `build/storage.fat` with a fresh copy of `apps.fat` |
-| `make clean` | Remove generated build output |
+| `make clean` | Remove generated build output but preserve `build/storage.fat` |
+| `make distclean` | Remove all generated build output, including `build/storage.fat` |
 
-The default QEMU memory size is `2048M`.
+The default QEMU memory size is `2048M`; the default QEMU CPU count is `4`.
 
 ```sh
 make run QEMU_MEM=1024M
@@ -73,35 +75,56 @@ Neptune currently boots this service stack:
 | `uart_server` | EL0 | Serial output service |
 | `keyboard_server` | EL0 | Keyboard input service |
 | `name_server` | EL0 | Service registry and endpoint lookup |
-| `block_server` | EL0 | Virtio-mmio block driver with RAM fallback |
+| `block_server` | EL0 | Virtio PCI block driver for persistent storage |
 | `fs_server` | EL0 | FatFs-backed filesystem and VFS service |
-| `shell` | EL0 | Interactive command shell |
+| `init` | EL0 | First user process; owns service startup policy |
+| `shell` | EL0 | Interactive command shell launched from `storage.fat` |
 
 The kernel keeps authority, scheduling, memory mappings, faults, and IPC
 handoff. Filesystem metadata and directory state now live in `fs.elf` user
-memory. `block.elf` first probes the QEMU virtio-mmio transport bank and, when
-present, exposes `build/storage.fat` as a persistent sector device over
-capability IPC. If no virtio block device is available, it falls back to a RAM
-copy of `apps.fat` from the boot initrd mapped at `0xD0000000`. `fs.elf` mounts
-the block service with FatFs and serves file operations through the VFS fast
-channel.
+memory. The kernel discovers the persistent virtio block device through ACPI
+MCFG/PCI ECAM, maps the device BAR into `block.elf`, and exposes
+`build/storage.fat` as a persistent sector device over capability IPC. `fs.elf`
+mounts the block service with FatFs and serves file operations through the VFS
+fast channel.
+
+The EFI stage reads the tiny `/boot` seed from the FAT boot image:
+`init.elf`, `ns.elf`, `block.elf`, and `fs.elf`. It builds a small in-memory
+boot archive from those files. The kernel creates only `init.elf`; init starts
+the storage foundation from that archive, waits for VFS, then reads the
+persistent `/etc/boot.txt` from `storage.fat` and launches disk-backed services
+such as `/sbin/uart.elf`, `/sbin/keyboard.elf`, and `/bin/shell.elf`.
 
 ## Implemented Features
 
 ### Boot And Platform
 
 - AArch64 UEFI boot under QEMU.
-- FAT image boot with `BOOTAA64.EFI` and `initrd.bin`.
-- Exception vectors, MMU, ACPI discovery, GICv2, and ARM generic timer setup.
+- FAT image boot with `BOOTAA64.EFI` and a minimal `/boot` seed.
+- Exception vectors, MMU, ACPI MADT/MCFG discovery, GICv2, and ARM generic
+  timer setup.
 - 1 kHz timer tick.
 - 39-bit lower-half virtual address layout.
 - 40-bit physical-address support.
 - ASID-aware user address spaces with targeted TLB invalidation.
-- QEMU virtio-mmio block window mapping for the EL0 block driver.
+- ACPI/PCI discovery for the EL0 virtio block driver.
 
 ### Scheduler
 
-- CPU0 per-core scheduler structure.
+- Per-core scheduler structures with CPU-local current task, ready bitmap,
+  ready queues, and timer wheel.
+- Kernel subsystems use the scheduler current-task accessor instead of a
+  shared exported `current_task` pointer.
+- Secondary cores are started with PSCI, get private stacks, initialize their
+  GIC CPU interface and local timer, register as online scheduler cores, and
+  enter the scheduler through per-core idle TCBs.
+- Bootstrap services stay on CPU0; normal shell child workloads may migrate to
+  secondary cores when they become ready or exhaust their quantum.
+- GICv2 SGI send support is present for IPI plumbing.
+- Per-core ready queues are protected by scheduler spinlocks.
+- Cross-core reschedule requests can be delivered through SGI/IPI.
+- Tasks carry a scheduler core id so ready/timer ownership survives task-table
+  growth and future migration.
 - O(1) MLFQ with 32 circular ready queues.
 - Bitmap readiness tracking with native AArch64 `CLZ` selection.
 - Queue 0 is highest priority and maps to bitmap bit 31.
@@ -121,13 +144,13 @@ channel.
 - Physical page allocator.
 - Kernel heap diagnostics.
 - Frame objects with refcounts above PMM pages.
-- VM objects for anonymous and initrd-backed mappings.
+- VM objects for anonymous and boot-archive-backed mappings.
 - Per-task VMA tables for ELF, stack, guard, mmap, imports, and file mappings.
 - Dynamically growing VMA tables with sorted lookup.
 - VMA split/remove/coalesce support.
 - Lazy anonymous `mmap`.
 - Lazy file-backed mappings.
-- Lazy executable segment loading for kernel initrd-backed spawn paths.
+- Lazy executable segment loading for kernel boot-archive-backed spawn paths.
 - Dynamic stack growth up to 64 KiB with a moving guard page.
 - `fork` with copy-on-write for writable frame-backed user pages.
 - Public `munmap`.
@@ -175,23 +198,37 @@ channel.
 - Injection preserves already-mapped client page contents, so the same path can
   move data FS-to-client or client-to-FS.
 - FatFs is vendored in `third_party/fatfs`.
-- The build creates an `apps.fat` FAT volume containing the user ELFs.
+- The build creates an `apps.fat` FAT seed volume with apps under `/bin`,
+  services under `/sbin`, and boot policy under `/etc/boot.txt`.
 - The build creates `build/storage.fat` from `apps.fat` only when it is missing,
   so filesystem writes survive normal rebuilds.
-- `block.elf` implements a userspace virtio-mmio block driver and exposes
+- Normal image builds refresh app ELFs inside `build/storage.fat` in place, so
+  user-created files survive while rebuilt programs become runnable from disk.
+- The standalone `initrd.bin` file is no longer used. The EFI stage loads the
+  minimal boot seed from `/boot` in the FAT boot image; demos, tests, UART,
+  keyboard, and the shell run from `storage.fat`.
+- `block.elf` implements a userspace modern virtio-pci block driver and exposes
   512-byte sectors over IPC.
+- The kernel parses ACPI MCFG, enumerates PCI ECAM, finds the modern virtio-blk
+  PCI function, enables memory/bus-master access, and grants `block.elf` a
+  discovered BAR mapping plus a read-only boot-info page.
 - `block.elf` uses DMA caps to pin and resolve only explicitly exported buffers
   before programming virtio descriptors.
-- `block.elf` falls back to a writable RAM copy of boot `apps.fat` when the
-  virtio device is absent.
 - `fs.elf` talks to `block.elf` through IPC-backed shared memory and mounts the
   result in EL0 with FatFs.
 - `fs.elf` owns directory and open-handle state.
+- `fs.elf` supports normalized paths, directory scanning, and `mkdir`.
 - `fs.elf` can create or replace files through FatFs writes.
+- `fs.elf` exposes root filesystem capacity through VFS `statfs`; the shell
+  reports it with `mounts`.
 - The shell can inspect, copy, install, and remove files through VFS.
-- `ls` uses the VFS path.
+- `recvhex <file> <size>` can ingest a new file over the serial console without
+  rebuilding the OS image.
+- `ls [path]` uses the VFS path. For example: `ls /`, `ls /bin`, `ls /sbin`.
 - `run <file>` asks `fs.elf` to read the executable, creates a kernel-owned
   VFS exec object, and spawns through an `OCAP_EXEC` handle.
+- Short executable names fall back to `/bin`, so both `run badptr.elf` and
+  `run /bin/badptr.elf` work.
 - Copied executables can be launched directly from `storage.fat`.
 - VFS exec caps are one-shot spawn tickets; the kernel releases the backing
   exec object after the spawn attempt.
@@ -213,44 +250,62 @@ After boot:
 Neptune>
 ```
 
+The shell supports a 256-byte command line, end-of-line editing, Backspace,
+Delete, Ctrl-U to clear the current line, Ctrl-C to cancel the line, Ctrl-L to
+clear the screen, and Up/Down history recall for the last 32 commands.
+
+Use `help` for grouped command help, or `help <command>` for one command.
+
 Core commands:
 
 | Command | Purpose |
 | --- | --- |
-| `help` | Show shell help |
+| `help [command]` | Show grouped help or details for one command |
 | `clear` | Clear the terminal |
 | `echo <text>` | Print text |
 | `uptime` | Show uptime |
-| `mem` | Show RAM and heap usage |
-| `vmmap` | Show this task's VMA table |
-| `capstat` | Show this task's capability slots |
-| `debug` | Show kernel/runtime debug info |
-| `ps` | Show task state |
-| `jobs` | Show shell child jobs |
-| `poll <tid>` | Check child status without reaping |
-| `wait <tid>` | Wait for and reap child status |
-| `kill <tid>` | Kill a user task |
 
 File and VFS commands:
 
 | Command | Purpose |
 | --- | --- |
-| `ls` | List files through the VFS fast channel |
+| `ls [path]` | List files through the VFS fast channel |
 | `cat <file>` | Print a file through VFS |
 | `cp <src> <dst>` | Copy a file through VFS |
 | `install <src> <dst>` | Copy an executable into the writable filesystem |
+| `recvhex <file> <size>` | Receive hex bytes from the console into a file |
 | `rm <file>` | Remove a file through VFS |
+| `mkdir <path>` | Create a directory through VFS |
+| `mounts` | Show mounted filesystems |
 | `vfstest` | Test VFS call/reply handoff |
 | `vfsinject` | Test shared page injection |
-| `vfsls` | Explicit VFS file listing |
+| `vfsls [path]` | Explicit VFS file listing |
 | `vfsopen <file>` | Show VFS metadata for one file |
 | `vfsread` | Read one file page through VFS injection |
 | `vfswrite` | Create and verify `notes.txt` through writable FatFs |
 | `vfsinstall` | Copy an ELF, run it from the writable FS, then remove it |
 | `vfsexec` | Resolve an executable through VFS, create an exec cap, and spawn it |
 | `run <file>` | Spawn an ELF through a kernel-owned VFS exec object |
-| `filelazy` | Read a file page through the VFS page path |
-| `vmstress` | Stress VMA growth with file mappings |
+
+Process commands:
+
+| Command | Purpose |
+| --- | --- |
+| `ps` | Show task scheduler state |
+| `jobs` | Show shell child jobs |
+| `spawn <pong|fault|spin>` | Spawn a demo child and leave status for `wait` |
+| `kill <tid>` | Kill a user task |
+| `wait <tid>` | Wait for and reap child status |
+| `poll <tid>` | Check child status without reaping |
+
+Diagnostic commands:
+
+| Command | Purpose |
+| --- | --- |
+| `mem` | Show RAM and heap usage |
+| `vmmap` | Show this task's VMA table |
+| `capstat` | Show this task's capability slots |
+| `debug` | Show kernel/runtime debug info |
 
 IPC and memory commands:
 
@@ -266,24 +321,43 @@ IPC and memory commands:
 | `munmap` | Test unmap and stale export rejection |
 | `forkcow` | Verify copy-on-write after fork |
 
-Regression and demo commands:
+Test and demo commands:
 
 | Command | Purpose |
 | --- | --- |
+| `demo [quick|vfs|ipc|mem|proc|all]` | Run curated bounded demo suites |
 | `smoke` | Run bounded core regression checks |
+| `vfstest` | Test VFS call/reply handoff |
+| `vfsinject` | Test shared page injection |
+| `filelazy` | Read a file page through the VFS page path |
+| `vmstress` | Stress VMA growth with file mappings |
 | `lazyexec` | Spawn `badptr.elf` through the VFS executable path |
 | `taskstress` | Grow the kernel task table |
 | `speed` | Benchmark syscalls, yield, faults, memory, and IPC |
 | `pong` | Run the IPC pong demo |
 | `fault` | Spawn a deliberate faulting task |
 | `badptr` | Verify invalid syscall pointers are rejected |
-| `spawn pong` | Spawn pong and leave status for `wait` |
-| `spawn fault` | Spawn a faulting child |
-| `spawn spin` | Spawn a long-running child |
 
 ## Demos
 
-Run a long-lived child:
+Use the curated demo runner for normal checks:
+
+```text
+demo
+demo quick
+demo vfs
+demo ipc
+demo mem
+demo proc
+```
+
+`demo all` runs every suite. It is intentionally noisy and slower, so use it
+when you want broad confidence rather than a quick smoke.
+
+Heavier stress probes such as `ipckill` stay as individual commands so the
+curated suites return cleanly to the shell.
+
+Process lifecycle demo:
 
 ```text
 spawn spin
@@ -293,7 +367,7 @@ kill 4
 wait 4
 ```
 
-Run the VFS path:
+VFS path demo, expanded:
 
 ```text
 ls
@@ -312,21 +386,35 @@ Run core smoke checks:
 smoke
 ```
 
-The current smoke path covers lazy memory, VFS call/injection, VFS writeback,
-register IPC, invalid pointers, stack growth, and the speed benchmark.
+The current quick smoke path covers lazy memory, VFS call/injection, VFS
+writeback, register IPC, invalid pointers, stack growth, and the speed
+benchmark.
 
 ## User Programs
 
-The current initrd contains:
+The FAT boot image contains only the `/boot` seed needed to reach
+`storage.fat`:
+
+| Program | Source | Purpose |
+| --- | --- | --- |
+| `init.elf` | `user/init.c` | First user process; starts services from policy |
+| `ns.elf` | `user/ns.c` | Name server |
+| `block.elf` | `user/block.c` | Virtio-pci block service |
+| `fs.elf` | `user/fs.c` | FatFs and VFS service |
+
+The persistent `storage.fat` layout is:
+
+| Path | Contents |
+| --- | --- |
+| `/bin` | Shell, demos, tests, and benchmarks |
+| `/sbin` | Init and service binaries |
+| `/etc/boot.txt` | Persistent boot manifest for disk-launched services |
+
+The `/bin` app set contains:
 
 | Program | Source | Purpose |
 | --- | --- | --- |
 | `shell.elf` | `user/shell.c` | Interactive shell |
-| `uart.elf` | `user/uart.c` | UART service |
-| `keyboard.elf` | `user/keyboard.c` | Keyboard service |
-| `ns.elf` | `user/ns.c` | Name server |
-| `block.elf` | `user/block.c` | Virtio-mmio/RAM FAT block service |
-| `fs.elf` | `user/fs.c` | FatFs and VFS service |
 | `pong.elf` | `user/pong.c` | IPC demo |
 | `fault.elf` | `user/fault.c` | Deliberate fault test |
 | `spin.elf` | `user/spin.c` | Long-running task |
@@ -341,16 +429,22 @@ The current initrd contains:
 | `speed.elf` | `user/speed.c` | Performance benchmark |
 | `speedipc.elf` | `user/speedipc.c` | IPC benchmark helper |
 
+The `/sbin` service set contains `init.elf`, `uart.elf`, `keyboard.elf`,
+`ns.elf`, `block.elf`, and `fs.elf`.
+
 ## Known Limitations
 
-- Single-core CPU0 scheduling only; the structures are ready for later SMP.
-- User programs are still packaged into `initrd.bin` at build time.
-- `make clean` removes the whole `build` directory, including `storage.fat`.
-- The block driver supports QEMU virtio-mmio only; no PCI virtio discovery yet.
+- Secondary cores can run normal EL0 workloads, but bootstrap services are
+  still deliberately pinned to CPU0 and there is no work stealing yet.
+- The `/boot` seed still contains `init.elf`, `ns.elf`, `block.elf`, and
+  `fs.elf` because those are needed before `storage.fat` can be mounted; the
+  normal service copies, shell, apps, and boot policy live in `storage.fat`.
+- The block driver requires a modern virtio-blk PCI device for `storage.fat`;
+  there is no RAM-disk fallback yet.
 - DMA caps pin frame-backed user pages, but there is still no IOMMU or device
   isolation layer.
 - VFS currently fronts one FatFs-backed volume only.
-- The initrd page cache and VM object tables are fixed-size v1 tables.
+- The boot-archive page cache and VM object tables are fixed-size v1 tables.
 - Memory-cap object and mapping tables are fixed-size v1 tables.
 - Copy-on-write currently covers forked, writable, frame-backed user pages.
 - Terminal input is intentionally simple and ASCII-oriented.
@@ -358,9 +452,7 @@ The current initrd contains:
 
 ## Good Next Steps
 
-- Add PCI/ACPI discovery for virtio devices instead of relying on the QEMU
-  virtio-mmio transport bank.
 - Add IOMMU-style device domains and per-device DMA authority.
-- Add host-side automated QEMU smoke scripts.
-- Extend the per-core scheduler work toward SMP.
+- Add host-side automated QEMU smoke scripts with SMP assertions.
+- Add work stealing and broader SMP hardening around global kernel tables.
 - Replace fixed-size v1 object tables with growable or reclaiming allocators.

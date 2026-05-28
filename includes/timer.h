@@ -4,6 +4,7 @@
 #include <stddef.h>
 
 void timer_init(void);
+void timer_init_secondary(void);
 
 void timer_handle_interrupt(void);
 

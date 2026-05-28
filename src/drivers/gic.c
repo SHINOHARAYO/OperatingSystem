@@ -19,6 +19,7 @@ static uint64_t GICC_BASE = 0;
 #define GICD_IPRIORITYR(n) (GICD_BASE + 0x400 + ((n) * 4))
 #define GICD_ITARGETSR(n)  (GICD_BASE + 0x800 + ((n) * 4))
 #define GICD_ICFGR(n)    (GICD_BASE + 0xC00 + ((n) * 4))
+#define GICD_SGIR        (GICD_BASE + 0xF00)
 
 #define GICC_CTLR        (GICC_BASE + 0x0000)
 #define GICC_PMR         (GICC_BASE + 0x0004)
@@ -57,14 +58,22 @@ void gic_init(void) {
     }
     mmio_write32(GICD_CTLR, 1);
     LOG_OK("GIC: Distributor (GICD) Enabled.");
-    mmio_write32(GICC_CTLR, 0);
-
-    // Set Priority Mask to allow all interrupts (lowest priority is 0xFF, so we want to be able to receive them)
-    mmio_write32(GICC_PMR, 0xF0);
-    // Bit 0: EnableGrp0 -> Enable Group 0 interrupts (Secure)
-    mmio_write32(GICC_CTLR, 1);
+    gic_init_cpu_interface();
     
     LOG_OK("GIC: CPU Interface (GICC) Enabled.");
+}
+
+void gic_init_cpu_interface(void) {
+    if (!GICC_BASE) {
+        GICC_BASE = acpi_get_gicc_base();
+    }
+    if (!GICC_BASE) {
+        return;
+    }
+
+    mmio_write32(GICC_CTLR, 0);
+    mmio_write32(GICC_PMR, 0xF0);
+    mmio_write32(GICC_CTLR, 1);
 }
 
 void gic_enable_interrupt(uint32_t int_id) {
@@ -92,4 +101,12 @@ uint32_t gic_acknowledge_interrupt(void) {
 void gic_end_of_interrupt(uint32_t int_id) {
     // This tells the GIC we are done, dropping the priority and clearing the Active state.
     mmio_write32(GICC_EOIR, int_id);
+}
+
+void gic_send_sgi(uint32_t int_id, uint32_t target_cpu_mask) {
+    if (!GICD_BASE || int_id >= 16 || target_cpu_mask == 0) {
+        return;
+    }
+    uint32_t value = ((target_cpu_mask & 0xFF) << 16) | (int_id & 0xF);
+    mmio_write32(GICD_SGIR, value);
 }

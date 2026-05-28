@@ -1,0 +1,3 @@
+service /sbin/uart.elf
+service /sbin/keyboard.elf
+shell /bin/shell.elf

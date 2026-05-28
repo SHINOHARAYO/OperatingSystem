@@ -4,6 +4,7 @@
 #include <stdarg.h>
 
 static int uart_cap = -1;
+static void vfs_copy_name(char *dst, const char *src, uint64_t cap);
 
 static int get_uart_cap(void) {
     if (uart_cap < 0) {
@@ -238,36 +239,58 @@ vfs_file_info_t vfs_open_file(const char *target) {
     info.handle = 0;
     info.size = 0;
 
-    if (ensure_vfs_bound() < 0) {
+    if (!target || target[0] == '\0' || ensure_vfs_bound() < 0) {
         return info;
     }
 
-    for (uint32_t index = 0; index < 128; index++) {
-        char *name = (char *)sys_mmap(PAGE_BYTES);
-        if (!name) {
-            return info;
-        }
-
-        vfs_reply_t reply = vfs_call_retry(VFS_FS_REQ_LIST, index, (uint64_t)name);
-        if (reply.status < 0 || reply.value0 == 0xFFFFFFFFFFFFFFFFUL) {
-            sys_munmap(name, PAGE_BYTES);
-            return info;
-        }
-        if (streq(name, target)) {
-            vfs_reply_t opened = vfs_call_retry(VFS_FS_REQ_OPEN_INDEX, index, 0);
-            sys_munmap(name, PAGE_BYTES);
-            if (opened.status < 0 || opened.value0 == 0) {
-                return info;
-            }
-            info.status = 0;
-            info.index = index;
-            info.handle = (uint32_t)opened.value0;
-            info.size = opened.value1;
-            return info;
-        }
-        sys_munmap(name, PAGE_BYTES);
+    char *path = (char *)sys_mmap(PAGE_BYTES);
+    if (!path) {
+        return info;
     }
+
+    memset(path, 0, PAGE_BYTES);
+    vfs_copy_name(path, target, PAGE_BYTES);
+    vfs_reply_t opened = vfs_call_retry(VFS_FS_REQ_OPEN_PATH, (uint64_t)path, 0);
+    if (opened.status < 0 && !strchr(target, '/')) {
+        memset(path, 0, PAGE_BYTES);
+        vfs_copy_name(path, "bin/", PAGE_BYTES);
+        uint64_t prefix = strlen(path);
+        vfs_copy_name(path + prefix, target, PAGE_BYTES - prefix);
+        opened = vfs_call_retry(VFS_FS_REQ_OPEN_PATH, (uint64_t)path, 0);
+    }
+    sys_munmap(path, PAGE_BYTES);
+
+    if (opened.status < 0 || opened.value0 == 0) {
+        return info;
+    }
+    info.status = 0;
+    info.index = (uint32_t)opened.value2;
+    info.handle = (uint32_t)opened.value0;
+    info.size = opened.value1;
     return info;
+}
+
+vfs_statfs_t vfs_statfs(void) {
+    vfs_statfs_t stat;
+    stat.status = -1;
+    stat.total_kib = 0;
+    stat.free_kib = 0;
+    stat.cluster_bytes = 0;
+
+    if (ensure_vfs_bound() < 0) {
+        return stat;
+    }
+
+    vfs_reply_t reply = vfs_call_retry(VFS_FS_REQ_STATFS, 0, 0);
+    if (reply.status < 0) {
+        return stat;
+    }
+
+    stat.status = 0;
+    stat.total_kib = reply.value0;
+    stat.free_kib = reply.value1;
+    stat.cluster_bytes = reply.value2;
+    return stat;
 }
 
 int64_t vfs_read_index(uint32_t index, void *buf) {
@@ -322,6 +345,23 @@ int vfs_delete_file(const char *name) {
     memset(remote_name, 0, PAGE_BYTES);
     vfs_copy_name(remote_name, name, PAGE_BYTES);
     vfs_reply_t reply = vfs_call_retry(VFS_FS_REQ_DELETE, (uint64_t)remote_name, 0);
+    sys_munmap(remote_name, PAGE_BYTES);
+    return reply.status < 0 ? -1 : 0;
+}
+
+int vfs_mkdir(const char *name) {
+    if (!name || name[0] == '\0' || ensure_vfs_bound() < 0) {
+        return -1;
+    }
+
+    char *remote_name = (char *)sys_mmap(PAGE_BYTES);
+    if (!remote_name) {
+        return -1;
+    }
+
+    memset(remote_name, 0, PAGE_BYTES);
+    vfs_copy_name(remote_name, name, PAGE_BYTES);
+    vfs_reply_t reply = vfs_call_retry(VFS_FS_REQ_MKDIR, (uint64_t)remote_name, 0);
     sys_munmap(remote_name, PAGE_BYTES);
     return reply.status < 0 ? -1 : 0;
 }

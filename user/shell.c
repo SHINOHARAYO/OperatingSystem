@@ -3,7 +3,9 @@
 #include "fs_proto.h"
 #include "ns_proto.h"
 
-#define MAX_CMD 128
+#define MAX_CMD 256
+#define SHELL_HISTORY 32
+#define SHELL_PROMPT "Neptune> "
 #define INITIAL_JOBS 16
 #define PONG_PRIORITY 50
 
@@ -49,7 +51,8 @@ static void run_vfstest_demo(void);
 static void run_vfsinject_demo(void);
 static void run_vfswrite_demo(void);
 static void run_vfsinstall_demo(void);
-static void list_files_vfs(void);
+static void list_files_vfs(const char *path);
+static void run_recvhex_command(const char *name, uint32_t size);
 
 static int ensure_job_capacity(uint32_t min_capacity) {
   if (job_capacity >= min_capacity) {
@@ -89,16 +92,6 @@ static int _streq(const char *a, const char *b) {
   return *a == '\0' && *b == '\0';
 }
 
-static int _starts_with(const char *buf, const char *prefix) {
-  while (*prefix) {
-    if (*buf != *prefix)
-      return 0;
-    buf++;
-    prefix++;
-  }
-  return 1;
-}
-
 static uint32_t _parse_u32(const char *s, int *ok) {
   uint32_t value = 0;
   int seen = 0;
@@ -121,33 +114,15 @@ static uint32_t _parse_u32(const char *s, int *ok) {
   return value;
 }
 
-static int split_two_args(char *s, char **a, char **b) {
-  while (*s == ' ') {
-    s++;
-  }
-  if (*s == '\0') {
-    return -1;
-  }
-  *a = s;
-  while (*s && *s != ' ') {
-    s++;
-  }
-  if (*s == '\0') {
-    return -1;
-  }
-  *s++ = '\0';
-  while (*s == ' ') {
-    s++;
-  }
-  if (*s == '\0') {
-    return -1;
-  }
-  *b = s;
-  while (*s && *s != ' ') {
-    s++;
-  }
-  *s = '\0';
-  return 0;
+static int hex_value(char c) {
+  if (c >= '0' && c <= '9') return c - '0';
+  if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+  if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+  return -1;
+}
+
+static int is_space_char(char c) {
+  return c == ' ' || c == '\n' || c == '\r' || c == '\t';
 }
 
 static const char *task_state_name(uint32_t state) {
@@ -270,7 +245,8 @@ static void print_debug_info(void) {
 
   printf("KERNEL\n");
   printf("  log-level: %u (%s)\n", info.log_level, log_level_name(info.log_level));
-  printf("  scheduler: CPU0 O(1) MLFQ, %u Hz tick\n", info.tick_hz);
+  printf("  scheduler: per-core O(1) MLFQ, %u Hz tick, %u core%s online\n",
+         info.tick_hz, info.online_cores, info.online_cores == 1 ? "" : "s");
   printf("  task-capacity: %u slots\n", info.task_capacity);
   printf("  max-user-asids: %u\n", info.max_user_asids);
 
@@ -1045,6 +1021,14 @@ static int get_keyboard_cap(void) {
   return keyboard_cap;
 }
 
+static char read_console_char(void) {
+  (void)get_keyboard_cap();
+  ipc_msg_t key = sys_ipc_recv(CAP_SELF);
+  char c = (char)key.payload[0];
+  sys_ipc_reply(key.reply_cap, 0, 0, 0, 0);
+  return c;
+}
+
 
 static uint32_t spawn_program(const char *name, uint8_t priority) {
   last_spawn_endpoint_cap = -1;
@@ -1080,6 +1064,9 @@ static void run_vfsinject_demo(void) {
     return;
   }
 
+  for (uint32_t i = 0; i < PAGE_BYTES; i++) {
+    name[i] = 0;
+  }
   vfs_reply_t reply = vfs_call_retry(VFS_FS_REQ_LIST, 0, (uint64_t)name);
   int ok = reply.status == 0 && reply.value0 != FS_RESP_END && name[0] != '\0';
   printf("vfsinject: %s size=%lu name=%s client=0x%lx fs=0x%lx\n",
@@ -1087,20 +1074,26 @@ static void run_vfsinject_demo(void) {
   sys_munmap(name, PAGE_BYTES);
 }
 
-static void list_files_vfs(void) {
+static void list_files_vfs(const char *path) {
   if (ensure_vfs_bound() < 0) {
     printf("vfsls: vfs server unavailable\n");
     return;
   }
 
   printf("SIZE      NAME\n");
-  for (uint32_t index = 0; index < 128; index++) {
+  for (uint32_t index = 0; index < 256; index++) {
     char *name = (char *)sys_mmap(PAGE_BYTES);
     if (!name) {
       printf("vfsls: mmap failed\n");
       return;
     }
 
+    for (uint32_t i = 0; i < PAGE_BYTES; i++) {
+      name[i] = 0;
+    }
+    if (path && path[0] && !(path[0] == '/' && path[1] == '\0')) {
+      write_literal(name, path);
+    }
     vfs_reply_t reply = vfs_call_retry(VFS_FS_REQ_LIST, index, (uint64_t)name);
     if (reply.status < 0) {
       sys_munmap(name, PAGE_BYTES);
@@ -1119,23 +1112,22 @@ static void list_files_vfs(void) {
 
 
 static void run_vfsread_demo(void) {
-  if (ensure_vfs_bound() < 0) {
-    printf("vfsread: vfs server unavailable\n");
-    return;
-  }
-
   unsigned char *buf = (unsigned char *)sys_mmap(PAGE_BYTES);
   if (!buf) {
     printf("vfsread: mmap failed\n");
     return;
   }
 
-  vfs_reply_t reply = vfs_call_retry(VFS_FS_REQ_READ_INDEX, 0, (uint64_t)buf);
-  int ok = reply.status == 0 && reply.value0 >= 4 &&
+  vfs_file_info_t info = vfs_open_file("/bin/shell.elf");
+  int64_t got = info.status < 0 ? -1 : vfs_read_handle_page(info.handle, 0, buf);
+  int ok = got >= 4 &&
            buf[0] == 0x7f && buf[1] == 'E' && buf[2] == 'L' && buf[3] == 'F';
-  printf("vfsread: %s bytes=%lu total=%lu magic=%x %c%c%c\n",
-         ok ? "ok" : "failed", reply.value0, reply.value2,
+  printf("vfsread: %s bytes=%ld total=%lu magic=%x %c%c%c\n",
+         ok ? "ok" : "failed", got, info.size,
          (uint32_t)buf[0], buf[1], buf[2], buf[3]);
+  if (info.status == 0) {
+    vfs_close_handle(info.handle);
+  }
   sys_munmap(buf, PAGE_BYTES);
 }
 
@@ -1290,6 +1282,87 @@ static void run_copy_command(const char *src, const char *dst, const char *verb)
   printf("%s: %s -> %s (%ld bytes)\n", verb, src, dst, copied);
 }
 
+static void run_recvhex_command(const char *name, uint32_t size) {
+  if (!name || name[0] == '\0' || size == 0) {
+    printf("usage: recvhex <file> <size>\n");
+    return;
+  }
+
+  fs_write_page_t *request = (fs_write_page_t *)sys_mmap(PAGE_BYTES);
+  if (!request) {
+    printf("recvhex: mmap failed\n");
+    return;
+  }
+
+  printf("recvhex: paste %u bytes as hex for %s\n", size, name);
+
+  uint32_t written_total = 0;
+  uint32_t chunk_used = 0;
+  int high_nibble = -1;
+  int failed = 0;
+
+  for (uint32_t i = 0; i < PAGE_BYTES; i++) {
+    ((char *)request)[i] = 0;
+  }
+  write_literal(request->name, name);
+  request->offset = 0;
+  request->flags = VFS_WRITE_FLAG_TRUNCATE;
+
+  while (written_total < size && !failed) {
+    char c = read_console_char();
+    if (is_space_char(c)) {
+      continue;
+    }
+
+    int value = hex_value(c);
+    if (value < 0) {
+      printf("\nrecvhex: invalid hex character\n");
+      failed = 1;
+      break;
+    }
+
+    if (high_nibble < 0) {
+      high_nibble = value;
+      continue;
+    }
+
+    request->data[chunk_used++] = (uint8_t)((high_nibble << 4) | value);
+    high_nibble = -1;
+
+    if (chunk_used == FS_WRITE_DATA_MAX || written_total + chunk_used == size) {
+      request->size = chunk_used;
+      int64_t wrote = vfs_write_page(request);
+      if (wrote != (int64_t)chunk_used) {
+        printf("\nrecvhex: write failed at offset %u\n", written_total);
+        failed = 1;
+        break;
+      }
+
+      written_total += chunk_used;
+      request->offset = written_total;
+      request->flags = 0;
+      chunk_used = 0;
+      for (uint32_t i = 0; i < FS_WRITE_DATA_MAX; i++) {
+        request->data[i] = 0;
+      }
+      printf(".");
+    }
+  }
+
+  if (!failed && high_nibble >= 0) {
+    printf("\nrecvhex: odd number of hex digits\n");
+    failed = 1;
+  }
+
+  sys_munmap(request, PAGE_BYTES);
+  if (failed) {
+    (void)vfs_delete_file(name);
+    return;
+  }
+
+  printf("\nrecvhex: wrote %u bytes to %s\n", written_total, name);
+}
+
 static void run_vfsinstall_demo(void) {
   const char *dst = "badcopy.elf";
   (void)vfs_delete_file(dst);
@@ -1315,11 +1388,818 @@ static void run_vfsinstall_demo(void) {
   }
 }
 
-static void print_prompt(void) { printf("\nNeptune> "); }
+typedef struct shell_command shell_command_t;
+typedef void (*shell_handler_t)(int argc, char **argv, char *line);
+
+struct shell_command {
+  const char *name;
+  const char *usage;
+  const char *group;
+  const char *description;
+  shell_handler_t handler;
+};
+
+static void shell_copy(char *dst, const char *src, uint32_t limit) {
+  uint32_t i = 0;
+  if (limit == 0) {
+    return;
+  }
+  while (i + 1 < limit && src[i]) {
+    dst[i] = src[i];
+    i++;
+  }
+  dst[i] = '\0';
+}
+
+static int parse_args(char *line, char **argv, int max_args) {
+  int argc = 0;
+  char *p = line;
+
+  while (*p && argc < max_args) {
+    while (*p == ' ' || *p == '\t') {
+      p++;
+    }
+    if (*p == '\0') {
+      break;
+    }
+    argv[argc++] = p;
+    while (*p && *p != ' ' && *p != '\t') {
+      p++;
+    }
+    if (*p) {
+      *p++ = '\0';
+    }
+  }
+
+  return argc;
+}
+
+static void print_usage(const shell_command_t *cmd) {
+  printf("usage: %s\n", cmd->usage);
+}
+
+static void cmd_help(int argc, char **argv, char *line);
+static void cmd_clear(int argc, char **argv, char *line);
+static void cmd_echo(int argc, char **argv, char *line);
+static void cmd_uptime(int argc, char **argv, char *line);
+static void cmd_ls(int argc, char **argv, char *line);
+static void cmd_cat(int argc, char **argv, char *line);
+static void cmd_cp(int argc, char **argv, char *line);
+static void cmd_install(int argc, char **argv, char *line);
+static void cmd_recvhex(int argc, char **argv, char *line);
+static void cmd_rm(int argc, char **argv, char *line);
+static void cmd_mkdir(int argc, char **argv, char *line);
+static void cmd_mounts(int argc, char **argv, char *line);
+static void cmd_run(int argc, char **argv, char *line);
+static void cmd_spawn(int argc, char **argv, char *line);
+static void cmd_ps(int argc, char **argv, char *line);
+static void cmd_jobs(int argc, char **argv, char *line);
+static void cmd_kill(int argc, char **argv, char *line);
+static void cmd_wait(int argc, char **argv, char *line);
+static void cmd_poll(int argc, char **argv, char *line);
+static void cmd_mem(int argc, char **argv, char *line);
+static void cmd_vmmap(int argc, char **argv, char *line);
+static void cmd_capstat(int argc, char **argv, char *line);
+static void cmd_debug(int argc, char **argv, char *line);
+static void cmd_pong(int argc, char **argv, char *line);
+static void cmd_fault(int argc, char **argv, char *line);
+static void cmd_badptr(int argc, char **argv, char *line);
+static void cmd_smoke(int argc, char **argv, char *line);
+static void cmd_vfstest(int argc, char **argv, char *line);
+static void cmd_vfsinject(int argc, char **argv, char *line);
+static void cmd_vfsls(int argc, char **argv, char *line);
+static void cmd_vfsopen(int argc, char **argv, char *line);
+static void cmd_vfsread(int argc, char **argv, char *line);
+static void cmd_vfswrite(int argc, char **argv, char *line);
+static void cmd_vfsinstall(int argc, char **argv, char *line);
+static void cmd_vfsexec(int argc, char **argv, char *line);
+static void cmd_ipcfast(int argc, char **argv, char *line);
+static void cmd_ipccap(int argc, char **argv, char *line);
+static void cmd_ipckill(int argc, char **argv, char *line);
+static void cmd_memshare(int argc, char **argv, char *line);
+static void cmd_memxfer(int argc, char **argv, char *line);
+static void cmd_memcaplife(int argc, char **argv, char *line);
+static void cmd_memrevoke(int argc, char **argv, char *line);
+static void cmd_munmap(int argc, char **argv, char *line);
+static void cmd_forkcow(int argc, char **argv, char *line);
+static void cmd_filelazy(int argc, char **argv, char *line);
+static void cmd_vmstress(int argc, char **argv, char *line);
+static void cmd_lazyexec(int argc, char **argv, char *line);
+static void cmd_taskstress(int argc, char **argv, char *line);
+static void cmd_speed(int argc, char **argv, char *line);
+static void cmd_demo(int argc, char **argv, char *line);
+
+static const shell_command_t commands[] = {
+  {"help", "help [command]", "core", "Show grouped help or details for one command", cmd_help},
+  {"clear", "clear", "core", "Clear the terminal", cmd_clear},
+  {"echo", "echo <text>", "core", "Print text", cmd_echo},
+  {"uptime", "uptime", "core", "Show uptime", cmd_uptime},
+
+  {"ls", "ls [path]", "files", "List files through the VFS fast channel", cmd_ls},
+  {"cat", "cat <file>", "files", "Print a file through VFS", cmd_cat},
+  {"cp", "cp <src> <dst>", "files", "Copy a file through VFS", cmd_cp},
+  {"install", "install <src> <dst>", "files", "Copy an executable into the writable filesystem", cmd_install},
+  {"recvhex", "recvhex <file> <size>", "files", "Receive hex bytes from the console into a file", cmd_recvhex},
+  {"rm", "rm <file>", "files", "Remove a file through VFS", cmd_rm},
+  {"mkdir", "mkdir <path>", "files", "Create a directory through VFS", cmd_mkdir},
+  {"mounts", "mounts", "files", "Show mounted filesystems", cmd_mounts},
+  {"vfsls", "vfsls [path]", "files", "List files through the VFS fast channel", cmd_vfsls},
+  {"vfsopen", "vfsopen <file>", "files", "Show VFS metadata for one file", cmd_vfsopen},
+  {"vfsread", "vfsread", "files", "Read one file page through VFS injection", cmd_vfsread},
+  {"vfswrite", "vfswrite", "files", "Create and verify notes.txt through writable FatFs", cmd_vfswrite},
+  {"vfsinstall", "vfsinstall", "files", "Copy and run an ELF from the writable FS", cmd_vfsinstall},
+  {"vfsexec", "vfsexec", "files", "Resolve an executable through VFS, create an exec cap, and spawn it", cmd_vfsexec},
+  {"run", "run <file>", "files", "Spawn an ELF through a kernel-owned VFS exec object", cmd_run},
+
+  {"ps", "ps", "process", "Show task scheduler state", cmd_ps},
+  {"jobs", "jobs", "process", "Show shell child jobs", cmd_jobs},
+  {"spawn", "spawn <pong|fault|spin>", "process", "Spawn a demo child and leave status for wait", cmd_spawn},
+  {"kill", "kill <tid>", "process", "Kill a user task", cmd_kill},
+  {"wait", "wait <tid>", "process", "Wait for and reap child status", cmd_wait},
+  {"poll", "poll <tid>", "process", "Check child status without reaping", cmd_poll},
+
+  {"mem", "mem", "diagnostics", "Show RAM and heap usage", cmd_mem},
+  {"vmmap", "vmmap", "diagnostics", "Show this task's VMA table", cmd_vmmap},
+  {"capstat", "capstat", "diagnostics", "Show this task's capability slots", cmd_capstat},
+  {"debug", "debug", "diagnostics", "Show kernel/runtime debug info", cmd_debug},
+
+  {"demo", "demo [quick|vfs|ipc|mem|proc|all]", "tests", "Run curated bounded demo suites", cmd_demo},
+  {"smoke", "smoke", "tests", "Run bounded core regression checks", cmd_smoke},
+  {"vfstest", "vfstest", "tests", "Test VFS call/reply handoff", cmd_vfstest},
+  {"vfsinject", "vfsinject", "tests", "Test shared page injection", cmd_vfsinject},
+
+  {"ipcfast", "ipcfast", "ipc/memory", "Test 0/8/64/128-byte register IPC payloads", cmd_ipcfast},
+  {"ipccap", "ipccap", "ipc/memory", "Transfer an endpoint cap through IPC", cmd_ipccap},
+  {"ipckill", "ipckill", "ipc/memory", "Verify IPC cleanup on task kill", cmd_ipckill},
+  {"memshare", "memshare", "ipc/memory", "Share one page with another task", cmd_memshare},
+  {"memxfer", "memxfer", "ipc/memory", "Transfer one page to another task", cmd_memxfer},
+  {"memcaplife", "memcaplife", "ipc/memory", "Use a memory cap after unmapping the old VA", cmd_memcaplife},
+  {"memrevoke", "memrevoke", "ipc/memory", "Lend and revoke a page", cmd_memrevoke},
+  {"munmap", "munmap", "ipc/memory", "Test unmap and stale export rejection", cmd_munmap},
+  {"forkcow", "forkcow", "ipc/memory", "Verify copy-on-write after fork", cmd_forkcow},
+
+  {"filelazy", "filelazy", "tests", "Read a file page through the VFS page path", cmd_filelazy},
+  {"vmstress", "vmstress", "tests", "Stress VMA growth with file mappings", cmd_vmstress},
+  {"lazyexec", "lazyexec", "tests", "Spawn badptr.elf through the VFS executable path", cmd_lazyexec},
+  {"taskstress", "taskstress", "tests", "Grow the kernel task table", cmd_taskstress},
+  {"speed", "speed", "tests", "Benchmark syscalls, yield, faults, memory, and IPC", cmd_speed},
+  {"pong", "pong", "tests", "Run the IPC pong demo", cmd_pong},
+  {"fault", "fault", "tests", "Spawn a deliberate faulting task", cmd_fault},
+  {"badptr", "badptr", "tests", "Verify invalid syscall pointers are rejected", cmd_badptr},
+};
+
+static const uint32_t command_count = sizeof(commands) / sizeof(commands[0]);
+
+static const shell_command_t *find_command(const char *name) {
+  for (uint32_t i = 0; i < command_count; i++) {
+    if (_streq(commands[i].name, name)) {
+      return &commands[i];
+    }
+  }
+  return 0;
+}
+
+static int command_accepts_args(const shell_command_t *cmd) {
+  const char *p = cmd->usage;
+  while (*p) {
+    if (*p == ' ') {
+      return 1;
+    }
+    p++;
+  }
+  return 0;
+}
+
+static void print_grouped_help(void) {
+  static const char *groups[] = {
+    "core", "files", "process", "diagnostics", "ipc/memory", "tests"
+  };
+
+  printf("Available commands:\n");
+  for (uint32_t g = 0; g < sizeof(groups) / sizeof(groups[0]); g++) {
+    printf("\n%s:\n", groups[g]);
+    for (uint32_t i = 0; i < command_count; i++) {
+      if (_streq(commands[i].group, groups[g])) {
+        printf("  %s", commands[i].usage);
+        uint32_t len = 0;
+        while (commands[i].usage[len]) len++;
+        while (len++ < 24) printf(" ");
+        printf("%s\n", commands[i].description);
+      }
+    }
+  }
+}
+
+static void cmd_help(int argc, char **argv, char *line) {
+  (void)line;
+  if (argc == 1) {
+    print_grouped_help();
+    return;
+  }
+  if (argc != 2) {
+    print_usage(find_command("help"));
+    return;
+  }
+
+  const shell_command_t *cmd = find_command(argv[1]);
+  if (!cmd) {
+    printf("No help for '%s'\n", argv[1]);
+    return;
+  }
+
+  printf("%s\n", cmd->usage);
+  printf("  group: %s\n", cmd->group);
+  printf("  %s\n", cmd->description);
+}
+
+static void cmd_clear(int argc, char **argv, char *line) {
+  (void)argc; (void)argv; (void)line;
+  printf("\x1b[2J\x1b[H");
+}
+
+static void cmd_echo(int argc, char **argv, char *line) {
+  (void)argv;
+  if (argc < 2) {
+    printf("\n");
+    return;
+  }
+  char *text = line + 4;
+  while (*text == ' ' || *text == '\t') {
+    text++;
+  }
+  printf("%s\n", text);
+}
+
+static void cmd_uptime(int argc, char **argv, char *line) {
+  (void)argc; (void)argv; (void)line;
+  uint64_t secs = sys_uptime();
+  uint64_t h = secs / 3600;
+  uint64_t m = (secs % 3600) / 60;
+  uint64_t s = secs % 60;
+  printf("Uptime: %luh %lum %lus\n", h, m, s);
+}
+
+static void cmd_ls(int argc, char **argv, char *line) {
+  (void)line;
+  if (argc > 2) {
+    print_usage(find_command("ls"));
+    return;
+  }
+  list_files_vfs(argc == 2 ? argv[1] : "");
+}
+
+static void cmd_cat(int argc, char **argv, char *line) {
+  (void)line;
+  if (argc != 2) {
+    print_usage(find_command("cat"));
+    return;
+  }
+  run_cat_command(argv[1]);
+}
+
+static void cmd_cp(int argc, char **argv, char *line) {
+  (void)line;
+  if (argc != 3) {
+    print_usage(find_command("cp"));
+    return;
+  }
+  run_copy_command(argv[1], argv[2], "cp");
+}
+
+static void cmd_install(int argc, char **argv, char *line) {
+  (void)line;
+  if (argc != 3) {
+    print_usage(find_command("install"));
+    return;
+  }
+  run_copy_command(argv[1], argv[2], "install");
+}
+
+static void cmd_recvhex(int argc, char **argv, char *line) {
+  (void)line;
+  if (argc != 3) {
+    print_usage(find_command("recvhex"));
+    return;
+  }
+  int ok = 0;
+  uint32_t size = _parse_u32(argv[2], &ok);
+  if (!ok || size == 0) {
+    print_usage(find_command("recvhex"));
+    return;
+  }
+  run_recvhex_command(argv[1], size);
+}
+
+static void cmd_rm(int argc, char **argv, char *line) {
+  (void)line;
+  if (argc != 2) {
+    print_usage(find_command("rm"));
+    return;
+  }
+  run_rm_command(argv[1]);
+}
+
+static void cmd_mkdir(int argc, char **argv, char *line) {
+  (void)line;
+  if (argc != 2) {
+    print_usage(find_command("mkdir"));
+    return;
+  }
+  if (vfs_mkdir(argv[1]) < 0) {
+    printf("mkdir: could not create '%s'\n", argv[1]);
+  }
+}
+
+static void cmd_mounts(int argc, char **argv, char *line) {
+  (void)argv;
+  (void)line;
+  if (argc != 1) {
+    print_usage(find_command("mounts"));
+    return;
+  }
+
+  vfs_statfs_t stat = vfs_statfs();
+  if (stat.status < 0) {
+    printf("mounts: VFS root unavailable\n");
+    return;
+  }
+
+  printf("MOUNT TYPE  SOURCE       TOTAL KiB FREE KiB CLUSTER\n");
+  printf("/     fatfs virtio-blk0  %lu %lu %lu\n",
+         stat.total_kib, stat.free_kib, stat.cluster_bytes);
+}
+
+static void cmd_run(int argc, char **argv, char *line) {
+  (void)line;
+  if (argc != 2) {
+    print_usage(find_command("run"));
+    return;
+  }
+  uint32_t tid = spawn_program(argv[1], PONG_PRIORITY);
+  if ((int)tid < 0) {
+    printf("Error: could not run '%s'\n", argv[1]);
+  } else {
+    add_job(tid, argv[1]);
+    printf("Started %s as TID %u\n", argv[1], tid);
+  }
+}
+
+static void cmd_spawn(int argc, char **argv, char *line) {
+  (void)line;
+  if (argc != 2) {
+    print_usage(find_command("spawn"));
+    return;
+  }
+
+  if (_streq(argv[1], "pong")) {
+    printf("Spawning pong...\n");
+    uint32_t pong_tid = spawn_program(PONG_FILE, PONG_PRIORITY);
+    if ((int)pong_tid < 0) {
+      printf("Error: Could not spawn pong (task limit reached?)\n");
+    } else {
+      printf("Pong is TID %d. Exchanging 5 messages...\n", (int)pong_tid);
+      if (run_pong_exchange(pong_tid) < 0) {
+        printf("Error: pong IPC failed\n");
+      } else {
+        add_job(pong_tid, "pong");
+        printf("Pong finished. Run 'wait %u' to reap it.\n", pong_tid);
+      }
+    }
+  } else if (_streq(argv[1], "fault")) {
+    printf("Spawning fault test...\n");
+    uint32_t fault_tid = spawn_program(FAULT_FILE, PONG_PRIORITY);
+    if ((int)fault_tid < 0) {
+      printf("Error: Could not spawn fault test (task limit reached?)\n");
+    } else {
+      add_job(fault_tid, "fault");
+      printf("Fault test is TID %d. Run 'wait %u' to reap it.\n",
+             (int)fault_tid, fault_tid);
+    }
+  } else if (_streq(argv[1], "spin")) {
+    uint32_t spin_tid = spawn_program(SPIN_FILE, PONG_PRIORITY);
+    if ((int)spin_tid < 0) {
+      printf("Error: Could not spawn spin task (task limit reached?)\n");
+    } else {
+      add_job(spin_tid, "spin");
+      printf("Spin task is TID %d. Run 'ps', 'kill %u', then 'wait %u'.\n",
+             (int)spin_tid, spin_tid, spin_tid);
+    }
+  } else {
+    print_usage(find_command("spawn"));
+  }
+}
+
+static void cmd_ps(int argc, char **argv, char *line) {
+  (void)argc; (void)argv; (void)line;
+  printf("TID PPID CPU STATE   PRI BASE TICKS WAIT TARGET IRQ\n");
+  uint32_t capacity = sys_task_capacity();
+  for (uint32_t i = 0; i < capacity; i++) {
+    task_info_t task = sys_ps(i);
+    if (!task.present) {
+      continue;
+    }
+    printf("%u   %u    %u   %s   %u   %u    %u     %u    %u      %u\n",
+           task.tid, task.parent_tid, task.core_id, task_state_name(task.state),
+           (uint32_t)task.priority, (uint32_t)task.base_priority,
+           task.ticks_remaining, task.wait_time,
+           task.ipc_target_tid, task.awaiting_irq);
+  }
+}
+
+static void cmd_jobs(int argc, char **argv, char *line) {
+  (void)argc; (void)argv; (void)line;
+  print_jobs();
+}
+
+static void cmd_kill(int argc, char **argv, char *line) {
+  (void)line;
+  if (argc != 2) {
+    print_usage(find_command("kill"));
+    return;
+  }
+  int ok = 0;
+  uint32_t tid = _parse_u32(argv[1], &ok);
+  if (!ok) {
+    print_usage(find_command("kill"));
+  } else if (sys_kill(tid) < 0) {
+    printf("Error: could not kill TID %u\n", tid);
+  } else {
+    printf("Killed TID %u\n", tid);
+  }
+}
+
+static void cmd_wait(int argc, char **argv, char *line) {
+  (void)line;
+  if (argc != 2) {
+    print_usage(find_command("wait"));
+    return;
+  }
+  int ok = 0;
+  uint32_t tid = _parse_u32(argv[1], &ok);
+  if (!ok) {
+    print_usage(find_command("wait"));
+    return;
+  }
+  wait_info_t info = sys_wait(tid);
+  print_wait_result(info);
+  if (info.status == WAIT_STATUS_DONE) {
+    remove_job(tid);
+  }
+}
+
+static void cmd_poll(int argc, char **argv, char *line) {
+  (void)line;
+  if (argc != 2) {
+    print_usage(find_command("poll"));
+    return;
+  }
+  int ok = 0;
+  uint32_t tid = _parse_u32(argv[1], &ok);
+  if (!ok) {
+    print_usage(find_command("poll"));
+  } else {
+    print_poll_result(sys_poll(tid));
+  }
+}
+
+static void cmd_mem(int argc, char **argv, char *line) {
+  (void)argc; (void)argv; (void)line;
+  memory_info_t mem = sys_mem();
+  print_kib_line("Total RAM", mem.total_memory);
+  print_kib_line("Free RAM", mem.free_memory);
+  print_kib_line("Kernel heap size", mem.heap_size);
+  print_kib_line("Kernel heap used", mem.heap_used);
+  print_kib_line("Kernel heap mapped", mem.heap_mapped);
+}
+
+static void cmd_vmmap(int argc, char **argv, char *line) {
+  (void)argc; (void)argv; (void)line;
+  print_vmmap();
+}
+
+static void cmd_capstat(int argc, char **argv, char *line) {
+  (void)argc; (void)argv; (void)line;
+  print_capstat();
+}
+
+static void cmd_debug(int argc, char **argv, char *line) {
+  (void)argc; (void)argv; (void)line;
+  print_debug_info();
+}
+
+static void cmd_pong(int argc, char **argv, char *line) {
+  (void)argc; (void)argv; (void)line;
+  printf("Spawning pong...\n");
+  uint32_t pong_tid = spawn_program(PONG_FILE, PONG_PRIORITY);
+  if ((int)pong_tid < 0) {
+    printf("Error: Could not spawn pong (task limit reached?)\n");
+  } else {
+    printf("Pong is TID %d. Exchanging 5 messages...\n", (int)pong_tid);
+    if (run_pong_exchange(pong_tid) < 0) {
+      printf("Error: pong IPC failed\n");
+    } else {
+      print_wait_result(sys_wait(pong_tid));
+    }
+  }
+}
+
+static void cmd_fault(int argc, char **argv, char *line) {
+  (void)argc; (void)argv; (void)line;
+  printf("Spawning fault test...\n");
+  uint32_t fault_tid = spawn_program(FAULT_FILE, PONG_PRIORITY);
+  if ((int)fault_tid < 0) {
+    printf("Error: Could not spawn fault test (task limit reached?)\n");
+  } else {
+    printf("Fault test is TID %d. It should be killed by the kernel.\n",
+           (int)fault_tid);
+    print_wait_result(sys_wait(fault_tid));
+  }
+}
+
+static void cmd_badptr(int argc, char **argv, char *line) {
+  (void)argc; (void)argv; (void)line;
+  uint32_t badptr_tid = spawn_program(BADPTR_FILE, PONG_PRIORITY);
+  if ((int)badptr_tid < 0) {
+    printf("Error: Could not spawn badptr test\n");
+  } else {
+    printf("Bad pointer test is TID %d.\n", (int)badptr_tid);
+    print_wait_result(sys_wait(badptr_tid));
+  }
+}
+
+static void cmd_smoke(int argc, char **argv, char *line) {
+  (void)argc; (void)argv; (void)line;
+  run_smoke_demo();
+}
+
+static void cmd_vfstest(int argc, char **argv, char *line) {
+  (void)argc; (void)argv; (void)line;
+  run_vfstest_demo();
+}
+
+static void cmd_vfsinject(int argc, char **argv, char *line) {
+  (void)argc; (void)argv; (void)line;
+  run_vfsinject_demo();
+}
+
+static void cmd_vfsls(int argc, char **argv, char *line) {
+  (void)line;
+  if (argc > 2) {
+    print_usage(find_command("vfsls"));
+    return;
+  }
+  list_files_vfs(argc == 2 ? argv[1] : "");
+}
+
+static void cmd_vfsopen(int argc, char **argv, char *line) {
+  (void)line;
+  if (argc != 2) {
+    print_usage(find_command("vfsopen"));
+    return;
+  }
+  run_vfsopen_command(argv[1]);
+}
+
+static void cmd_vfsread(int argc, char **argv, char *line) {
+  (void)argc; (void)argv; (void)line;
+  run_vfsread_demo();
+}
+
+static void cmd_vfswrite(int argc, char **argv, char *line) {
+  (void)argc; (void)argv; (void)line;
+  run_vfswrite_demo();
+}
+
+static void cmd_vfsinstall(int argc, char **argv, char *line) {
+  (void)argc; (void)argv; (void)line;
+  run_vfsinstall_demo();
+}
+
+static void cmd_vfsexec(int argc, char **argv, char *line) {
+  (void)argc; (void)argv; (void)line;
+  run_vfsexec_demo();
+}
+
+static void cmd_ipcfast(int argc, char **argv, char *line) {
+  (void)argc; (void)argv; (void)line;
+  run_ipcfast_demo();
+}
+
+static void cmd_ipccap(int argc, char **argv, char *line) {
+  (void)argc; (void)argv; (void)line;
+  run_ipccap_demo();
+}
+
+static void cmd_ipckill(int argc, char **argv, char *line) {
+  (void)argc; (void)argv; (void)line;
+  run_ipckill_demo();
+}
+
+static void cmd_memshare(int argc, char **argv, char *line) {
+  (void)argc; (void)argv; (void)line;
+  run_memshare_demo();
+}
+
+static void cmd_memxfer(int argc, char **argv, char *line) {
+  (void)argc; (void)argv; (void)line;
+  run_memxfer_demo();
+}
+
+static void cmd_memcaplife(int argc, char **argv, char *line) {
+  (void)argc; (void)argv; (void)line;
+  run_memcaplife_demo();
+}
+
+static void cmd_memrevoke(int argc, char **argv, char *line) {
+  (void)argc; (void)argv; (void)line;
+  run_memrevoke_demo();
+}
+
+static void cmd_munmap(int argc, char **argv, char *line) {
+  (void)argc; (void)argv; (void)line;
+  run_munmap_demo();
+}
+
+static void cmd_forkcow(int argc, char **argv, char *line) {
+  (void)argc; (void)argv; (void)line;
+  run_forkcow_demo();
+}
+
+static void cmd_filelazy(int argc, char **argv, char *line) {
+  (void)argc; (void)argv; (void)line;
+  run_filelazy_demo();
+}
+
+static void cmd_vmstress(int argc, char **argv, char *line) {
+  (void)argc; (void)argv; (void)line;
+  run_vmstress_demo();
+}
+
+static void cmd_lazyexec(int argc, char **argv, char *line) {
+  (void)argc; (void)argv; (void)line;
+  run_lazyexec_demo();
+}
+
+static void cmd_taskstress(int argc, char **argv, char *line) {
+  (void)argc; (void)argv; (void)line;
+  run_taskstress_demo();
+}
+
+static void cmd_speed(int argc, char **argv, char *line) {
+  (void)argc; (void)argv; (void)line;
+  uint32_t speed_tid = spawn_program(SPEED_FILE, PONG_PRIORITY);
+  if ((int)speed_tid < 0) {
+    printf("Error: Could not spawn speed benchmark\n");
+  } else {
+    print_wait_result(sys_wait(speed_tid));
+  }
+}
+
+static void print_demo_suites(void) {
+  printf("Demo suites:\n");
+  printf("  demo quick    Core smoke path\n");
+  printf("  demo vfs      VFS call, injection, read, write, install, exec\n");
+  printf("  demo ipc      Register IPC and cap transfer\n");
+  printf("  demo mem      Share, transfer, cap lifetime, revoke, unmap, COW\n");
+  printf("  demo proc     Fault isolation, stack growth, task table growth\n");
+  printf("  demo all      Run every suite above\n");
+}
+
+static void run_demo_quick(void) {
+  run_smoke_demo();
+}
+
+static void run_demo_vfs(void) {
+  printf("demo vfs: starting\n");
+  list_files_vfs("");
+  run_vfstest_demo();
+  run_vfsinject_demo();
+  run_vfsread_demo();
+  run_vfswrite_demo();
+  run_vfsinstall_demo();
+  run_vfsexec_demo();
+  printf("demo vfs: done\n");
+}
+
+static void run_demo_ipc(void) {
+  printf("demo ipc: starting\n");
+  run_ipcfast_demo();
+  run_ipccap_demo();
+  printf("demo ipc: done\n");
+}
+
+static void run_demo_mem(void) {
+  printf("demo mem: starting\n");
+  run_memshare_demo();
+  run_memxfer_demo();
+  run_memcaplife_demo();
+  run_memrevoke_demo();
+  run_munmap_demo();
+  run_forkcow_demo();
+  printf("demo mem: done\n");
+}
+
+static void run_demo_proc(void) {
+  printf("demo proc: starting\n");
+  (void)run_and_expect_exit(BADPTR_FILE);
+  (void)run_and_expect_exit(STACKGROW_FILE);
+  run_taskstress_demo();
+  printf("demo proc: done\n");
+}
+
+static void cmd_demo(int argc, char **argv, char *line) {
+  (void)line;
+  if (argc == 1) {
+    print_demo_suites();
+    return;
+  }
+  if (argc != 2) {
+    print_usage(find_command("demo"));
+    return;
+  }
+
+  if (_streq(argv[1], "quick")) {
+    run_demo_quick();
+  } else if (_streq(argv[1], "vfs")) {
+    run_demo_vfs();
+  } else if (_streq(argv[1], "ipc")) {
+    run_demo_ipc();
+  } else if (_streq(argv[1], "mem")) {
+    run_demo_mem();
+  } else if (_streq(argv[1], "proc")) {
+    run_demo_proc();
+  } else if (_streq(argv[1], "all")) {
+    run_demo_quick();
+    run_demo_vfs();
+    run_demo_ipc();
+    run_demo_mem();
+    run_demo_proc();
+  } else {
+    print_demo_suites();
+  }
+}
+
+static void dispatch_command(char *line) {
+  char original[MAX_CMD];
+  char *argv[8];
+  shell_copy(original, line, sizeof(original));
+  int argc = parse_args(line, argv, 8);
+  if (argc == 0) {
+    return;
+  }
+
+  const shell_command_t *cmd = find_command(argv[0]);
+  if (!cmd) {
+    printf("Unknown command: '%s'\n", argv[0]);
+    printf("Type 'help' for grouped commands, or 'help <command>'.\n");
+    return;
+  }
+
+  if (!command_accepts_args(cmd) && argc != 1) {
+    print_usage(cmd);
+    return;
+  }
+
+  cmd->handler(argc, argv, original);
+}
+
+static char history[SHELL_HISTORY][MAX_CMD];
+static int history_start;
+static int history_len;
+
+static const char *history_get(int index) {
+  return history[(history_start + index) % SHELL_HISTORY];
+}
+
+static void history_add(const char *cmd) {
+  if (cmd[0] == '\0') {
+    return;
+  }
+  if (history_len > 0 && _streq(history_get(history_len - 1), cmd)) {
+    return;
+  }
+
+  int slot;
+  if (history_len < SHELL_HISTORY) {
+    slot = (history_start + history_len) % SHELL_HISTORY;
+    history_len++;
+  } else {
+    slot = history_start;
+    history_start = (history_start + 1) % SHELL_HISTORY;
+  }
+  shell_copy(history[slot], cmd, MAX_CMD);
+}
+
+static void redraw_input(const char *cmd) {
+  printf("\r\x1b[2K%s%s", SHELL_PROMPT, cmd);
+}
+
+static void print_prompt(void) { printf("\n%s", SHELL_PROMPT); }
 
 void _start(void) {
   char cmd[MAX_CMD];
   int len = 0;
+  int history_cursor = -1;
 
   while (ns_register("shell") < 0) {
     sys_sleep(10);
@@ -1330,353 +2210,78 @@ void _start(void) {
   printf(" |  \\| |/ _ \\ '_ \\| __| | | | '_ \\ / _ \\ | | \\___ \\ \n");
   printf(" | |\\  |  __/ |_) | |_| |_| | | | |  __/ |_| |___) |\n");
   printf(" |_| \\_|\\___| .__/ \\__|\\__,_|_| |_|\\___|\\___/|____/ \n");
-  printf("            |_|    AArch64 Microkernel Shell v0.1\n\n");
+  printf("            |_|    AArch64 Microkernel Shell v0.2\n\n");
   printf("Type 'help' for available commands.\n");
 
+  cmd[0] = '\0';
   print_prompt();
 
   while (1) {
-    (void)get_keyboard_cap();
-    ipc_msg_t key = sys_ipc_recv(CAP_SELF);
-    char c = (char)key.payload[0];
-    sys_ipc_reply(key.reply_cap, 0, 0, 0, 0);
+    char c = read_console_char();
 
     if (c == '\r' || c == '\n') {
       printf("\n");
       cmd[len] = '\0';
-
-      if (len == 0) {
-
-      } else if (_streq(cmd, "help")) {
-        printf("Available commands:\n");
-        printf("  help          Show this help message\n");
-        printf("  pong          Spawn pong (5-message IPC demo, then exits)\n");
-        printf("  fault         Spawn a task that page-faults and gets killed\n");
-        printf("  spawn pong    Run pong, leave status for wait <tid>\n");
-        printf("  spawn fault   Spawn fault test, leave status for wait <tid>\n");
-        printf("  spawn spin    Spawn a child that runs until killed\n");
-        printf("  badptr        Verify bad syscall pointers are rejected\n");
-        printf("  run <file>    Spawn through a kernel-owned VFS exec object\n");
-        printf("  cat <file>    Print a file through VFS\n");
-        printf("  cp <src> <dst> Copy a file through VFS\n");
-        printf("  install <src> <dst> Copy an executable into the FS\n");
-        printf("  rm <file>     Remove a file through VFS\n");
-        printf("  clear         Clear the screen\n");
-        printf("  echo <text>   Print text back to the terminal\n");
-        printf("  ls            List files through the VFS fast lane\n");
-        printf("  uptime        Show seconds elapsed since boot\n");
-        printf("  mem           Show memory usage\n");
-        printf("  vmmap         Show this task's VMAs\n");
-        printf("  capstat       Show this task's capability slots\n");
-        printf("  debug         Show kernel build/runtime debug info\n");
-        printf("  smoke         Run core regression smoke checks\n");
-        printf("  vfstest       Test the EL1 VFS fast lane\n");
-        printf("  vfsinject     Test VFS shared page injection\n");
-        printf("  vfsls         List files through the VFS fast lane\n");
-        printf("  vfsopen <file> Show VFS metadata for one file\n");
-        printf("  vfsread       Read one file page through VFS injection\n");
-        printf("  vfswrite      Create and verify notes.txt through writable FatFs\n");
-        printf("  vfsinstall    Copy and run an ELF from the writable FS\n");
-        printf("  vfsexec       Resolve an executable through VFS, then spawn it\n");
-        printf("  ipcfast       Test 0/8/64/128-byte register IPC\n");
-        printf("  ipccap        Transfer an endpoint cap through IPC\n");
-        printf("  ipckill       Test IPC cleanup across task kills\n");
-        printf("  speed         Run userspace OS speed benchmarks\n");
-        printf("  memshare      Share one page with a child task\n");
-        printf("  memxfer       Transfer one page to a child task\n");
-        printf("  memcaplife    Share a cap after unmapping old VA\n");
-        printf("  memrevoke     Lend then revoke a child mapping\n");
-        printf("  munmap        Unmap one lazy mmap page\n");
-        printf("  forkcow       Fork shell and verify copy-on-write\n");
-        printf("  filelazy      Read one file page through the VFS page path\n");
-        printf("  vmstress      Grow and shrink the VMA table\n");
-        printf("  lazyexec      Spawn badptr.elf through the VFS executable path\n");
-        printf("  taskstress    Grow the kernel task table with spin tasks\n");
-        printf("  ps            Show task scheduler state\n");
-        printf("  jobs          Show shell child jobs\n");
-        printf("  kill <tid>    Kill a user task\n");
-        printf("  wait <tid>    Wait for a child task status\n");
-        printf("  poll <tid>    Check child status without reaping\n");
-
-      } else if (_streq(cmd, "pong")) {
-        printf("Spawning pong...\n");
-        uint32_t pong_tid = spawn_program(PONG_FILE, PONG_PRIORITY);
-        if ((int)pong_tid < 0) {
-          printf("Error: Could not spawn pong (task limit reached?)\n");
-        } else {
-          printf("Pong is TID %d. Exchanging 5 messages...\n", (int)pong_tid);
-          if (run_pong_exchange(pong_tid) < 0) {
-            printf("Error: pong IPC failed\n");
-          } else {
-            print_wait_result(sys_wait(pong_tid));
-          }
-        }
-
-      } else if (_streq(cmd, "fault")) {
-        printf("Spawning fault test...\n");
-        uint32_t fault_tid = spawn_program(FAULT_FILE, PONG_PRIORITY);
-        if ((int)fault_tid < 0) {
-          printf("Error: Could not spawn fault test (task limit reached?)\n");
-        } else {
-          printf("Fault test is TID %d. It should be killed by the kernel.\n",
-                 (int)fault_tid);
-          print_wait_result(sys_wait(fault_tid));
-        }
-
-      } else if (_streq(cmd, "spawn pong")) {
-        printf("Spawning pong...\n");
-        uint32_t pong_tid = spawn_program(PONG_FILE, PONG_PRIORITY);
-        if ((int)pong_tid < 0) {
-          printf("Error: Could not spawn pong (task limit reached?)\n");
-        } else {
-          printf("Pong is TID %d. Exchanging 5 messages...\n", (int)pong_tid);
-          if (run_pong_exchange(pong_tid) < 0) {
-            printf("Error: pong IPC failed\n");
-          } else {
-            add_job(pong_tid, "pong");
-            printf("Pong finished. Run 'wait %u' to reap it.\n", pong_tid);
-          }
-        }
-
-      } else if (_streq(cmd, "spawn fault")) {
-        printf("Spawning fault test...\n");
-        uint32_t fault_tid = spawn_program(FAULT_FILE, PONG_PRIORITY);
-        if ((int)fault_tid < 0) {
-          printf("Error: Could not spawn fault test (task limit reached?)\n");
-        } else {
-          add_job(fault_tid, "fault");
-          printf("Fault test is TID %d. Run 'wait %u' to reap it.\n",
-                 (int)fault_tid, fault_tid);
-        }
-
-      } else if (_streq(cmd, "spawn spin")) {
-        uint32_t spin_tid = spawn_program(SPIN_FILE, PONG_PRIORITY);
-        if ((int)spin_tid < 0) {
-          printf("Error: Could not spawn spin task (task limit reached?)\n");
-        } else {
-          add_job(spin_tid, "spin");
-          printf("Spin task is TID %d. Run 'ps', 'kill %u', then 'wait %u'.\n",
-                 (int)spin_tid, spin_tid, spin_tid);
-        }
-
-      } else if (_streq(cmd, "badptr")) {
-        uint32_t badptr_tid = spawn_program(BADPTR_FILE, PONG_PRIORITY);
-        if ((int)badptr_tid < 0) {
-          printf("Error: Could not spawn badptr test\n");
-        } else {
-          printf("Bad pointer test is TID %d.\n", (int)badptr_tid);
-          print_wait_result(sys_wait(badptr_tid));
-        }
-
-      } else if (_starts_with(cmd, "run ")) {
-        const char *name = cmd + 4;
-        uint32_t tid = spawn_program(name, PONG_PRIORITY);
-        if ((int)tid < 0) {
-          printf("Error: could not run '%s'\n", name);
-        } else {
-          add_job(tid, name);
-          printf("Started %s as TID %u\n", name, tid);
-        }
-
-      } else if (_starts_with(cmd, "cat ")) {
-        run_cat_command(cmd + 4);
-
-      } else if (_starts_with(cmd, "rm ")) {
-        run_rm_command(cmd + 3);
-
-      } else if (_starts_with(cmd, "cp ")) {
-        char *src = 0;
-        char *dst = 0;
-        if (split_two_args(cmd + 3, &src, &dst) < 0) {
-          printf("usage: cp <src> <dst>\n");
-        } else {
-          run_copy_command(src, dst, "cp");
-        }
-
-      } else if (_starts_with(cmd, "install ")) {
-        char *src = 0;
-        char *dst = 0;
-        if (split_two_args(cmd + 8, &src, &dst) < 0) {
-          printf("usage: install <src> <dst>\n");
-        } else {
-          run_copy_command(src, dst, "install");
-        }
-
-      } else if (_streq(cmd, "clear")) {
-        printf("\x1b[2J\x1b[H");
-
-      } else if (_streq(cmd, "ls")) {
-        list_files_vfs();
-
-
-      } else if (_starts_with(cmd, "echo ")) {
-        printf("%s\n", cmd + 5);
-
-      } else if (_streq(cmd, "uptime")) {
-        uint64_t secs = sys_uptime();
-        uint64_t h = secs / 3600;
-        uint64_t m = (secs % 3600) / 60;
-        uint64_t s = secs % 60;
-        printf("Uptime: %luh %lum %lus\n", h, m, s);
-
-      } else if (_streq(cmd, "mem")) {
-        memory_info_t mem = sys_mem();
-        print_kib_line("Total RAM", mem.total_memory);
-        print_kib_line("Free RAM", mem.free_memory);
-        print_kib_line("Kernel heap size", mem.heap_size);
-        print_kib_line("Kernel heap used", mem.heap_used);
-        print_kib_line("Kernel heap mapped", mem.heap_mapped);
-
-      } else if (_streq(cmd, "vmmap")) {
-        print_vmmap();
-
-      } else if (_streq(cmd, "capstat")) {
-        print_capstat();
-
-      } else if (_streq(cmd, "debug")) {
-        print_debug_info();
-
-      } else if (_streq(cmd, "smoke")) {
-        run_smoke_demo();
-
-
-      } else if (_streq(cmd, "vfstest")) {
-        run_vfstest_demo();
-
-      } else if (_streq(cmd, "vfsinject")) {
-        run_vfsinject_demo();
-
-      } else if (_streq(cmd, "vfsls")) {
-        list_files_vfs();
-
-      } else if (_starts_with(cmd, "vfsopen ")) {
-        run_vfsopen_command(cmd + 8);
-
-      } else if (_streq(cmd, "vfsread")) {
-        run_vfsread_demo();
-
-      } else if (_streq(cmd, "vfswrite")) {
-        run_vfswrite_demo();
-
-      } else if (_streq(cmd, "vfsinstall")) {
-        run_vfsinstall_demo();
-
-      } else if (_streq(cmd, "vfsexec")) {
-        run_vfsexec_demo();
-
-      } else if (_streq(cmd, "ipcfast")) {
-        run_ipcfast_demo();
-
-      } else if (_streq(cmd, "ipccap")) {
-        run_ipccap_demo();
-
-      } else if (_streq(cmd, "ipckill")) {
-        run_ipckill_demo();
-
-      } else if (_streq(cmd, "speed")) {
-        uint32_t speed_tid = spawn_program(SPEED_FILE, PONG_PRIORITY);
-        if ((int)speed_tid < 0) {
-          printf("Error: Could not spawn speed benchmark\n");
-        } else {
-          print_wait_result(sys_wait(speed_tid));
-        }
-
-      } else if (_streq(cmd, "memshare")) {
-        run_memshare_demo();
-
-      } else if (_streq(cmd, "memxfer")) {
-        run_memxfer_demo();
-
-      } else if (_streq(cmd, "memcaplife")) {
-        run_memcaplife_demo();
-
-      } else if (_streq(cmd, "memrevoke")) {
-        run_memrevoke_demo();
-
-      } else if (_streq(cmd, "munmap")) {
-        run_munmap_demo();
-
-      } else if (_streq(cmd, "forkcow")) {
-        run_forkcow_demo();
-
-      } else if (_streq(cmd, "filelazy")) {
-        run_filelazy_demo();
-
-      } else if (_streq(cmd, "vmstress")) {
-        run_vmstress_demo();
-
-      } else if (_streq(cmd, "lazyexec")) {
-        run_lazyexec_demo();
-
-      } else if (_streq(cmd, "taskstress")) {
-        run_taskstress_demo();
-
-      } else if (_streq(cmd, "ps")) {
-        printf("TID PPID STATE   PRI BASE TICKS WAIT TARGET IRQ\n");
-        uint32_t capacity = sys_task_capacity();
-        for (uint32_t i = 0; i < capacity; i++) {
-          task_info_t task = sys_ps(i);
-          if (!task.present) {
-            continue;
-          }
-          printf("%u   %u    %s   %u   %u    %u     %u    %u      %u\n",
-                 task.tid, task.parent_tid, task_state_name(task.state),
-                 (uint32_t)task.priority, (uint32_t)task.base_priority,
-                 task.ticks_remaining, task.wait_time,
-                 task.ipc_target_tid, task.awaiting_irq);
-        }
-
-      } else if (_streq(cmd, "jobs")) {
-        print_jobs();
-
-      } else if (_starts_with(cmd, "kill ")) {
-        int ok = 0;
-        uint32_t tid = _parse_u32(cmd + 5, &ok);
-        if (!ok) {
-          printf("Usage: kill <tid>\n");
-        } else if (sys_kill(tid) < 0) {
-          printf("Error: could not kill TID %u\n", tid);
-        } else {
-          printf("Killed TID %u\n", tid);
-        }
-
-      } else if (_starts_with(cmd, "wait ")) {
-        int ok = 0;
-        uint32_t tid = _parse_u32(cmd + 5, &ok);
-        if (!ok) {
-          printf("Usage: wait <tid>\n");
-        } else {
-          wait_info_t info = sys_wait(tid);
-          print_wait_result(info);
-          if (info.status == WAIT_STATUS_DONE) {
-            remove_job(tid);
-          }
-        }
-
-      } else if (_starts_with(cmd, "poll ")) {
-        int ok = 0;
-        uint32_t tid = _parse_u32(cmd + 5, &ok);
-        if (!ok) {
-          printf("Usage: poll <tid>\n");
-        } else {
-          print_poll_result(sys_poll(tid));
-        }
-
-      } else {
-        printf("Unknown command: '%s'\n", cmd);
-        printf("Type 'help' for a list of commands.\n");
-      }
-
+      history_add(cmd);
+      dispatch_command(cmd);
       len = 0;
+      cmd[0] = '\0';
+      history_cursor = -1;
       print_prompt();
-
+    } else if (c == 3) {
+      printf("^C");
+      len = 0;
+      cmd[0] = '\0';
+      history_cursor = -1;
+      print_prompt();
+    } else if (c == 12) {
+      printf("\x1b[2J\x1b[H");
+      redraw_input(cmd);
+    } else if (c == 21) {
+      len = 0;
+      cmd[0] = '\0';
+      history_cursor = -1;
+      redraw_input(cmd);
+    } else if (c == 27) {
+      char c1 = read_console_char();
+      if (c1 == '[') {
+        char c2 = read_console_char();
+        if (c2 == 'A' && history_len > 0) {
+          if (history_cursor < 0) {
+            history_cursor = history_len - 1;
+          } else if (history_cursor > 0) {
+            history_cursor--;
+          }
+          shell_copy(cmd, history_get(history_cursor), MAX_CMD);
+          len = 0;
+          while (cmd[len]) len++;
+          redraw_input(cmd);
+        } else if (c2 == 'B' && history_len > 0) {
+          if (history_cursor >= 0 && history_cursor < history_len - 1) {
+            history_cursor++;
+            shell_copy(cmd, history_get(history_cursor), MAX_CMD);
+          } else {
+            history_cursor = -1;
+            cmd[0] = '\0';
+          }
+          len = 0;
+          while (cmd[len]) len++;
+          redraw_input(cmd);
+        } else if (c2 == '3') {
+          (void)read_console_char();
+        }
+      }
     } else if (c == 127 || c == '\b') {
       if (len > 0) {
         len--;
+        cmd[len] = '\0';
+        history_cursor = -1;
         printf("\b \b");
       }
     } else if (c >= 32 && c < 127 && len < MAX_CMD - 1) {
       cmd[len++] = c;
+      cmd[len] = '\0';
+      history_cursor = -1;
       printf("%c", c);
     }
   }

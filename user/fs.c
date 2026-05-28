@@ -6,7 +6,9 @@
 #include "ff.h"
 
 #define FS_NAME_MAX 56
-#define FS_MAX_FILES 128
+#define FS_MAX_FILES 256
+#define FS_MAX_DIRS 64
+#define FS_MAX_LISTED (FS_MAX_FILES + FS_MAX_DIRS)
 #define FS_MAX_HANDLES 128
 #define PAGE_BYTES 4096ULL
 #define FS_EXEC_MAX_SIZE (1024ULL * 1024ULL)
@@ -21,9 +23,12 @@ typedef struct {
     uint64_t offset;
 } fs_handle_t;
 
-static fs_entry_t *entries;
-static fs_handle_t *handles;
+static fs_entry_t entries[FS_MAX_FILES];
+static fs_handle_t handles[FS_MAX_HANDLES];
+static char dirs[FS_MAX_DIRS][FS_NAME_MAX];
+static char list_seen[FS_MAX_LISTED][FS_NAME_MAX];
 static uint32_t entry_count;
+static uint32_t dir_count;
 static int table_loaded;
 static FATFS fat_fs;
 static int fat_mounted;
@@ -46,15 +51,56 @@ static char lower_ascii(char c) {
     return c;
 }
 
-static void copy_lower_string(char *dst, const char *src, uint32_t cap) {
+static void normalize_path(char *dst, const char *src, uint32_t cap) {
+    uint32_t out = 0;
     uint32_t i = 0;
     if (cap == 0) {
         return;
     }
-    for (; i + 1 < cap && src[i]; i++) {
-        dst[i] = lower_ascii(src[i]);
+    if (!src) {
+        dst[0] = '\0';
+        return;
     }
-    dst[i] = '\0';
+    while (src[i] == '/') {
+        i++;
+    }
+    for (; out + 1 < cap && src[i]; i++) {
+        char c = src[i] == '\\' ? '/' : lower_ascii(src[i]);
+        if (c == '/' && (out == 0 || dst[out - 1] == '/')) {
+            continue;
+        }
+        dst[out++] = c;
+    }
+    while (out > 0 && dst[out - 1] == '/') {
+        out--;
+    }
+    dst[out] = '\0';
+}
+
+static int join_path(char *dst, uint32_t cap, const char *dir, const char *name) {
+    uint32_t out = 0;
+    if (!dst || !dir || !name || name[0] == '\0' || cap == 0) {
+        return -1;
+    }
+    dst[0] = '\0';
+    if (dir[0] && dir[0] != '/') {
+        if (out + 1 >= cap) return -1;
+        dst[out++] = '/';
+    }
+    for (uint32_t i = 0; dir[i]; i++) {
+        if (out + 1 >= cap) return -1;
+        dst[out++] = dir[i];
+    }
+    if (out == 0 || dst[out - 1] != '/') {
+        if (out + 1 >= cap) return -1;
+        dst[out++] = '/';
+    }
+    for (uint32_t i = 0; name[i]; i++) {
+        if (out + 1 >= cap) return -1;
+        dst[out++] = name[i];
+    }
+    dst[out] = '\0';
+    return 0;
 }
 
 
@@ -122,19 +168,77 @@ static int read_fat_file_page(const char *name, uint64_t offset,
     return 0;
 }
 
+static int add_fat_file_to_table(const char *path, uint64_t size) {
+    if (!path || entry_count >= FS_MAX_FILES) {
+        return -1;
+    }
+    fs_entry_t *entry = &entries[entry_count];
+    normalize_path(entry->name, path, sizeof(entry->name));
+    entry->size = size;
+    if (entry->name[0] == '\0') {
+        return -1;
+    }
+    entry_count++;
+    return 0;
+}
+
+static int add_dir_to_table(const char *path) {
+    char norm[FS_NAME_MAX];
+    normalize_path(norm, path, sizeof(norm));
+    if (norm[0] == '\0') {
+        return 0;
+    }
+    for (uint32_t i = 0; i < dir_count; i++) {
+        if (streq(dirs[i], norm)) {
+            return 0;
+        }
+    }
+    if (dir_count >= FS_MAX_DIRS) {
+        return -1;
+    }
+    copy_string(dirs[dir_count], norm, FS_NAME_MAX);
+    dir_count++;
+    return 0;
+}
+
+static int scan_fat_dir(const char *path) {
+    DIR dir;
+    if (f_opendir(&dir, path) != FR_OK) {
+        return -1;
+    }
+
+    while (entry_count < FS_MAX_FILES) {
+        FILINFO info;
+        if (f_readdir(&dir, &info) != FR_OK) {
+            f_closedir(&dir);
+            return -1;
+        }
+        if (info.fname[0] == '\0') {
+            break;
+        }
+        if (info.fname[0] == '.') {
+            continue;
+        }
+
+        char child[FS_NAME_MAX];
+        if (join_path(child, sizeof(child), path, info.fname) < 0) {
+            continue;
+        }
+        if (info.fattrib & AM_DIR) {
+            (void)add_dir_to_table(child);
+            (void)scan_fat_dir(child);
+        } else {
+            (void)add_fat_file_to_table(child, (uint64_t)info.fsize);
+        }
+    }
+
+    f_closedir(&dir);
+    return 0;
+}
+
 static int build_fs_table(void) {
     if (table_loaded) {
         return 0;
-    }
-
-    if (!entries) {
-        entries = (fs_entry_t *)malloc(sizeof(fs_entry_t) * FS_MAX_FILES);
-    }
-    if (!handles) {
-        handles = (fs_handle_t *)malloc(sizeof(fs_handle_t) * FS_MAX_HANDLES);
-    }
-    if (!entries || !handles) {
-        return -1;
     }
 
     for (uint32_t i = 0; i < FS_MAX_HANDLES; i++) {
@@ -144,34 +248,14 @@ static int build_fs_table(void) {
     }
 
     entry_count = 0;
+    dir_count = 0;
     if (mount_fat_volume() < 0) {
         return -1;
     }
 
-    DIR dir;
-    if (f_opendir(&dir, "/") != FR_OK) {
+    if (scan_fat_dir("/") < 0) {
         return -1;
     }
-
-    while (entry_count < FS_MAX_FILES) {
-        FILINFO info;
-        if (f_readdir(&dir, &info) != FR_OK) {
-            return -1;
-        }
-        if (info.fname[0] == '\0') {
-            break;
-        }
-        if (info.fattrib & AM_DIR) {
-            continue;
-        }
-
-        fs_entry_t *entry = &entries[entry_count];
-        copy_lower_string(entry->name, info.fname, sizeof(entry->name));
-        entry->size = (uint64_t)info.fsize;
-        entry_count++;
-    }
-
-    f_closedir(&dir);
     table_loaded = 1;
     return 0;
 }
@@ -185,7 +269,7 @@ static void update_table_entry(const char *name, uint64_t size) {
     }
 
     char lowered[FS_NAME_MAX];
-    copy_lower_string(lowered, name, sizeof(lowered));
+    normalize_path(lowered, name, sizeof(lowered));
     for (uint32_t i = 0; i < entry_count; i++) {
         if (streq(entries[i].name, lowered)) {
             entries[i].size = size;
@@ -206,7 +290,7 @@ static void remove_table_entry(const char *name) {
     }
 
     char lowered[FS_NAME_MAX];
-    copy_lower_string(lowered, name, sizeof(lowered));
+    normalize_path(lowered, name, sizeof(lowered));
     for (uint32_t i = 0; i < entry_count; i++) {
         if (!streq(entries[i].name, lowered)) {
             continue;
@@ -236,14 +320,64 @@ static void remove_table_entry(const char *name) {
     }
 }
 
+static int immediate_child_name(const char *path, const char *dir,
+                                char *child, uint32_t cap) {
+    const char *name = path;
+    if (!path || !child || cap == 0) {
+        return 0;
+    }
+    if (dir && dir[0]) {
+        uint32_t d = 0;
+        while (dir[d]) {
+            if (path[d] != dir[d]) {
+                return 0;
+            }
+            d++;
+        }
+        if (path[d] != '/') {
+            return 0;
+        }
+        name = path + d + 1;
+    }
+    if (name[0] == '\0') {
+        return 0;
+    }
+
+    uint32_t out = 0;
+    while (out + 1 < cap && name[out] && name[out] != '/') {
+        child[out] = name[out];
+        out++;
+    }
+    child[out] = '\0';
+    if (out == 0) {
+        return 0;
+    }
+    return name[out] == '/' ? 1 : 2;
+}
+
+static int list_name_seen(uint32_t count, const char *name) {
+    for (uint32_t i = 0; i < count; i++) {
+        if (streq(list_seen[i], name)) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+static void list_name_add(uint32_t *count, const char *name) {
+    if (*count >= FS_MAX_LISTED) {
+        return;
+    }
+    copy_string(list_seen[*count], name, FS_NAME_MAX);
+    (*count)++;
+}
 
 static void handle_vfs_list(vfs_request_t request) {
-    if (build_fs_table() < 0 || request.arg1 >= entry_count || request.arg2 == 0) {
+    if (build_fs_table() < 0 || request.arg2 == 0) {
         sys_vfs_reply(0, FS_RESP_END, 0, 0);
         return;
     }
 
-    fs_entry_t *entry = &entries[(uint32_t)request.arg1];
     char *remote = (char *)sys_vfs_inject(request.client_tid,
                                           (void *)request.arg2, 1);
     if (!remote) {
@@ -251,9 +385,47 @@ static void handle_vfs_list(vfs_request_t request) {
         return;
     }
 
-    copy_string(remote, entry->name, FS_NAME_MAX);
+    char dir[FS_NAME_MAX];
+    normalize_path(dir, remote, sizeof(dir));
+    uint32_t seen = 0;
+    uint32_t listed = 0;
+
+    for (uint32_t i = 0; i < dir_count; i++) {
+        char child[FS_NAME_MAX];
+        if (immediate_child_name(dirs[i], dir, child, sizeof(child)) == 0 ||
+            list_name_seen(listed, child)) {
+            continue;
+        }
+        if (seen == request.arg1) {
+            copy_string(remote, child, FS_NAME_MAX);
+            sys_munmap(remote, PAGE_BYTES);
+            sys_vfs_reply(0, 0, request.arg2, 0);
+            return;
+        }
+        list_name_add(&listed, child);
+        seen++;
+    }
+
+    for (uint32_t i = 0; i < entry_count; i++) {
+        fs_entry_t *entry = &entries[i];
+        char child[FS_NAME_MAX];
+        if (immediate_child_name(entry->name, dir, child, sizeof(child)) == 0 ||
+            list_name_seen(listed, child)) {
+            continue;
+        }
+
+        if (seen == request.arg1) {
+            copy_string(remote, child, FS_NAME_MAX);
+            sys_munmap(remote, PAGE_BYTES);
+            sys_vfs_reply(0, entry->size, request.arg2, i);
+            return;
+        }
+        list_name_add(&listed, child);
+        seen++;
+    }
+
     sys_munmap(remote, PAGE_BYTES);
-    sys_vfs_reply(0, entry->size, request.arg2, (uint64_t)remote);
+    sys_vfs_reply(0, FS_RESP_END, 0, 0);
 }
 
 static void handle_vfs_read(vfs_request_t request) {
@@ -286,7 +458,7 @@ static void handle_vfs_read(vfs_request_t request) {
 }
 
 static int alloc_handle(uint32_t entry_index) {
-    if (!handles || entry_index >= entry_count) {
+    if (entry_index >= entry_count) {
         return -1;
     }
 
@@ -303,7 +475,7 @@ static int alloc_handle(uint32_t entry_index) {
 }
 
 static fs_entry_t *entry_from_handle(uint32_t handle) {
-    if (!handles || handle == 0 || handle > FS_MAX_HANDLES) {
+    if (handle == 0 || handle > FS_MAX_HANDLES) {
         return 0;
     }
 
@@ -329,6 +501,39 @@ static void handle_vfs_open_index(vfs_request_t request) {
 
     fs_entry_t *entry = &entries[(uint32_t)request.arg1];
     sys_vfs_reply(0, (uint32_t)handle, entry->size, request.arg1);
+}
+
+static void handle_vfs_open_path(vfs_request_t request) {
+    if (build_fs_table() < 0 || request.arg1 == 0) {
+        sys_vfs_reply(-1, 0, 0, 0);
+        return;
+    }
+
+    char *remote = (char *)sys_vfs_inject(request.client_tid,
+                                          (void *)request.arg1, 1);
+    if (!remote) {
+        sys_vfs_reply(-1, 0, 0, 0);
+        return;
+    }
+
+    char path[FS_NAME_MAX];
+    normalize_path(path, remote, sizeof(path));
+    sys_munmap(remote, PAGE_BYTES);
+
+    for (uint32_t i = 0; i < entry_count; i++) {
+        if (!streq(entries[i].name, path)) {
+            continue;
+        }
+        int handle = alloc_handle(i);
+        if (handle < 0) {
+            sys_vfs_reply(-1, 0, 0, 0);
+            return;
+        }
+        sys_vfs_reply(0, (uint32_t)handle, entries[i].size, i);
+        return;
+    }
+
+    sys_vfs_reply(-1, 0, 0, 0);
 }
 
 static void handle_vfs_read_handle_page(vfs_request_t request) {
@@ -378,7 +583,7 @@ static void handle_vfs_read_handle_page(vfs_request_t request) {
 
 static void handle_vfs_close_handle(vfs_request_t request) {
     uint32_t handle = (uint32_t)request.arg1;
-    if (!handles || handle == 0 || handle > FS_MAX_HANDLES ||
+    if (handle == 0 || handle > FS_MAX_HANDLES ||
         !handles[handle - 1].used) {
         sys_vfs_reply(-1, 0, 0, 0);
         return;
@@ -407,8 +612,11 @@ static void handle_vfs_write_page(vfs_request_t request) {
     uint64_t written64 = 0;
     uint64_t file_size = 0;
 
+    char norm_name[FS_NAME_MAX];
+    normalize_path(norm_name, remote->name, sizeof(norm_name));
+
     if (mount_fat_volume() == 0 &&
-        remote->name[0] != '\0' &&
+        norm_name[0] != '\0' &&
         remote->size <= FS_WRITE_DATA_MAX) {
         BYTE mode = FA_WRITE | FA_OPEN_ALWAYS;
         if (remote->flags & VFS_WRITE_FLAG_TRUNCATE) {
@@ -416,7 +624,7 @@ static void handle_vfs_write_page(vfs_request_t request) {
         }
 
         FIL file;
-        if (f_open(&file, remote->name, mode) == FR_OK) {
+        if (f_open(&file, norm_name, mode) == FR_OK) {
             if (f_lseek(&file, remote->offset) == FR_OK) {
                 UINT wrote = 0;
                 if (f_write(&file, remote->data, (UINT)remote->size, &wrote) == FR_OK &&
@@ -424,7 +632,7 @@ static void handle_vfs_write_page(vfs_request_t request) {
                     f_sync(&file) == FR_OK) {
                     written64 = wrote;
                     file_size = (uint64_t)f_size(&file);
-                    update_table_entry(remote->name, file_size);
+                    update_table_entry(norm_name, file_size);
                     ok = 1;
                 }
             }
@@ -450,17 +658,78 @@ static void handle_vfs_delete(vfs_request_t request) {
     }
 
     char name[FS_NAME_MAX];
-    copy_string(name, remote, sizeof(name));
+    normalize_path(name, remote, sizeof(name));
     sys_munmap(remote, PAGE_BYTES);
 
     int ok = 0;
-    if (mount_fat_volume() == 0 && name[0] != '\0' &&
-        f_unlink(name) == FR_OK) {
+    if (mount_fat_volume() == 0 && name[0] != '\0' && f_unlink(name) == FR_OK) {
         remove_table_entry(name);
         ok = 1;
     }
 
     sys_vfs_reply(ok ? 0 : -1, 0, 0, 0);
+}
+
+static void handle_vfs_mkdir(vfs_request_t request) {
+    if (request.arg1 == 0) {
+        sys_vfs_reply(-1, 0, 0, 0);
+        return;
+    }
+
+    char *remote = (char *)sys_vfs_inject(request.client_tid,
+                                          (void *)request.arg1, 1);
+    if (!remote) {
+        sys_vfs_reply(-1, 0, 0, 0);
+        return;
+    }
+
+    char path[FS_NAME_MAX];
+    normalize_path(path, remote, sizeof(path));
+    sys_munmap(remote, PAGE_BYTES);
+
+    if (mount_fat_volume() < 0 || path[0] == '\0') {
+        sys_vfs_reply(-1, 0, 0, 0);
+        return;
+    }
+
+    FRESULT res = f_mkdir(path);
+    if (res == FR_OK || res == FR_EXIST) {
+        (void)add_dir_to_table(path);
+        sys_vfs_reply(0, 0, 0, 0);
+    } else {
+        sys_vfs_reply(-1, 0, 0, 0);
+    }
+}
+
+static void handle_vfs_statfs(void) {
+    if (mount_fat_volume() < 0) {
+        sys_vfs_reply(-1, 0, 0, 0);
+        return;
+    }
+
+    DWORD free_clusters = 0;
+    FATFS *fs = 0;
+    if (f_getfree("", &free_clusters, &fs) != FR_OK || !fs) {
+        sys_vfs_reply(-1, 0, 0, 0);
+        return;
+    }
+
+    uint64_t cluster_bytes = (uint64_t)fs->csize * 512ULL;
+    uint64_t total_clusters = fs->n_fatent > 2 ? (uint64_t)(fs->n_fatent - 2) : 0;
+    uint64_t total_kib = (total_clusters * cluster_bytes) / 1024ULL;
+    uint64_t free_kib = ((uint64_t)free_clusters * cluster_bytes) / 1024ULL;
+
+    sys_vfs_reply(0, total_kib, free_kib, cluster_bytes);
+}
+
+static uint32_t boot_flags_for_exec(const char *name) {
+    if (streq(name, "sbin/uart.elf") || streq(name, "sbin/keyboard.elf")) {
+        return VFS_EXEC_BOOT_UART;
+    }
+    if (streq(name, "sbin/block.elf")) {
+        return VFS_EXEC_BOOT_BLOCK;
+    }
+    return 0;
 }
 
 static void handle_vfs_exec_index(vfs_request_t request) {
@@ -506,7 +775,8 @@ static void handle_vfs_exec_index(vfs_request_t request) {
     }
 
     int exec_cap = sys_vfs_exec_create(request.client_tid, elf, entry->size,
-                                       (uint32_t)request.arg1);
+                                       (uint32_t)request.arg1,
+                                       boot_flags_for_exec(entry->name));
     free(elf);
     if (exec_cap < 0) {
         sys_vfs_reply(-1, 0, 0, 0);
@@ -545,6 +815,12 @@ static void run_vfs_server(void) {
             handle_vfs_write_page(request);
         } else if (request.arg0 == VFS_FS_REQ_DELETE) {
             handle_vfs_delete(request);
+        } else if (request.arg0 == VFS_FS_REQ_OPEN_PATH) {
+            handle_vfs_open_path(request);
+        } else if (request.arg0 == VFS_FS_REQ_MKDIR) {
+            handle_vfs_mkdir(request);
+        } else if (request.arg0 == VFS_FS_REQ_STATFS) {
+            handle_vfs_statfs();
         } else {
             sys_vfs_reply(-1, 0, 0, 0);
         }

@@ -99,7 +99,7 @@ uint64_t elf_load(const uint8_t *elf_data, uint64_t elf_size, uint64_t *pgd, uin
             file_size = phdr->p_memsz + page_delta;
         }
 
-        if (file_cap != 0) {
+        if (file_cap != 0 && !(phdr->p_flags & PF_W)) {
             uint32_t object_id = 0;
             if (vm_object_create_initrd(0, file_cap - 1, file_offset, file_size,
                                         seg_end - seg_start,

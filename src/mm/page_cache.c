@@ -27,7 +27,7 @@ int page_cache_init(void) {
     }
 
     page_cache_clock = 1;
-    LOG_OK_HEX("PAGECACHE: initrd cache pages: ", MAX_INITRD_CACHE_PAGES);
+    LOG_OK_HEX("PAGECACHE: boot archive cache pages: ", MAX_INITRD_CACHE_PAGES);
     return 0;
 }
 
@@ -107,4 +107,3 @@ int page_cache_get_initrd_page(uint32_t file_index, uint64_t file_offset,
     *out_paddr = frame->paddr;
     return 0;
 }
-
