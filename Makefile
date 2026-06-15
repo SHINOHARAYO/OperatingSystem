@@ -29,7 +29,8 @@ USER_ELFS      := $(APP_ELFS)
 BOOT_MANIFEST  := etc/boot.txt
 
 USER_CFLAGS = -target aarch64-linux-gnu -ffreestanding -nostdlib -static -fno-builtin \
-              -Ithird_party/fatfs -Iincludes -Wl,-Ttext=0x80000000 -Wl,--entry=_start
+              -mgeneral-regs-only -Ithird_party/fatfs -Iincludes \
+              -Wl,-Ttext=0x80000000 -Wl,--entry=_start
 
 # ── Top-level targets ────────────────────────────────────────────────────────
 

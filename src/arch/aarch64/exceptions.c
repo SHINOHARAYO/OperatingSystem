@@ -9,6 +9,7 @@
 #include "vfs.h"
 #include "pmm.h"
 #include "kmalloc.h"
+#include "smp.h"
 
 #define SYS_YIELD 1
 #define SYS_SEND  2
@@ -219,9 +220,12 @@ void handle_irq(void) {
     int timer_tick = 0;
     int should_reschedule = 0;
     int reschedule_ipi = 0;
+    int tlb_shootdown_ipi = 0;
 
     if (int_id == 1) {
         reschedule_ipi = 1;
+    } else if (int_id == 2) {
+        tlb_shootdown_ipi = 1;
     } else if (int_id == 30) {
         timer_handle_interrupt();
         timer_tick = 1;
@@ -239,7 +243,9 @@ void handle_irq(void) {
         gic_end_of_interrupt(int_id);
     }
 
-    if (reschedule_ipi) {
+    if (tlb_shootdown_ipi) {
+        smp_handle_tlb_shootdown_ipi();
+    } else if (reschedule_ipi) {
         sched_handle_reschedule_ipi();
     } else if (timer_tick) {
         sched_tick();

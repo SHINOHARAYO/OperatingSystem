@@ -9,6 +9,12 @@
 #define PSCI_CPU_ON 0xC4000003ULL
 #define SMP_STACK_SIZE 4096
 #define SMP_IPI_RESCHEDULE 1
+#define SMP_IPI_TLB_SHOOTDOWN 2
+#define SMP_TLB_VA_ASID 1
+#define SMP_TLB_VA_ALL 2
+#define SMP_TLB_ASID 3
+#define SMP_TLB_ALL 4
+#define SMP_ASID_COUNT 65536
 
 extern uint64_t l1_table[512];
 extern uint64_t high_l1_table[512];
@@ -17,6 +23,167 @@ extern void smp_secondary_entry(void);
 
 uint8_t smp_secondary_stacks[MAX_SCHED_CORES][SMP_STACK_SIZE]
     __attribute__((aligned(4096)));
+
+typedef struct {
+    volatile uint32_t seq;
+    volatile uint32_t ack;
+    volatile uint32_t type;
+    volatile uint32_t asid;
+    volatile uint64_t va;
+} smp_tlb_request_t;
+
+static volatile uint32_t smp_online_mask = 1;
+static volatile uint32_t smp_tlb_seq = 1;
+static smp_tlb_request_t smp_tlb_requests[MAX_SCHED_CORES];
+static volatile uint32_t smp_asid_masks[SMP_ASID_COUNT];
+
+static uint32_t smp_current_core_id(void) {
+    uint64_t mpidr = 0;
+    __asm__ volatile("mrs %0, mpidr_el1" : "=r"(mpidr));
+    return (uint32_t)(mpidr & 0xFF);
+}
+
+static void smp_local_tlb_flush_va_asid(uint64_t va, uint16_t asid) {
+    uint64_t op = ((uint64_t)asid << 48) | ((va >> 12) & 0x00000FFFFFFFFFFFULL);
+    __asm__ volatile("tlbi vae1is, %0" : : "r"(op) : "memory");
+    __asm__ volatile("dsb ish\n isb" : : : "memory");
+}
+
+static void smp_local_tlb_flush_va_all_asids(uint64_t va) {
+    __asm__ volatile("tlbi vaae1is, %0" : : "r"(va >> 12) : "memory");
+    __asm__ volatile("dsb ish\n isb" : : : "memory");
+}
+
+static void smp_local_tlb_flush_asid(uint16_t asid) {
+    uint64_t op = (uint64_t)asid << 48;
+    __asm__ volatile("tlbi aside1is, %0" : : "r"(op) : "memory");
+    __asm__ volatile("dsb ish\n isb" : : : "memory");
+}
+
+static void smp_local_tlb_flush_all(void) {
+    __asm__ volatile("tlbi vmalle1is\n dsb ish\n isb" : : : "memory");
+}
+
+static void smp_process_tlb_request(uint32_t core_id) {
+    if (core_id >= MAX_SCHED_CORES) {
+        return;
+    }
+
+    smp_tlb_request_t *request = &smp_tlb_requests[core_id];
+    uint32_t seq = __atomic_load_n(&request->seq, __ATOMIC_ACQUIRE);
+    if (seq == 0 || __atomic_load_n(&request->ack, __ATOMIC_ACQUIRE) == seq) {
+        return;
+    }
+
+    if (request->type == SMP_TLB_VA_ASID) {
+        smp_local_tlb_flush_va_asid(request->va, (uint16_t)request->asid);
+    } else if (request->type == SMP_TLB_VA_ALL) {
+        smp_local_tlb_flush_va_all_asids(request->va);
+    } else if (request->type == SMP_TLB_ASID) {
+        smp_local_tlb_flush_asid((uint16_t)request->asid);
+    } else if (request->type == SMP_TLB_ALL) {
+        smp_local_tlb_flush_all();
+    }
+
+    __atomic_store_n(&request->ack, seq, __ATOMIC_RELEASE);
+}
+
+static void smp_tlb_broadcast(uint32_t type, uint64_t va, uint16_t asid,
+                              uint32_t requested_targets) {
+    uint32_t self = smp_current_core_id();
+    uint32_t online = __atomic_load_n(&smp_online_mask, __ATOMIC_ACQUIRE);
+    uint32_t seq = __atomic_add_fetch(&smp_tlb_seq, 1, __ATOMIC_ACQ_REL);
+    uint32_t targets = 0;
+
+    for (uint32_t core_id = 0; core_id < MAX_SCHED_CORES; core_id++) {
+        uint32_t bit = 1U << core_id;
+        if (core_id == self || (online & bit) == 0 ||
+            (requested_targets & bit) == 0) {
+            continue;
+        }
+
+        smp_tlb_requests[core_id].type = type;
+        smp_tlb_requests[core_id].va = va;
+        smp_tlb_requests[core_id].asid = asid;
+        __atomic_store_n(&smp_tlb_requests[core_id].seq, seq, __ATOMIC_RELEASE);
+        targets |= 1U << core_id;
+    }
+
+    if (targets == 0) {
+        return;
+    }
+
+    gic_send_sgi(SMP_IPI_TLB_SHOOTDOWN, targets);
+
+    for (uint32_t spin = 0; spin < 1000000; spin++) {
+        smp_process_tlb_request(self);
+        uint32_t done = 1;
+        for (uint32_t core_id = 0; core_id < MAX_SCHED_CORES; core_id++) {
+            if ((targets & (1U << core_id)) == 0) {
+                continue;
+            }
+            if (__atomic_load_n(&smp_tlb_requests[core_id].ack,
+                                __ATOMIC_ACQUIRE) != seq) {
+                done = 0;
+                break;
+            }
+        }
+        if (done) {
+            return;
+        }
+        __asm__ volatile("yield");
+    }
+
+    LOG_WARN("SMP: TLB shootdown ack timeout.");
+}
+
+void smp_asid_activate(uint16_t asid) {
+    if (asid == 0) {
+        return;
+    }
+    uint32_t core_id = smp_current_core_id();
+    if (core_id < MAX_SCHED_CORES) {
+        __atomic_fetch_or(&smp_asid_masks[asid], 1U << core_id, __ATOMIC_RELEASE);
+    }
+}
+
+void smp_asid_forget(uint16_t asid) {
+    if (asid != 0) {
+        __atomic_store_n(&smp_asid_masks[asid], 0, __ATOMIC_RELEASE);
+    }
+}
+
+void smp_tlb_shootdown_va_asid(uint64_t va, uint16_t asid) {
+    uint32_t targets = __atomic_load_n(&smp_asid_masks[asid], __ATOMIC_ACQUIRE);
+    uint32_t self = smp_current_core_id();
+    if (self < MAX_SCHED_CORES && (targets & (1U << self)) != 0) {
+        smp_local_tlb_flush_va_asid(va, asid);
+    }
+    smp_tlb_broadcast(SMP_TLB_VA_ASID, va, asid, targets);
+}
+
+void smp_tlb_shootdown_va_all_asids(uint64_t va) {
+    smp_local_tlb_flush_va_all_asids(va);
+    smp_tlb_broadcast(SMP_TLB_VA_ALL, va, 0, UINT32_MAX);
+}
+
+void smp_tlb_shootdown_asid(uint16_t asid) {
+    uint32_t targets = __atomic_load_n(&smp_asid_masks[asid], __ATOMIC_ACQUIRE);
+    uint32_t self = smp_current_core_id();
+    if (self < MAX_SCHED_CORES && (targets & (1U << self)) != 0) {
+        smp_local_tlb_flush_asid(asid);
+    }
+    smp_tlb_broadcast(SMP_TLB_ASID, 0, asid, targets);
+}
+
+void smp_tlb_shootdown_all(void) {
+    smp_local_tlb_flush_all();
+    smp_tlb_broadcast(SMP_TLB_ALL, 0, 0, UINT32_MAX);
+}
+
+void smp_handle_tlb_shootdown_ipi(void) {
+    smp_process_tlb_request(smp_current_core_id());
+}
 
 void smp_send_reschedule(uint32_t core_id) {
     if (core_id >= MAX_SCHED_CORES) {
@@ -73,6 +240,9 @@ void smp_secondary_main(uint64_t core_id) {
     sched_secondary_core_online((uint32_t)core_id);
     timer_init_secondary();
     __asm__ volatile("msr daifclr, #2" : : : "memory");
+    if (core_id < MAX_SCHED_CORES) {
+        __atomic_fetch_or(&smp_online_mask, 1U << core_id, __ATOMIC_RELEASE);
+    }
 
     while (1) {
         __asm__ volatile("wfi");

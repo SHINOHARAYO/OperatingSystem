@@ -3,6 +3,7 @@
 #include <stdint.h>
 #include <stddef.h>
 #include "orange_cat.h"
+#include "spinlock.h"
 #include "vma.h"
 
 #define TASK_STACK_SIZE 4096
@@ -43,7 +44,8 @@ typedef enum {
     TASK_STATE_BLOCKED_ON_IRQ,
     TASK_STATE_BLOCKED_ON_WAIT,
     TASK_STATE_BLOCKED_ON_VFS_CALL,
-    TASK_STATE_BLOCKED_ON_VFS_RECV
+    TASK_STATE_BLOCKED_ON_VFS_RECV,
+    TASK_STATE_DEAD
 } task_state_t;
 
 typedef enum {
@@ -58,9 +60,11 @@ typedef struct tcb_t {
     uint64_t sp;
     uint64_t pc;
     uint64_t pstate;
+    spinlock_t lock;
     
     uint32_t tid;
     task_state_t state;
+    uint32_t refcount;
     
     uint8_t priority;
     uint8_t base_priority;
@@ -70,7 +74,8 @@ typedef struct tcb_t {
     uint32_t sleep_ticks_remaining;
     uint8_t sched_queued;
     uint8_t timer_queued;
-    uint16_t sched_padding;
+    uint8_t kill_requested;
+    uint8_t sched_padding;
     uint32_t sched_core_id;
     uint64_t wake_tick;
     struct tcb_t *sched_next;
@@ -163,6 +168,8 @@ int vm_unmap_range(tcb_t *task, uint64_t start, uint64_t size);
 uint32_t sched_task_capacity(void);
 tcb_t *sched_task_at(uint32_t index);
 tcb_t *sched_find_task(uint32_t tid);
+tcb_t *sched_task_get(uint32_t tid);
+void sched_task_put(tcb_t *task);
 tcb_t *sched_current_task(void);
 uint64_t *sched_task_trap_frame(tcb_t *task);
 void sched_clear_ipc_state(tcb_t *task);

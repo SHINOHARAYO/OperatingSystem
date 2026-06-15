@@ -48,18 +48,13 @@ static int find_route(tcb_t *task, uint32_t vfs_id) {
     return -1;
 }
 
-static void enqueue_vfs_caller(tcb_t *fs, tcb_t *caller) {
-    caller->vfs_next = 0;
-    if (fs->vfs_call_tail) {
-        fs->vfs_call_tail->vfs_next = caller;
-    } else {
-        fs->vfs_call_head = caller;
-    }
-    fs->vfs_call_tail = caller;
-}
-
 static tcb_t *dequeue_vfs_caller(tcb_t *fs) {
-    if (!fs || !fs->vfs_call_head) {
+    if (!fs) {
+        return 0;
+    }
+    spin_lock(&fs->lock);
+    if (!fs->vfs_call_head) {
+        spin_unlock(&fs->lock);
         return 0;
     }
 
@@ -69,6 +64,7 @@ static tcb_t *dequeue_vfs_caller(tcb_t *fs) {
         fs->vfs_call_tail = 0;
     }
     caller->vfs_next = 0;
+    spin_unlock(&fs->lock);
     return caller;
 }
 
@@ -83,6 +79,7 @@ static void unlink_vfs_caller(tcb_t *caller) {
         return;
     }
 
+    spin_lock(&fs->lock);
     tcb_t *prev = 0;
     tcb_t *cur = fs->vfs_call_head;
     while (cur) {
@@ -96,11 +93,15 @@ static void unlink_vfs_caller(tcb_t *caller) {
                 fs->vfs_call_tail = prev;
             }
             cur->vfs_next = 0;
+            spin_unlock(&fs->lock);
+            sched_task_put(fs);
             return;
         }
         prev = cur;
         cur = cur->vfs_next;
     }
+    spin_unlock(&fs->lock);
+    sched_task_put(fs);
 }
 
 static void deliver_vfs_call(tcb_t *caller, tcb_t *fs, uint64_t *fs_regs) {
@@ -124,12 +125,14 @@ void vfs_bind_syscall(uint64_t *regs, uint32_t vfs_id, uint32_t endpoint_cap) {
     }
 
     ocap_t cap;
+    tcb_t *endpoint = NULL;
     if (ocap_lookup(&current->caps, endpoint_cap, OCAP_ENDPOINT,
                     OCAP_RIGHT_CALL, &cap) < 0 ||
-        !sched_find_task(cap.object_id)) {
+        !(endpoint = sched_find_task(cap.object_id))) {
         regs[0] = (uint64_t)-1;
         return;
     }
+    sched_task_put(endpoint);
 
     int slot = find_route(current, vfs_id);
     if (slot < 0) {
@@ -157,15 +160,30 @@ void vfs_recv_syscall(uint64_t *regs) {
         return;
     }
 
-    tcb_t *caller = dequeue_vfs_caller(current);
+    spin_lock(&current->lock);
+    tcb_t *caller = current->vfs_call_head;
+    if (caller) {
+        current->vfs_call_head = caller->vfs_next;
+        if (current->vfs_call_tail == caller) {
+            current->vfs_call_tail = 0;
+        }
+        caller->vfs_next = 0;
+    } else {
+        current->state = TASK_STATE_BLOCKED_ON_VFS_RECV;
+        current->ticks_remaining = 0;
+    }
+    spin_unlock(&current->lock);
+
     if (caller && caller->state == TASK_STATE_BLOCKED_ON_VFS_CALL &&
         caller->vfs_reply_tid == current->tid) {
         deliver_vfs_call(caller, current, regs);
         return;
     }
+    if (caller) {
+        regs[0] = (uint64_t)-1;
+        return;
+    }
 
-    current->state = TASK_STATE_BLOCKED_ON_VFS_RECV;
-    current->ticks_remaining = 0;
     sched_reschedule();
 }
 
@@ -196,16 +214,32 @@ void vfs_call_syscall(uint64_t *regs) {
     caller->state = TASK_STATE_BLOCKED_ON_VFS_CALL;
     caller->ticks_remaining = 0;
 
+    int direct_deliver = 0;
+    spin_lock(&fs->lock);
     if (fs->state == TASK_STATE_BLOCKED_ON_VFS_RECV) {
         uint64_t *fs_tf = sched_task_trap_frame(fs);
         deliver_vfs_call(caller, fs, fs_tf);
+        direct_deliver = 1;
+    } else {
+        caller->vfs_next = 0;
+        if (fs->vfs_call_tail) {
+            fs->vfs_call_tail->vfs_next = caller;
+        } else {
+            fs->vfs_call_head = caller;
+        }
+        fs->vfs_call_tail = caller;
+    }
+    spin_unlock(&fs->lock);
+
+    if (direct_deliver) {
         sched_make_ready(fs);
         sched_handoff_to_task(fs);
+        sched_task_put(fs);
         return;
     }
 
-    enqueue_vfs_caller(fs, caller);
     sched_reschedule();
+    sched_task_put(fs);
 }
 
 int vfs_enqueue_kernel_call(tcb_t *caller, tcb_t *fs, uint32_t vfs_id, uint64_t arg0, uint64_t arg1, uint64_t arg2) {
@@ -219,15 +253,29 @@ int vfs_enqueue_kernel_call(tcb_t *caller, tcb_t *fs, uint32_t vfs_id, uint64_t 
     caller->state = TASK_STATE_BLOCKED_ON_VFS_CALL;
     caller->ticks_remaining = 0;
 
+    int direct_deliver = 0;
+    spin_lock(&fs->lock);
     if (fs->state == TASK_STATE_BLOCKED_ON_VFS_RECV) {
         uint64_t *fs_tf = sched_task_trap_frame(fs);
         deliver_vfs_call(caller, fs, fs_tf);
+        direct_deliver = 1;
+    } else {
+        caller->vfs_next = 0;
+        if (fs->vfs_call_tail) {
+            fs->vfs_call_tail->vfs_next = caller;
+        } else {
+            fs->vfs_call_head = caller;
+        }
+        fs->vfs_call_tail = caller;
+    }
+    spin_unlock(&fs->lock);
+
+    if (direct_deliver) {
         sched_make_ready(fs);
         sched_handoff_to_task(fs);
         return 0;
     }
 
-    enqueue_vfs_caller(fs, caller);
     sched_reschedule();
     return 0;
 }
@@ -245,6 +293,9 @@ void vfs_reply_syscall(uint64_t *regs) {
         fs->vfs_active_client_tid = 0;
         fs->vfs_active_id = 0;
         regs[0] = (uint64_t)-1;
+        if (client) {
+            sched_task_put(client);
+        }
         return;
     }
 
@@ -265,6 +316,7 @@ void vfs_reply_syscall(uint64_t *regs) {
     sched_make_ready(client);
     regs[0] = 0;
     sched_handoff_to_task(client);
+    sched_task_put(client);
 }
 
 static int get_vma_flags(tcb_t *task, uint64_t start, uint64_t size, uint64_t *out_flags) {
@@ -332,6 +384,9 @@ void vfs_inject_syscall(uint64_t *regs, uint32_t client_tid,
         (vma_range_is_free(&client->vm, client_va, client_va + size) &&
          get_vma_flags(client, client_va, size, 0) == 0)) {
         regs[0] = 0;
+        if (client) {
+            sched_task_put(client);
+        }
         return;
     }
 
@@ -343,11 +398,13 @@ void vfs_inject_syscall(uint64_t *regs, uint32_t client_tid,
                        0, size, 0, VMA_BACKING_ANON, 0,
                        page_count, page_count) < 0) {
             regs[0] = 0;
+            sched_task_put(client);
             return;
         }
         client_vma_added = 1;
     } else if (get_vma_flags(client, client_va, size, &client_pt_flags) < 0) {
         regs[0] = 0;
+        sched_task_put(client);
         return;
     }
 
@@ -361,6 +418,7 @@ void vfs_inject_syscall(uint64_t *regs, uint32_t client_tid,
             vma_remove(&client->vm, client_va, client_va + size);
         }
         regs[0] = 0;
+        sched_task_put(client);
         return;
     }
 
@@ -411,6 +469,7 @@ void vfs_inject_syscall(uint64_t *regs, uint32_t client_tid,
         }
         vma_remove(&fs->vm, fs_va, fs_va + size);
         regs[0] = 0;
+        sched_task_put(client);
         return;
     }
 
@@ -418,6 +477,7 @@ void vfs_inject_syscall(uint64_t *regs, uint32_t client_tid,
     regs[0] = fs_va;
     regs[1] = client_va;
     regs[2] = size;
+    sched_task_put(client);
 }
 
 void vfs_task_died(uint32_t tid) {
@@ -478,5 +538,6 @@ void vfs_task_died(uint32_t tid) {
                 }
             }
         }
+        sched_task_put(task);
     }
 }

@@ -45,9 +45,12 @@ extern uint64_t l1_table[512];
 #define BOOT_DEVICE_UART  (1U << 0)
 #define BOOT_DEVICE_BLOCK (1U << 1)
 
-static tcb_t *tasks = NULL;
+static tcb_t **tasks = NULL;
 static uint32_t task_capacity = 0;
 static uint32_t task_table_pages = 0;
+static uint32_t task_slot_pages = 0;
+static spinlock_t task_table_lock;
+static spinlock_t asid_lock;
 
 typedef struct {
     uint32_t core_id;
@@ -112,8 +115,10 @@ static int install_cap(tcb_t *task, uint32_t type, uint32_t object_id,
                        uint64_t rights, uint64_t flags);
 static void install_standard_caps(tcb_t *task);
 static int install_endpoint_cap_for_tid(tcb_t *task, uint32_t tid);
-static void rebuild_scheduler_queues_after_task_move(void);
 static int task_index_from_ptr(tcb_t *task);
+static __attribute__((noreturn)) void terminate_current_task(uint32_t reason, int exit_code,
+                                                             uint64_t esr, uint64_t elr,
+                                                             uint64_t far);
 
 static uint32_t next_tid = 1;
 static uint32_t name_server_tid = DEFAULT_NAME_SERVER_TID;
@@ -140,6 +145,18 @@ static sched_core_t *sched_core_by_id(uint32_t core_id) {
 
 static sched_core_t *sched_current_core(void) {
     return sched_core_by_id(current_core_id());
+}
+
+static void sched_task_lock(tcb_t *task) {
+    if (task) {
+        spin_lock(&task->lock);
+    }
+}
+
+static void sched_task_unlock(tcb_t *task) {
+    if (task) {
+        spin_unlock(&task->lock);
+    }
 }
 
 static sched_core_t *sched_core_for_task(tcb_t *task) {
@@ -190,7 +207,9 @@ static sched_core_t *sched_select_ready_core(void) {
 }
 
 static int sched_task_can_balance(tcb_t *task) {
-    return task && task->tid != 0 && task->pgd != NULL && task->parent_tid > 1;
+    return task && task->tid != 0 && task->pgd != NULL &&
+           task->parent_tid > 1 && task->base_priority == 0 &&
+           !task->kill_requested;
 }
 
 static void sched_set_current(sched_core_t *core, tcb_t *task, int task_idx) {
@@ -205,6 +224,13 @@ static void sched_set_current(sched_core_t *core, tcb_t *task, int task_idx) {
 }
 
 #define current_task (sched_current_core()->running_task)
+
+static void sched_remote_reschedule(uint32_t core_id) {
+    if (core_id < MAX_SCHED_CORES && sched_cores[core_id].online) {
+        sched_cores[core_id].reschedule_pending = 1;
+        smp_send_reschedule(core_id);
+    }
+}
 
 static uint8_t normalize_priority(uint8_t priority) {
     if (priority >= SCHED_LEVELS) {
@@ -242,7 +268,7 @@ static void timer_queue_reset_task(tcb_t *task) {
 
 static void ready_enqueue_tail_on_core(sched_core_t *core, tcb_t *task) {
     if (!task || task->tid == 0 || task->state == TASK_STATE_FREE ||
-        task->sched_queued) {
+        task->state == TASK_STATE_DEAD || task->sched_queued) {
         return;
     }
     if (!core) {
@@ -278,23 +304,7 @@ static void ready_enqueue_tail(tcb_t *task) {
     ready_enqueue_tail_on_core(sched_core_for_task(task), task);
 }
 
-static void signal_remote_ready(tcb_t *task) {
-    uint32_t current_core = current_core_id();
-    if (task && task->sched_core_id != current_core &&
-        task->sched_core_id < MAX_SCHED_CORES &&
-        sched_cores[task->sched_core_id].online) {
-        sched_cores[task->sched_core_id].reschedule_pending = 1;
-        smp_send_reschedule(task->sched_core_id);
-    }
-}
-
-static void ready_remove(tcb_t *task) {
-    if (!task || !task->sched_queued) {
-        return;
-    }
-    sched_core_t *core = sched_core_for_task(task);
-    spin_lock(&core->lock);
-
+static void ready_detach_locked(sched_core_t *core, tcb_t *task) {
     uint8_t priority = task->priority;
     if (priority >= SCHED_LEVELS) {
         priority = SCHED_LEVELS - 1;
@@ -314,6 +324,48 @@ static void ready_remove(tcb_t *task) {
     if (core->ready_count > 0) {
         core->ready_count--;
     }
+}
+
+static void ready_attach_locked(sched_core_t *core, tcb_t *task) {
+    uint8_t priority = task->priority;
+    if (priority >= SCHED_LEVELS) {
+        priority = SCHED_LEVELS - 1;
+        task->priority = priority;
+    }
+
+    tcb_t *head = core->queues[priority];
+    if (!head) {
+        core->queues[priority] = task;
+        task->sched_next = task;
+        task->sched_prev = task;
+    } else {
+        tcb_t *tail = head->sched_prev;
+        tail->sched_next = task;
+        task->sched_prev = tail;
+        task->sched_next = head;
+        head->sched_prev = task;
+    }
+    task->sched_queued = 1;
+    task->sched_core_id = core->core_id;
+    core->ready_count++;
+    core->ready_bitmap |= ready_bit(priority);
+}
+
+static void signal_remote_ready(tcb_t *task) {
+    uint32_t current_core = current_core_id();
+    if (task && task->sched_core_id != current_core &&
+        task->sched_core_id < MAX_SCHED_CORES) {
+        sched_remote_reschedule(task->sched_core_id);
+    }
+}
+
+static void ready_remove(tcb_t *task) {
+    if (!task || !task->sched_queued) {
+        return;
+    }
+    sched_core_t *core = sched_core_for_task(task);
+    spin_lock(&core->lock);
+    ready_detach_locked(core, task);
     spin_unlock(&core->lock);
 }
 
@@ -334,21 +386,69 @@ static tcb_t *ready_pop_highest(void) {
         spin_unlock(&core->lock);
         return NULL;
     }
-
-    if (task->sched_next == task) {
-        core->queues[queue_index] = NULL;
-        core->ready_bitmap &= ~ready_bit((uint8_t)queue_index);
-    } else {
-        core->queues[queue_index] = task->sched_next;
-        task->sched_prev->sched_next = task->sched_next;
-        task->sched_next->sched_prev = task->sched_prev;
-    }
-    ready_queue_reset_task(task);
-    if (core->ready_count > 0) {
-        core->ready_count--;
-    }
+    ready_detach_locked(core, task);
     spin_unlock(&core->lock);
     return task;
+}
+
+static tcb_t *ready_find_stealable_locked(sched_core_t *core) {
+    for (int level = SCHED_LEVELS - 1; level >= 0; level--) {
+        tcb_t *head = core->queues[level];
+        if (!head) {
+            continue;
+        }
+
+        tcb_t *task = head->sched_prev;
+        tcb_t *tail = task;
+        do {
+            if (task->state == TASK_STATE_READY &&
+                task->sched_queued && sched_task_can_balance(task)) {
+                return task;
+            }
+            task = task->sched_prev;
+        } while (task != tail);
+    }
+    return NULL;
+}
+
+static int ready_steal_from_core(sched_core_t *dst, sched_core_t *src) {
+    if (!dst || !src || dst == src || !dst->online || !src->online) {
+        return 0;
+    }
+
+    sched_core_t *first = dst->core_id < src->core_id ? dst : src;
+    sched_core_t *second = first == dst ? src : dst;
+    spin_lock(&first->lock);
+    spin_lock(&second->lock);
+
+    int stolen = 0;
+    if (dst->ready_count == 0 && src->ready_count > 0) {
+        tcb_t *task = ready_find_stealable_locked(src);
+        if (task) {
+            ready_detach_locked(src, task);
+            ready_attach_locked(dst, task);
+            stolen = 1;
+        }
+    }
+
+    spin_unlock(&second->lock);
+    spin_unlock(&first->lock);
+    return stolen;
+}
+
+static int ready_steal_for_current_core(void) {
+    sched_core_t *dst = sched_current_core();
+    for (uint32_t offset = 1; offset < MAX_SCHED_CORES; offset++) {
+        uint32_t core_id = (dst->core_id + offset) % MAX_SCHED_CORES;
+        sched_core_t *core = &sched_cores[core_id];
+        if (core == dst || !core->online) {
+            continue;
+        }
+        if (ready_steal_from_core(dst, core)) {
+            return 1;
+        }
+    }
+    return 0;
 }
 
 static int highest_ready_priority(void) {
@@ -375,7 +475,7 @@ void sched_make_ready(tcb_t *task) {
     task->ticks_remaining = quantum_for_priority(task->priority);
     task->quantum = task->ticks_remaining;
     task->wait_time = 0;
-    if (!task->sched_queued && old_state != TASK_STATE_RUNNING &&
+    if (!task->sched_queued && old_state == TASK_STATE_FREE &&
         sched_task_can_balance(task)) {
         sched_core_t *target_core = sched_select_ready_core();
         task->sched_core_id = target_core->core_id;
@@ -403,14 +503,6 @@ static void zero_bytes(void *ptr, uint64_t size) {
     }
 }
 
-static void copy_bytes(void *dst, const void *src, uint64_t size) {
-    uint8_t *d = (uint8_t *)dst;
-    const uint8_t *s = (const uint8_t *)src;
-    for (uint64_t i = 0; i < size; i++) {
-        d[i] = s[i];
-    }
-}
-
 void sched_clear_ipc_state(tcb_t *task) {
     if (!task) {
         return;
@@ -431,6 +523,7 @@ static int allocate_user_asid(uint16_t *out_asid) {
         return -1;
     }
 
+    spin_lock(&asid_lock);
     for (uint32_t searched = 0; searched < MAX_USER_ASIDS; searched++) {
         uint16_t candidate = next_user_asid;
         next_user_asid = (candidate == MAX_USER_ASIDS) ? 1 : (uint16_t)(candidate + 1);
@@ -439,10 +532,12 @@ static int allocate_user_asid(uint16_t *out_asid) {
             asid_in_use[candidate] = 1;
             vmm_flush_asid(candidate);
             *out_asid = candidate;
+            spin_unlock(&asid_lock);
             return 0;
         }
     }
 
+    spin_unlock(&asid_lock);
     return -1;
 }
 
@@ -451,8 +546,11 @@ static void release_user_asid(uint16_t asid) {
         return;
     }
 
+    spin_lock(&asid_lock);
     vmm_flush_asid(asid);
+    smp_asid_forget(asid);
     asid_in_use[asid] = 0;
+    spin_unlock(&asid_lock);
 }
 
 static void init_free_task_slot(tcb_t *task) {
@@ -460,8 +558,10 @@ static void init_free_task_slot(tcb_t *task) {
         return;
     }
 
+    task->lock.value = 0;
     task->state = TASK_STATE_FREE;
     task->tid = 0;
+    task->refcount = 0;
     task->asid = 0;
     task->reserved_asid_padding = 0;
     task->vm.vmas = NULL;
@@ -479,6 +579,7 @@ static void init_free_task_slot(tcb_t *task) {
     task->ticks_remaining = 0;
     task->wait_time = 0;
     task->sleep_ticks_remaining = 0;
+    task->kill_requested = 0;
     task->sched_core_id = 0;
     ready_queue_reset_task(task);
     timer_queue_reset_task(task);
@@ -487,74 +588,98 @@ static void init_free_task_slot(tcb_t *task) {
     clear_caps(task);
 }
 
+static int allocate_task_pointer_table(void) {
+    if (tasks) {
+        return 0;
+    }
+
+    task_table_pages = table_pages_for_size(sizeof(tcb_t *), MAX_USER_ASIDS + 1);
+    tasks = (tcb_t **)pmm_alloc_contiguous_pages(task_table_pages);
+    if (!tasks) {
+        task_table_pages = 0;
+        return -1;
+    }
+    zero_bytes(tasks, (uint64_t)task_table_pages * PAGE_SIZE);
+    task_slot_pages = table_pages_for_size(sizeof(tcb_t), 1);
+    return 0;
+}
+
+static int allocate_termination_table(void) {
+    if (termination_records) {
+        return 0;
+    }
+
+    termination_table_pages =
+        table_pages_for_size(sizeof(termination_record_t), MAX_USER_ASIDS + 1);
+    termination_records =
+        (termination_record_t *)pmm_alloc_contiguous_pages(termination_table_pages);
+    if (!termination_records) {
+        termination_table_pages = 0;
+        return -1;
+    }
+    zero_bytes(termination_records, (uint64_t)termination_table_pages * PAGE_SIZE);
+    return 0;
+}
+
+static int allocate_task_slot(uint32_t index) {
+    if (index > MAX_USER_ASIDS) {
+        return -1;
+    }
+    if (tasks[index]) {
+        return 0;
+    }
+
+    tcb_t *slot = (tcb_t *)pmm_alloc_contiguous_pages(task_slot_pages);
+    if (!slot) {
+        return -1;
+    }
+    zero_bytes(slot, (uint64_t)task_slot_pages * PAGE_SIZE);
+    init_free_task_slot(slot);
+    tasks[index] = slot;
+    return 0;
+}
+
 static int grow_task_tables(uint32_t min_capacity) {
-    uint32_t old_capacity = task_capacity;
-    uint32_t new_capacity = old_capacity ? old_capacity * 2 : TASK_INITIAL_CAPACITY;
-    while (new_capacity < min_capacity) {
-        new_capacity *= 2;
-    }
-
-    if (new_capacity > MAX_USER_ASIDS) {
+    if (min_capacity > MAX_USER_ASIDS + 1) {
         return -1;
     }
 
-    uint32_t new_task_pages = table_pages_for_size(sizeof(tcb_t), new_capacity);
-    uint32_t new_term_pages = table_pages_for_size(sizeof(termination_record_t), new_capacity);
-    tcb_t *new_tasks = (tcb_t *)pmm_alloc_contiguous_pages(new_task_pages);
-    if (!new_tasks) {
+    spin_lock(&task_table_lock);
+    if (task_capacity >= min_capacity) {
+        spin_unlock(&task_table_lock);
+        return 0;
+    }
+
+    if (allocate_task_pointer_table() < 0 || allocate_termination_table() < 0) {
+        spin_unlock(&task_table_lock);
         return -1;
     }
 
-    termination_record_t *new_records =
-        (termination_record_t *)pmm_alloc_contiguous_pages(new_term_pages);
-    if (!new_records) {
-        pmm_free_contiguous_pages(new_tasks, new_task_pages);
-        return -1;
-    }
-
-    zero_bytes(new_tasks, (uint64_t)new_task_pages * PAGE_SIZE);
-    zero_bytes(new_records, (uint64_t)new_term_pages * PAGE_SIZE);
-
-    for (uint32_t i = 0; i < old_capacity; i++) {
-        copy_bytes(&new_tasks[i], &tasks[i], sizeof(tcb_t));
-        copy_bytes(&new_records[i], &termination_records[i],
-                   sizeof(termination_record_t));
-    }
-    for (uint32_t i = old_capacity; i < new_capacity; i++) {
-        init_free_task_slot(&new_tasks[i]);
-        clear_termination_record(&new_records[i]);
-    }
-
-    tcb_t *old_tasks = tasks;
-    termination_record_t *old_records = termination_records;
-    uint32_t old_task_pages = task_table_pages;
-    uint32_t old_term_pages = termination_table_pages;
-
-    tasks = new_tasks;
-    termination_records = new_records;
-    task_capacity = new_capacity;
-    task_table_pages = new_task_pages;
-    termination_table_pages = new_term_pages;
-    rebuild_scheduler_queues_after_task_move();
-
-    if (old_tasks) {
-        pmm_free_contiguous_pages(old_tasks, old_task_pages);
-    }
-    if (old_records) {
-        pmm_free_contiguous_pages(old_records, old_term_pages);
+    while (task_capacity < min_capacity) {
+        if (allocate_task_slot(task_capacity) < 0) {
+            spin_unlock(&task_table_lock);
+            return -1;
+        }
+        clear_termination_record(&termination_records[task_capacity]);
+        task_capacity++;
     }
 
     LOG_DEBUG_HEX("SCHED: Task table capacity: ", task_capacity);
+    spin_unlock(&task_table_lock);
     return 0;
 }
 
 static int find_free_task_slot(uint32_t first_slot) {
     while (1) {
+        spin_lock(&task_table_lock);
         for (uint32_t i = first_slot; i < task_capacity; i++) {
-            if (tasks[i].state == TASK_STATE_FREE) {
+            if (tasks[i] && tasks[i]->state == TASK_STATE_FREE &&
+                tasks[i]->refcount == 0) {
+                spin_unlock(&task_table_lock);
                 return (int)i;
             }
         }
+        spin_unlock(&task_table_lock);
 
         uint32_t old_capacity = task_capacity;
         if (grow_task_tables(task_capacity + 1) < 0) {
@@ -570,27 +695,123 @@ static uint64_t make_ttbr0(uint64_t *pgd, uint16_t asid) {
 }
 
 static tcb_t* get_tcb(uint32_t tid) {
+    spin_lock(&task_table_lock);
     for (uint32_t i = 0; i < task_capacity; i++) {
-        if (tasks[i].state != TASK_STATE_FREE && tasks[i].tid == tid) {
-            return &tasks[i];
+        if (tasks[i] && tasks[i]->state != TASK_STATE_FREE &&
+            tasks[i]->state != TASK_STATE_DEAD && tasks[i]->tid == tid) {
+            spin_unlock(&task_table_lock);
+            return tasks[i];
         }
     }
+    spin_unlock(&task_table_lock);
     return NULL;
 }
 
 uint32_t sched_task_capacity(void) {
-    return task_capacity;
+    uint32_t capacity;
+    spin_lock(&task_table_lock);
+    capacity = task_capacity;
+    spin_unlock(&task_table_lock);
+    return capacity;
 }
 
 tcb_t *sched_task_at(uint32_t index) {
-    if (index >= task_capacity || tasks[index].state == TASK_STATE_FREE) {
+    spin_lock(&task_table_lock);
+    if (index >= task_capacity || !tasks[index] ||
+        tasks[index]->state == TASK_STATE_FREE ||
+        tasks[index]->state == TASK_STATE_DEAD) {
+        spin_unlock(&task_table_lock);
         return NULL;
     }
-    return &tasks[index];
+    tcb_t *task = tasks[index];
+    spin_lock(&task->lock);
+    task->refcount++;
+    spin_unlock(&task->lock);
+    spin_unlock(&task_table_lock);
+    return task;
 }
 
 tcb_t *sched_find_task(uint32_t tid) {
-    return get_tcb(tid);
+    return sched_task_get(tid);
+}
+
+static void recycle_dead_task_slot(tcb_t *task) {
+    if (!task || task->state != TASK_STATE_DEAD || task->refcount != 0) {
+        return;
+    }
+
+    task->tid = 0;
+    task->state = TASK_STATE_FREE;
+    task->asid = 0;
+    task->reserved_asid_padding = 0;
+    task->sp = 0;
+    task->sp_el0 = 0;
+    task->priority = 0;
+    task->kill_requested = 0;
+    task->base_priority = 0;
+    task->quantum = 0;
+    task->ticks_remaining = 0;
+    task->wait_time = 0;
+    task->sleep_ticks_remaining = 0;
+    task->sched_core_id = 0;
+    ready_queue_reset_task(task);
+    timer_queue_reset_task(task);
+    sched_clear_ipc_state(task);
+    vfs_clear_task_state(task);
+    task->awaiting_irq = 0;
+    task->parent_tid = 0;
+    task->wait_target_tid = 0;
+    task->user_stack_base = NULL;
+    task->user_heap_pointer = 0;
+    task->user_shared_pointer = 0;
+    task->lock.value = 0;
+}
+
+tcb_t *sched_task_get(uint32_t tid) {
+    if (tid == 0) {
+        return NULL;
+    }
+
+    spin_lock(&task_table_lock);
+    for (uint32_t i = 0; i < task_capacity; i++) {
+        tcb_t *task = tasks[i];
+        if (!task) {
+            continue;
+        }
+
+        spin_lock(&task->lock);
+        if (task->state != TASK_STATE_FREE &&
+            task->state != TASK_STATE_DEAD &&
+            task->tid == tid) {
+            task->refcount++;
+            spin_unlock(&task->lock);
+            spin_unlock(&task_table_lock);
+            return task;
+        }
+        spin_unlock(&task->lock);
+    }
+    spin_unlock(&task_table_lock);
+    return NULL;
+}
+
+void sched_task_put(tcb_t *task) {
+    if (!task || task->tid == 0) {
+        return;
+    }
+
+    int recycle = 0;
+    spin_lock(&task->lock);
+    if (task->refcount > 0) {
+        task->refcount--;
+    }
+    if (task->state == TASK_STATE_DEAD && task->refcount == 0) {
+        recycle = 1;
+    }
+    spin_unlock(&task->lock);
+
+    if (recycle) {
+        recycle_dead_task_slot(task);
+    }
 }
 
 tcb_t *sched_current_task(void) {
@@ -734,7 +955,7 @@ static void update_name_server_tid(uint32_t tid) {
     }
     name_server_tid = tid;
     for (uint32_t i = 1; i < task_capacity; i++) {
-        tcb_t *task = &tasks[i];
+        tcb_t *task = tasks[i];
         if (task->state == TASK_STATE_FREE || task->tid == 0) {
             continue;
         }
@@ -906,88 +1127,6 @@ static void process_timer_wheel_bucket(void) {
         }
         task = next;
     }
-}
-
-static void rebuild_scheduler_queues_after_task_move(void) {
-    for (uint32_t core_id = 0; core_id < MAX_SCHED_CORES; core_id++) {
-        sched_cores[core_id].ready_bitmap = 0;
-        sched_cores[core_id].ready_count = 0;
-        for (uint32_t i = 0; i < SCHED_LEVELS; i++) {
-            sched_cores[core_id].queues[i] = NULL;
-        }
-        for (uint32_t i = 0; i < SCHED_TIMER_WHEEL_SIZE; i++) {
-            sched_cores[core_id].timer_wheel[i] = NULL;
-        }
-    }
-
-    for (uint32_t i = 0; i < task_capacity; i++) {
-        uint64_t wake_tick = tasks[i].wake_tick;
-        uint8_t timer_queued = tasks[i].timer_queued;
-        uint32_t core_id = tasks[i].sched_core_id;
-        ready_queue_reset_task(&tasks[i]);
-        timer_queue_reset_task(&tasks[i]);
-        tasks[i].sched_core_id = (core_id < MAX_SCHED_CORES &&
-                                  sched_cores[core_id].online) ? core_id : 0;
-        tasks[i].ipc_next = NULL;
-        tasks[i].ipc_call_head = NULL;
-        tasks[i].ipc_call_tail = NULL;
-        tasks[i].vfs_next = NULL;
-        tasks[i].vfs_call_head = NULL;
-        tasks[i].vfs_call_tail = NULL;
-        if (tasks[i].state == TASK_STATE_READY && tasks[i].tid != 0) {
-            ready_enqueue_tail_on_core(sched_core_for_task(&tasks[i]), &tasks[i]);
-        }
-        if (timer_queued &&
-            (tasks[i].state == TASK_STATE_SLEEPING ||
-             tasks[i].state == TASK_STATE_BLOCKED_ON_IRQ)) {
-            timer_insert_at(&tasks[i], wake_tick);
-        }
-    }
-
-    for (uint32_t i = 0; i < task_capacity; i++) {
-        if (tasks[i].state != TASK_STATE_BLOCKED_ON_IPC_CALL ||
-            tasks[i].ipc_target_tid == 0) {
-            continue;
-        }
-        tcb_t *endpoint = get_tcb(tasks[i].ipc_target_tid);
-        if (!endpoint) {
-            continue;
-        }
-        tasks[i].ipc_next = NULL;
-        if (endpoint->ipc_call_tail) {
-            endpoint->ipc_call_tail->ipc_next = &tasks[i];
-        } else {
-            endpoint->ipc_call_head = &tasks[i];
-        }
-        endpoint->ipc_call_tail = &tasks[i];
-    }
-
-    for (uint32_t i = 0; i < task_capacity; i++) {
-        if (tasks[i].state != TASK_STATE_BLOCKED_ON_VFS_CALL ||
-            tasks[i].vfs_reply_tid == 0) {
-            continue;
-        }
-        tcb_t *fs = get_tcb(tasks[i].vfs_reply_tid);
-        if (!fs || fs->vfs_active_client_tid == tasks[i].tid) {
-            continue;
-        }
-        tasks[i].vfs_next = NULL;
-        if (fs->vfs_call_tail) {
-            fs->vfs_call_tail->vfs_next = &tasks[i];
-        } else {
-            fs->vfs_call_head = &tasks[i];
-        }
-        fs->vfs_call_tail = &tasks[i];
-    }
-
-    for (uint32_t core_id = 0; core_id < MAX_SCHED_CORES; core_id++) {
-        sched_core_t *core = &sched_cores[core_id];
-        if (core->current_task_idx >= 0 &&
-            (uint32_t)core->current_task_idx < task_capacity) {
-            core->running_task = &tasks[core->current_task_idx];
-        }
-    }
-    current_task = sched_current_core()->running_task;
 }
 
 static int map_user_frame(tcb_t *task, uint64_t va, uint64_t flags) {
@@ -1264,7 +1403,7 @@ static void invalidate_reply_caps_for_caller(uint32_t caller_tid) {
     }
 
     for (uint32_t i = 0; i < task_capacity; i++) {
-        tcb_t *task = &tasks[i];
+        tcb_t *task = tasks[i];
         if (task->state == TASK_STATE_FREE || !task->caps.entries) {
             continue;
         }
@@ -1289,6 +1428,7 @@ static void unlink_queued_ipc_call(tcb_t *caller) {
         return;
     }
 
+    sched_task_lock(endpoint);
     tcb_t *prev = NULL;
     tcb_t *cur = endpoint->ipc_call_head;
     while (cur) {
@@ -1302,22 +1442,31 @@ static void unlink_queued_ipc_call(tcb_t *caller) {
                 endpoint->ipc_call_tail = prev;
             }
             cur->ipc_next = NULL;
+            sched_task_unlock(endpoint);
             return;
         }
         prev = cur;
         cur = cur->ipc_next;
     }
+    sched_task_unlock(endpoint);
 }
 
 static void wake_ipc_peers(uint32_t tid) {
     tcb_t *endpoint = get_tcb(tid);
-    while (endpoint && endpoint->ipc_call_head) {
+    while (endpoint) {
+        sched_task_lock(endpoint);
         tcb_t *caller = endpoint->ipc_call_head;
-        endpoint->ipc_call_head = caller->ipc_next;
-        if (endpoint->ipc_call_tail == caller) {
-            endpoint->ipc_call_tail = NULL;
+        if (caller) {
+            endpoint->ipc_call_head = caller->ipc_next;
+            if (endpoint->ipc_call_tail == caller) {
+                endpoint->ipc_call_tail = NULL;
+            }
+            caller->ipc_next = NULL;
         }
-        caller->ipc_next = NULL;
+        sched_task_unlock(endpoint);
+        if (!caller) {
+            break;
+        }
         if (caller->state == TASK_STATE_BLOCKED_ON_IPC_CALL) {
             uint64_t *tf = sched_task_trap_frame(caller);
             tf[0] = (uint64_t)-1;
@@ -1327,19 +1476,19 @@ static void wake_ipc_peers(uint32_t tid) {
     }
 
     for (uint32_t i = 0; i < task_capacity; i++) {
-        if ((tasks[i].state == TASK_STATE_BLOCKED_ON_IPC_CALL ||
-             tasks[i].state == TASK_STATE_BLOCKED_ON_IPC_REPLY) &&
-            tasks[i].ipc_target_tid == tid) {
-            uint64_t *tf = sched_task_trap_frame(&tasks[i]);
+        if ((tasks[i]->state == TASK_STATE_BLOCKED_ON_IPC_CALL ||
+             tasks[i]->state == TASK_STATE_BLOCKED_ON_IPC_REPLY) &&
+            tasks[i]->ipc_target_tid == tid) {
+            uint64_t *tf = sched_task_trap_frame(tasks[i]);
             tf[0] = (uint64_t)-1;
-            sched_clear_ipc_state(&tasks[i]);
-            sched_make_ready(&tasks[i]);
-        } else if (tasks[i].state == TASK_STATE_BLOCKED_ON_IPC_RECV &&
-                   tasks[i].ipc_target_tid == tid) {
-            uint64_t *tf = sched_task_trap_frame(&tasks[i]);
+            sched_clear_ipc_state(tasks[i]);
+            sched_make_ready(tasks[i]);
+        } else if (tasks[i]->state == TASK_STATE_BLOCKED_ON_IPC_RECV &&
+                   tasks[i]->ipc_target_tid == tid) {
+            uint64_t *tf = sched_task_trap_frame(tasks[i]);
             tf[0] = (uint64_t)-1;
-            sched_clear_ipc_state(&tasks[i]);
-            sched_make_ready(&tasks[i]);
+            sched_clear_ipc_state(tasks[i]);
+            sched_make_ready(tasks[i]);
         }
     }
 }
@@ -1399,9 +1548,10 @@ static termination_record_t *find_termination_record(uint32_t parent_tid, uint32
 
 static int has_live_child(uint32_t parent_tid, uint32_t tid) {
     for (uint32_t i = 0; i < task_capacity; i++) {
-        if (tasks[i].state != TASK_STATE_FREE &&
-            tasks[i].parent_tid == parent_tid &&
-            (tid == 0 || tasks[i].tid == tid)) {
+        if (tasks[i]->state != TASK_STATE_FREE &&
+            tasks[i]->state != TASK_STATE_DEAD &&
+            tasks[i]->parent_tid == parent_tid &&
+            (tid == 0 || tasks[i]->tid == tid)) {
             return 1;
         }
     }
@@ -1410,14 +1560,14 @@ static int has_live_child(uint32_t parent_tid, uint32_t tid) {
 
 static void wake_waiting_parent(termination_record_t *record) {
     for (uint32_t i = 0; i < task_capacity; i++) {
-        if (tasks[i].state == TASK_STATE_BLOCKED_ON_WAIT &&
-            tasks[i].tid == record->parent_tid &&
-            (tasks[i].wait_target_tid == 0 || tasks[i].wait_target_tid == record->tid)) {
-            uint64_t *tf = sched_task_trap_frame(&tasks[i]);
+        if (tasks[i]->state == TASK_STATE_BLOCKED_ON_WAIT &&
+            tasks[i]->tid == record->parent_tid &&
+            (tasks[i]->wait_target_tid == 0 || tasks[i]->wait_target_tid == record->tid)) {
+            uint64_t *tf = sched_task_trap_frame(tasks[i]);
             write_wait_result(tf, record);
-            tasks[i].wait_target_tid = 0;
+            tasks[i]->wait_target_tid = 0;
             clear_termination_record(record);
-            sched_make_ready(&tasks[i]);
+            sched_make_ready(tasks[i]);
             return;
         }
     }
@@ -1461,7 +1611,10 @@ static void record_task_termination(tcb_t *task, uint32_t reason, int exit_code,
 }
 
 static void destroy_task(tcb_t *task) {
-    if (!task || task->state == TASK_STATE_FREE || task->tid == 0) return;
+    if (!task || task->state == TASK_STATE_FREE ||
+        task->state == TASK_STATE_DEAD || task->tid == 0) {
+        return;
+    }
 
     ready_remove(task);
     timer_remove(task);
@@ -1478,14 +1631,14 @@ static void destroy_task(tcb_t *task) {
     vma_destroy(&task->vm);
     release_user_asid(task->asid);
 
-    task->tid = 0;
-    task->state = TASK_STATE_FREE;
+    task->state = TASK_STATE_DEAD;
     task->pgd = NULL;
     task->asid = 0;
     task->reserved_asid_padding = 0;
     task->sp = 0;
     task->sp_el0 = 0;
     task->priority = 0;
+    task->kill_requested = 0;
     task->base_priority = 0;
     task->quantum = 0;
     task->ticks_remaining = 0;
@@ -1505,6 +1658,7 @@ static void destroy_task(tcb_t *task) {
     task->user_shared_pointer = 0;
     clear_caps(task);
     release_cap_table(task);
+    sched_task_put(task);
 }
 
 extern void cpu_switch_to_dead(tcb_t *next);
@@ -1513,6 +1667,8 @@ extern void cpu_switch_to(tcb_t *prev, tcb_t *next);
 static void switch_to_task_address_space(tcb_t *task) {
     if (task->pgd != NULL) {
         __asm__ volatile("msr sp_el0, %0" : : "r"(task->sp_el0));
+        smp_asid_activate(task->asid);
+        __asm__ volatile("dsb ishst" : : : "memory");
         __asm__ volatile("msr ttbr0_el1, %0" : : "r"(make_ttbr0(task->pgd, task->asid)));
     } else {
         __asm__ volatile("msr ttbr0_el1, %0" : : "r"(make_ttbr0(l1_table, 0)));
@@ -1526,38 +1682,57 @@ static void reset_to_kernel_address_space(void) {
     __asm__ volatile("isb");
 }
 
-static void global_priority_boost(void) {
-    for (uint32_t core_id = 0; core_id < MAX_SCHED_CORES; core_id++) {
-        sched_cores[core_id].ready_bitmap = 0;
-        sched_cores[core_id].ready_count = 0;
-        for (uint32_t i = 0; i < SCHED_LEVELS; i++) {
-            sched_cores[core_id].queues[i] = NULL;
-        }
-    }
-
-    for (uint32_t i = 0; i < task_capacity; i++) {
-        if (tasks[i].state == TASK_STATE_FREE) {
+static void priority_boost_current_core(void) {
+    sched_core_t *core = sched_current_core();
+    tcb_t *boosted_head = NULL;
+    spin_lock(&core->lock);
+    for (uint32_t level = 0; level < SCHED_LEVELS; level++) {
+        tcb_t *head = core->queues[level];
+        core->queues[level] = NULL;
+        if (!head) {
             continue;
         }
-        ready_queue_reset_task(&tasks[i]);
-        if (tasks[i].state == TASK_STATE_READY && tasks[i].tid != 0) {
-            tasks[i].priority = 0;
-            tasks[i].quantum = quantum_for_priority(0);
-            tasks[i].ticks_remaining = tasks[i].quantum;
-            tasks[i].wait_time = 0;
-            ready_enqueue_tail_on_core(sched_core_for_task(&tasks[i]), &tasks[i]);
-        }
-    }
 
-    for (uint32_t core_id = 0; core_id < MAX_SCHED_CORES; core_id++) {
-        tcb_t *running = sched_cores[core_id].running_task;
-        if (running && running->tid != 0 && running->state == TASK_STATE_RUNNING) {
-            running->priority = 0;
-            running->quantum = quantum_for_priority(0);
-            running->ticks_remaining = running->quantum;
-            running->wait_time = 0;
-        }
+        tcb_t *task = head;
+        do {
+            tcb_t *next = task->sched_next;
+            task->priority = 0;
+            task->quantum = quantum_for_priority(0);
+            task->ticks_remaining = task->quantum;
+            task->wait_time = 0;
+
+            if (!boosted_head) {
+                boosted_head = task;
+                task->sched_next = task;
+                task->sched_prev = task;
+            } else {
+                tcb_t *tail = boosted_head->sched_prev;
+                tail->sched_next = task;
+                task->sched_prev = tail;
+                task->sched_next = boosted_head;
+                boosted_head->sched_prev = task;
+            }
+            task = next;
+        } while (task != head);
     }
+    core->queues[0] = boosted_head;
+    core->ready_bitmap = boosted_head ? ready_bit(0) : 0;
+    tcb_t *running = core->running_task;
+    if (running && running->tid != 0 && running->state == TASK_STATE_RUNNING) {
+        running->priority = 0;
+        running->quantum = quantum_for_priority(0);
+        running->ticks_remaining = running->quantum;
+        running->wait_time = 0;
+    }
+    spin_unlock(&core->lock);
+}
+
+static tcb_t *ready_pop_or_steal(void) {
+    tcb_t *task = ready_pop_highest();
+    if (!task && ready_steal_for_current_core()) {
+        task = ready_pop_highest();
+    }
+    return task;
 }
 
 static void schedule_next(void) {
@@ -1568,9 +1743,9 @@ static void schedule_next(void) {
         return;
     }
 
-    tcb_t *target = ready_pop_highest();
+    tcb_t *target = ready_pop_or_steal();
     if (!target) {
-        target = core->idle_task ? core->idle_task : &tasks[0];
+        target = core->idle_task ? core->idle_task : tasks[0];
     }
 
     int target_idx = task_index_from_ptr(target);
@@ -1632,15 +1807,15 @@ void sched_reschedule(void) {
 
 static __attribute__((noreturn)) void switch_to_next_after_current_destroyed(void) {
     sched_core_t *core = sched_current_core();
-    tcb_t *target = ready_pop_highest();
+    tcb_t *target = ready_pop_or_steal();
     if (!target) {
-        target = core->idle_task ? core->idle_task : &tasks[0];
+        target = core->idle_task ? core->idle_task : tasks[0];
     }
 
     int target_idx = task_index_from_ptr(target);
     if (target_idx < 0 && target != core->idle_task) {
         target_idx = 0;
-        target = &tasks[0];
+        target = tasks[0];
     }
     sched_set_current(core, target, target_idx);
     current_task->state = TASK_STATE_RUNNING;
@@ -1671,12 +1846,72 @@ static __attribute__((noreturn)) void terminate_current_task(uint32_t reason, in
     switch_to_next_after_current_destroyed();
 }
 
+static int sched_take_kill_request(tcb_t *task) {
+    int requested = 0;
+    sched_task_lock(task);
+    if (task && task->kill_requested) {
+        task->kill_requested = 0;
+        requested = 1;
+    }
+    sched_task_unlock(task);
+    return requested;
+}
+
+static void sched_request_remote_kill(tcb_t *target) {
+    sched_task_lock(target);
+    if (target) {
+        target->kill_requested = 1;
+    }
+    sched_task_unlock(target);
+
+    for (uint32_t core_id = 0; core_id < MAX_SCHED_CORES; core_id++) {
+        sched_remote_reschedule(core_id);
+    }
+}
+
+static void sched_terminate_if_kill_requested(void) {
+    if (current_task && sched_take_kill_request(current_task)) {
+        terminate_current_task(TASK_TERM_KILLED, -1, 0, 0, 0);
+    }
+}
+
+static void sched_process_owner_kills(void) {
+    sched_core_t *core = sched_current_core();
+    uint32_t capacity = task_capacity;
+
+    for (uint32_t i = 0; i < capacity; i++) {
+        tcb_t *task = tasks[i];
+        if (!task || task == core->running_task ||
+            task->sched_core_id != core->core_id) {
+            continue;
+        }
+
+        int destroy = 0;
+        sched_task_lock(task);
+        if (task->kill_requested &&
+            task->state != TASK_STATE_FREE &&
+            task->state != TASK_STATE_DEAD &&
+            task->state != TASK_STATE_RUNNING) {
+            task->kill_requested = 0;
+            destroy = 1;
+        }
+        sched_task_unlock(task);
+
+        if (destroy) {
+            record_task_termination(task, TASK_TERM_KILLED, -1, 0, 0, 0);
+            destroy_task(task);
+        }
+    }
+}
+
 static void init_idle_task(tcb_t *idle, uint32_t core_id) {
     if (!idle) {
         return;
     }
+    idle->lock.value = 0;
     idle->tid = 0;
     idle->state = TASK_STATE_RUNNING;
+    idle->refcount = 1;
     idle->priority = SCHED_LEVELS - 1;
     idle->base_priority = SCHED_LEVELS - 1;
     idle->quantum = quantum_for_priority(idle->priority);
@@ -1712,33 +1947,35 @@ void sched_init(void) {
     }
 
     memcap_init();
-    tasks[0].tid = 0;
-    tasks[0].state = TASK_STATE_RUNNING;
-    tasks[0].priority = SCHED_LEVELS - 1;
-    tasks[0].base_priority = SCHED_LEVELS - 1;
-    tasks[0].quantum = quantum_for_priority(tasks[0].priority);
-    tasks[0].ticks_remaining = tasks[0].quantum;
-    tasks[0].wait_time = 0;
-    tasks[0].sleep_ticks_remaining = 0;
-    tasks[0].sched_core_id = 0;
-    ready_queue_reset_task(&tasks[0]);
-    timer_queue_reset_task(&tasks[0]);
-    tasks[0].ipc_target_tid = 0;
-    sched_clear_ipc_state(&tasks[0]);
-    vfs_clear_task_state(&tasks[0]);
-    tasks[0].awaiting_irq = 0;
-    tasks[0].parent_tid = 0;
-    tasks[0].wait_target_tid = 0;
-    tasks[0].pgd = NULL;
-    tasks[0].asid = 0;
-    tasks[0].reserved_asid_padding = 0;
-    tasks[0].sp_el0 = 0;
-    tasks[0].user_heap_pointer = 0;
-    tasks[0].user_shared_pointer = 0;
-    clear_caps(&tasks[0]);
+    tasks[0]->lock.value = 0;
+    tasks[0]->tid = 0;
+    tasks[0]->state = TASK_STATE_RUNNING;
+    tasks[0]->refcount = 1;
+    tasks[0]->priority = SCHED_LEVELS - 1;
+    tasks[0]->base_priority = SCHED_LEVELS - 1;
+    tasks[0]->quantum = quantum_for_priority(tasks[0]->priority);
+    tasks[0]->ticks_remaining = tasks[0]->quantum;
+    tasks[0]->wait_time = 0;
+    tasks[0]->sleep_ticks_remaining = 0;
+    tasks[0]->sched_core_id = 0;
+    ready_queue_reset_task(tasks[0]);
+    timer_queue_reset_task(tasks[0]);
+    tasks[0]->ipc_target_tid = 0;
+    sched_clear_ipc_state(tasks[0]);
+    vfs_clear_task_state(tasks[0]);
+    tasks[0]->awaiting_irq = 0;
+    tasks[0]->parent_tid = 0;
+    tasks[0]->wait_target_tid = 0;
+    tasks[0]->pgd = NULL;
+    tasks[0]->asid = 0;
+    tasks[0]->reserved_asid_padding = 0;
+    tasks[0]->sp_el0 = 0;
+    tasks[0]->user_heap_pointer = 0;
+    tasks[0]->user_shared_pointer = 0;
+    clear_caps(tasks[0]);
 
-    sched_cores[0].idle_task = &tasks[0];
-    sched_set_current(&sched_cores[0], &tasks[0], 0);
+    sched_cores[0].idle_task = tasks[0];
+    sched_set_current(&sched_cores[0], tasks[0], 0);
 
     LOG_OK_HEX("SCHED: Scheduler Initialized. Online cores: ", sched_online_cores);
 }
@@ -1767,6 +2004,8 @@ uint32_t sched_online_core_count(void) {
 void sched_handle_reschedule_ipi(void) {
     sched_core_t *core = sched_current_core();
     core->reschedule_pending = 0;
+    sched_terminate_if_kill_requested();
+    sched_process_owner_kills();
     sched_reschedule();
 }
 
@@ -1777,7 +2016,7 @@ int sched_create_task(void (*entry_point)(void), uint8_t priority) {
         return -1;
     }
 
-    tcb_t *tcb = &tasks[idx];
+    tcb_t *tcb = tasks[idx];
     tcb->kernel_stack_base = kmalloc(TASK_STACK_SIZE);
     if (!tcb->kernel_stack_base) {
         LOG_FAIL("SCHED: Failed to allocate stack for new task.");
@@ -1805,12 +2044,14 @@ int sched_create_task(void (*entry_point)(void), uint8_t priority) {
 
     tcb->tid = next_tid++;
     tcb->state = TASK_STATE_FREE;
+    tcb->refcount = 1;
     tcb->priority = normalize_priority(priority);
     tcb->base_priority = tcb->priority;
     tcb->quantum = quantum_for_priority(tcb->priority);
     tcb->ticks_remaining = tcb->quantum;
     tcb->wait_time = 0;
     tcb->sleep_ticks_remaining = 0;
+    tcb->kill_requested = 0;
     ready_queue_reset_task(tcb);
     timer_queue_reset_task(tcb);
     sched_clear_ipc_state(tcb);
@@ -1839,19 +2080,22 @@ int sched_create_task(void (*entry_point)(void), uint8_t priority) {
 }
 
 static int create_user_task_with_file_cap(const uint8_t *elf_data, uint64_t elf_size,
-                                          uint8_t priority, uint32_t file_cap) {
+                                          uint8_t priority, uint32_t file_cap,
+                                          uint32_t parent_tid) {
     int idx = find_free_task_slot(1);
     if (idx == -1) {
         LOG_FAIL("SCHED: Cannot create user task, task table growth failed.");
         return -1;
     }
 
-    tcb_t *tcb = &tasks[idx];
+    tcb_t *tcb = tasks[idx];
     tcb->tid = 0;
     tcb->state = TASK_STATE_FREE;
+    tcb->refcount = 1;
     tcb->pgd = NULL;
     if (allocate_user_asid(&tcb->asid) < 0) {
         LOG_FAIL("SCHED: Failed to allocate ASID for user task.");
+        tcb->refcount = 0;
         return -1;
     }
     tcb->reserved_asid_padding = 0;
@@ -1868,6 +2112,7 @@ static int create_user_task_with_file_cap(const uint8_t *elf_data, uint64_t elf_
         if (!tcb->kernel_stack_base) {
             release_user_asid(tcb->asid);
             tcb->asid = 0;
+            tcb->refcount = 0;
             return -1;
         }
     }
@@ -1899,13 +2144,14 @@ static int create_user_task_with_file_cap(const uint8_t *elf_data, uint64_t elf_
     tcb->ticks_remaining = tcb->quantum;
     tcb->wait_time = 0;
     tcb->sleep_ticks_remaining = 0;
+    tcb->kill_requested = 0;
     ready_queue_reset_task(tcb);
     timer_queue_reset_task(tcb);
     
     sched_clear_ipc_state(tcb);
     vfs_clear_task_state(tcb);
     tcb->awaiting_irq = 0;
-    tcb->parent_tid = 0;
+    tcb->parent_tid = parent_tid;
     tcb->wait_target_tid = 0;
     clear_caps(tcb);
     install_standard_caps(tcb);
@@ -1958,6 +2204,7 @@ fail:
     release_user_asid(tcb->asid);
     tcb->tid = 0;
     tcb->state = TASK_STATE_FREE;
+    tcb->refcount = 0;
     tcb->pgd = NULL;
     tcb->asid = 0;
     tcb->reserved_asid_padding = 0;
@@ -1974,12 +2221,13 @@ fail:
 }
 
 int sched_create_user_task(const uint8_t *elf_data, uint64_t elf_size, uint8_t priority) {
-    return create_user_task_with_file_cap(elf_data, elf_size, priority, 0);
+    return create_user_task_with_file_cap(elf_data, elf_size, priority, 0, 0);
 }
 
 int sched_create_user_task_from_file(const uint8_t *elf_data, uint64_t elf_size,
                                      uint8_t priority, uint32_t initrd_index) {
-    return create_user_task_with_file_cap(elf_data, elf_size, priority, initrd_index + 1);
+    return create_user_task_with_file_cap(elf_data, elf_size, priority,
+                                          initrd_index + 1, 0);
 }
 
 static int copy_vmas(vm_space_t *dst, const vm_space_t *src) {
@@ -2067,11 +2315,13 @@ int sched_fork_syscall(uint64_t *regs) {
         return -1;
     }
 
-    tcb_t *child = &tasks[idx];
+    tcb_t *child = tasks[idx];
     child->tid = 0;
     child->state = TASK_STATE_FREE;
+    child->refcount = 1;
     child->pgd = NULL;
     if (allocate_user_asid(&child->asid) < 0) {
+        child->refcount = 0;
         regs[0] = (uint64_t)-1;
         return -1;
     }
@@ -2087,6 +2337,7 @@ int sched_fork_syscall(uint64_t *regs) {
         if (!child->kernel_stack_base) {
             release_user_asid(child->asid);
             child->asid = 0;
+            child->refcount = 0;
             regs[0] = (uint64_t)-1;
             return -1;
         }
@@ -2095,6 +2346,7 @@ int sched_fork_syscall(uint64_t *regs) {
     if (vma_init(&child->vm) < 0) {
         release_user_asid(child->asid);
         child->asid = 0;
+        child->refcount = 0;
         regs[0] = (uint64_t)-1;
         return -1;
     }
@@ -2104,6 +2356,7 @@ int sched_fork_syscall(uint64_t *regs) {
         vma_destroy(&child->vm);
         release_user_asid(child->asid);
         child->asid = 0;
+        child->refcount = 0;
         regs[0] = (uint64_t)-1;
         return -1;
     }
@@ -2115,6 +2368,7 @@ int sched_fork_syscall(uint64_t *regs) {
         child->pgd = NULL;
         release_user_asid(child->asid);
         child->asid = 0;
+        child->refcount = 0;
         regs[0] = (uint64_t)-1;
         return -1;
     }
@@ -2147,6 +2401,7 @@ int sched_fork_syscall(uint64_t *regs) {
     child->ticks_remaining = child->quantum;
     child->wait_time = 0;
     child->sleep_ticks_remaining = 0;
+    child->kill_requested = 0;
     ready_queue_reset_task(child);
     timer_queue_reset_task(child);
     sched_clear_ipc_state(child);
@@ -2186,12 +2441,13 @@ void sched_tick(void) {
     sched_core_t *core = sched_current_core();
     current_task = core->running_task;
     if (current_task == NULL) return;
+    sched_terminate_if_kill_requested();
+    sched_process_owner_kills();
     core->total_ticks++;
     process_timer_wheel_bucket();
 
-    if (core->core_id == 0 &&
-        (core->total_ticks % SCHED_BOOST_INTERVAL) == 0) {
-        global_priority_boost();
+    if ((core->total_ticks % SCHED_BOOST_INTERVAL) == 0) {
+        priority_boost_current_core();
     }
 
     if (current_task->state != TASK_STATE_RUNNING) {
@@ -2212,9 +2468,6 @@ void sched_tick(void) {
         current_task->ticks_remaining = current_task->quantum;
         current_task->state = TASK_STATE_READY;
         current_task->wait_time = 0;
-        if (sched_task_can_balance(current_task)) {
-            current_task->sched_core_id = sched_select_ready_core()->core_id;
-        }
         ready_enqueue_tail(current_task);
         signal_remote_ready(current_task);
         schedule_next();
@@ -2222,9 +2475,6 @@ void sched_tick(void) {
                (current_task->tid == 0 || highest < current_task->priority)) {
         if (current_task->tid != 0) {
             current_task->state = TASK_STATE_READY;
-            if (sched_task_can_balance(current_task)) {
-                current_task->sched_core_id = sched_select_ready_core()->core_id;
-            }
             ready_enqueue_tail(current_task);
             signal_remote_ready(current_task);
         }
@@ -2235,13 +2485,11 @@ void sched_tick(void) {
 void sched_yield_syscall(void) {
     current_task = sched_current_core()->running_task;
     if (!current_task) return;
+    sched_terminate_if_kill_requested();
     if (current_task->tid != 0 && current_task->state == TASK_STATE_RUNNING) {
         current_task->ticks_remaining = quantum_for_priority(current_task->priority);
         current_task->quantum = current_task->ticks_remaining;
         current_task->state = TASK_STATE_READY;
-        if (sched_task_can_balance(current_task)) {
-            current_task->sched_core_id = sched_select_ready_core()->core_id;
-        }
         ready_enqueue_tail(current_task);
         signal_remote_ready(current_task);
     }
@@ -2447,7 +2695,8 @@ int sched_spawn_syscall(uint64_t *regs, uint64_t elf_data, uint64_t elf_size, ui
         return -1;
     }
 
-    int tid = sched_create_user_task((const uint8_t*)elf_data, elf_size, priority);
+    int tid = create_user_task_with_file_cap((const uint8_t*)elf_data, elf_size,
+                                             priority, 0, current_task->tid);
     if (tid >= 0) {
         tcb_t *child = get_tcb((uint32_t)tid);
         if (child) {
@@ -2485,7 +2734,8 @@ int sched_spawn_file_syscall(uint64_t *regs, uint64_t name_ptr, uint8_t priority
         return -1;
     }
 
-    int tid = sched_create_user_task_from_file(elf_data, elf_size, priority, initrd_index);
+    int tid = create_user_task_with_file_cap(elf_data, elf_size, priority,
+                                             initrd_index + 1, current_task->tid);
     if (tid >= 0) {
         tcb_t *child = get_tcb((uint32_t)tid);
         if (child) {
@@ -2586,29 +2836,36 @@ int sched_vfs_exec_create_syscall(uint64_t *regs, uint32_t client_tid,
         fs->vfs_active_client_tid != client_tid ||
         fs->vfs_active_id != VFS_ID_FS) {
         regs[0] = (uint64_t)-1;
+        if (client) {
+            sched_task_put(client);
+        }
         return -1;
     }
 
     if (user_range_readable(elf_data, (size_t)elf_size) < 0) {
         regs[0] = (uint64_t)-1;
+        sched_task_put(client);
         return -1;
     }
 
     uint64_t pages64 = (elf_size + PAGE_SIZE - 1) / PAGE_SIZE;
     if (pages64 == 0 || pages64 > UINT32_MAX) {
         regs[0] = (uint64_t)-1;
+        sched_task_put(client);
         return -1;
     }
 
     int object_id = find_free_vfs_exec_object();
     if (object_id < 0) {
         regs[0] = (uint64_t)-1;
+        sched_task_put(client);
         return -1;
     }
 
     uint8_t *copy = (uint8_t *)pmm_alloc_contiguous_pages(pages64);
     if (!copy) {
         regs[0] = (uint64_t)-1;
+        sched_task_put(client);
         return -1;
     }
 
@@ -2616,6 +2873,7 @@ int sched_vfs_exec_create_syscall(uint64_t *regs, uint32_t client_tid,
         copy[0] != 0x7f || copy[1] != 'E' || copy[2] != 'L' || copy[3] != 'F') {
         pmm_free_contiguous_pages(copy, pages64);
         regs[0] = (uint64_t)-1;
+        sched_task_put(client);
         return -1;
     }
 
@@ -2634,12 +2892,14 @@ int sched_vfs_exec_create_syscall(uint64_t *regs, uint32_t client_tid,
     if (cap_slot < 0) {
         clear_vfs_exec_object(object);
         regs[0] = (uint64_t)-1;
+        sched_task_put(client);
         return -1;
     }
 
     regs[0] = (uint64_t)cap_slot;
     regs[1] = (uint64_t)object_id;
     regs[2] = elf_size;
+    sched_task_put(client);
     return cap_slot;
 }
 
@@ -2665,7 +2925,8 @@ int sched_spawn_exec_syscall(uint64_t *regs, uint32_t exec_cap, uint8_t priority
         vfs_exec_object_t *object = &vfs_exec_objects[cap.object_id];
         elf_data = object->data;
         elf_size = object->size;
-        tid = sched_create_user_task(elf_data, elf_size, priority);
+        tid = create_user_task_with_file_cap(elf_data, elf_size, priority,
+                                             0, current_task->tid);
         if (tid >= 0) {
             apply_boot_device_grants(get_tcb((uint32_t)tid), object->boot_flags);
         }
@@ -2674,8 +2935,8 @@ int sched_spawn_exec_syscall(uint64_t *regs, uint32_t exec_cap, uint8_t priority
             if (regs) regs[0] = (uint64_t)-1;
             return -1;
         }
-        tid = sched_create_user_task_from_file(elf_data, elf_size, priority,
-                                               cap.object_id);
+        tid = create_user_task_with_file_cap(elf_data, elf_size, priority,
+                                             cap.object_id + 1, current_task->tid);
     }
 
     if (cap.flags & OCAP_FLAG_VFS_EXEC) {
@@ -2728,25 +2989,26 @@ void sched_await_irq_timeout_syscall(uint64_t *regs, uint32_t irq_num, uint64_t 
 
 void sched_wake_irq(uint32_t irq_num) {
     for (uint32_t i = 0; i < task_capacity; i++) {
-        if (tasks[i].state == TASK_STATE_BLOCKED_ON_IRQ && tasks[i].awaiting_irq == irq_num) {
-            uint64_t *tf = sched_task_trap_frame(&tasks[i]);
+        if (tasks[i]->state == TASK_STATE_BLOCKED_ON_IRQ && tasks[i]->awaiting_irq == irq_num) {
+            uint64_t *tf = sched_task_trap_frame(tasks[i]);
             tf[0] = 1;
-            timer_remove(&tasks[i]);
-            tasks[i].awaiting_irq = 0;
-            tasks[i].sleep_ticks_remaining = 0;
-            sched_make_ready(&tasks[i]);
+            timer_remove(tasks[i]);
+            tasks[i]->awaiting_irq = 0;
+            tasks[i]->sleep_ticks_remaining = 0;
+            sched_make_ready(tasks[i]);
         }
     }
 }
 
 void sched_ps_syscall(uint64_t *regs, uint32_t index) {
     if (!regs) return;
-    if (index >= task_capacity || tasks[index].state == TASK_STATE_FREE) {
+    if (index >= task_capacity || tasks[index]->state == TASK_STATE_FREE ||
+        tasks[index]->state == TASK_STATE_DEAD) {
         regs[0] = 0;
         return;
     }
 
-    tcb_t *task = &tasks[index];
+    tcb_t *task = tasks[index];
     regs[0] = 1;
     regs[1] = task->tid;
     regs[2] = task->state;
@@ -2844,7 +3106,7 @@ static int task_index_from_ptr(tcb_t *task) {
     }
 
     for (uint32_t i = 0; i < task_capacity; i++) {
-        if (&tasks[i] == task) {
+        if (tasks[i] == task) {
             return (int)i;
         }
     }
@@ -2860,6 +3122,12 @@ void sched_handoff_to_task(tcb_t *target) {
 
     int target_idx = task_index_from_ptr(target);
     if (target_idx < 0) {
+        return;
+    }
+
+    if (target->sched_core_id != core->core_id) {
+        signal_remote_ready(target);
+        sched_reschedule();
         return;
     }
 
@@ -2983,6 +3251,13 @@ int sched_kill_syscall(uint64_t *regs, uint32_t tid) {
 
     if (target == current_task) {
         terminate_current_task(TASK_TERM_KILLED, -1, 0, 0, 0);
+    }
+
+    if (target->sched_core_id != current_core_id() &&
+        target->sched_core_id < MAX_SCHED_CORES &&
+        sched_cores[target->sched_core_id].online) {
+        sched_request_remote_kill(target);
+        return 0;
     }
 
     record_task_termination(target, TASK_TERM_KILLED, -1, 0, 0, 0);

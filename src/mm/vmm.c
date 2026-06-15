@@ -4,6 +4,7 @@
 #include "frame.h"
 #include "uart.h"
 #include "log.h"
+#include "smp.h"
 
 // Pointer to the root page table (L1 for 39-bit VA space)
 extern uint64_t l1_table[512];
@@ -13,24 +14,19 @@ extern uint64_t high_l1_table[512];
 #define VMM_ASID_ALL 0xFFFFU
 
 void vmm_flush_va_asid(uint64_t va, uint16_t asid) {
-    uint64_t op = ((uint64_t)asid << 48) | ((va >> 12) & 0x00000FFFFFFFFFFFULL);
-    __asm__ volatile("tlbi vae1is, %0" : : "r"(op));
-    __asm__ volatile("dsb ish\n isb");
+    smp_tlb_shootdown_va_asid(va, asid);
 }
 
 static void vmm_flush_va_all_asids(uint64_t va) {
-    __asm__ volatile("tlbi vaae1is, %0" : : "r"(va >> 12));
-    __asm__ volatile("dsb ish\n isb");
+    smp_tlb_shootdown_va_all_asids(va);
 }
 
 void vmm_flush_asid(uint16_t asid) {
-    uint64_t op = (uint64_t)asid << 48;
-    __asm__ volatile("tlbi aside1is, %0" : : "r"(op));
-    __asm__ volatile("dsb ish\n isb");
+    smp_tlb_shootdown_asid(asid);
 }
 
 void vmm_flush_all(void) {
-    __asm__ volatile("tlbi vmalle1is\n dsb ish\n isb");
+    smp_tlb_shootdown_all();
 }
 
 void vmm_init(void) {

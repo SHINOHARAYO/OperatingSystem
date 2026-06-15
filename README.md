@@ -107,6 +107,10 @@ such as `/sbin/uart.elf`, `/sbin/keyboard.elf`, and `/bin/shell.elf`.
 - 39-bit lower-half virtual address layout.
 - 40-bit physical-address support.
 - ASID-aware user address spaces with targeted TLB invalidation.
+- Per-ASID CPU residency masks keep ordinary VA+ASID and ASID shootdowns
+  limited to cores that have actually executed that address space.
+- Cross-core TLB shootdown uses GIC SGIs with per-core acknowledgements for
+  VA+ASID, VA-all-ASID, ASID, and full invalidations.
 - ACPI/PCI discovery for the EL0 virtio block driver.
 
 ### Scheduler
@@ -118,13 +122,26 @@ such as `/sbin/uart.elf`, `/sbin/keyboard.elf`, and `/bin/shell.elf`.
 - Secondary cores are started with PSCI, get private stacks, initialize their
   GIC CPU interface and local timer, register as online scheduler cores, and
   enter the scheduler through per-core idle TCBs.
-- Bootstrap services stay on CPU0; normal shell child workloads may migrate to
-  secondary cores when they become ready or exhaust their quantum.
+- Bootstrap services and IPC/VFS-heavy tasks stay on CPU0; normal priority-0
+  user workloads can be placed on or stolen by secondary cores.
 - GICv2 SGI send support is present for IPI plumbing.
 - Per-core ready queues are protected by scheduler spinlocks.
 - Cross-core reschedule requests can be delivered through SGI/IPI.
+- ASID allocation and task lookup/growth have first-pass SMP locks.
+- Task slots are stable non-moving TCB allocations behind a growable pointer
+  table, so scheduler, IPC, and VFS task pointers survive task-capacity growth.
+- Public task lookup uses held references with deferred slot recycling, so
+  killed tasks are removed immediately but their TCB slot is not reused until
+  outstanding kernel references are released.
+- IPC endpoint queues and VFS service queues use endpoint-task locks so
+  enqueue/dequeue/block transitions are atomic enough for the current SMP
+  model.
 - Tasks carry a scheduler core id so ready/timer ownership survives task-table
-  growth and future migration.
+  growth and ready-task migration.
+- Idle cores use lock-ordered queue-transfer work stealing for eligible
+  `READY` user tasks. A stolen task remains visible on exactly one ready queue.
+- Remote kill requests are completed by the target task's owner core, avoiding
+  cross-core address-space teardown.
 - O(1) MLFQ with 32 circular ready queues.
 - Bitmap readiness tracking with native AArch64 `CLZ` selection.
 - Queue 0 is highest priority and maps to bitmap bit 31.
@@ -135,7 +152,8 @@ such as `/sbin/uart.elf`, `/sbin/keyboard.elf`, and `/bin/shell.elf`.
   - queues 16-23: 8 ms
   - queues 24-31: 16 ms
 - 1024-bucket timer wheel for sleep and IRQ timeout wakeups.
-- Global priority boost every 1000 ticks.
+- Per-core local priority boost every 1000 ticks avoids cross-core ready-queue
+  rebuilding while preventing starvation on each CPU.
 - Yield keeps priority; CPU-bound quantum exhaustion demotes.
 - Blocking on IPC, VFS, sleep, wait, IRQ, or fault does not demote.
 
@@ -332,7 +350,7 @@ Test and demo commands:
 | `filelazy` | Read a file page through the VFS page path |
 | `vmstress` | Stress VMA growth with file mappings |
 | `lazyexec` | Spawn `badptr.elf` through the VFS executable path |
-| `taskstress` | Grow the kernel task table |
+| `taskstress` | Stress repeated task spawn, kill, and reap |
 | `speed` | Benchmark syscalls, yield, faults, memory, and IPC |
 | `pong` | Run the IPC pong demo |
 | `fault` | Spawn a deliberate faulting task |
@@ -434,8 +452,17 @@ The `/sbin` service set contains `init.elf`, `uart.elf`, `keyboard.elf`,
 
 ## Known Limitations
 
-- Secondary cores can run normal EL0 workloads, but bootstrap services are
-  still deliberately pinned to CPU0 and there is no work stealing yet.
+- Secondary cores run and steal normal EL0 workloads, but IPC/VFS-heavy tasks
+  remain pinned to CPU0 until shared service handoff paths are fully
+  SMP-hardened.
+- Work stealing currently moves only eligible `READY` tasks. Running, blocked,
+  sleeping, timer-owned, and service tasks do not migrate yet.
+- TLB shootdowns use one request mailbox per target core. ASID residency keeps
+  contention low, but fully concurrent cross-core mapping mutation still needs
+  a serialized or generation-queued shootdown protocol.
+- Timer-wheel ownership, IPC/VFS queues, and remaining shared object tables
+  still need a complete IRQ-safe locking audit before arbitrary tasks can
+  migrate between cores.
 - The `/boot` seed still contains `init.elf`, `ns.elf`, `block.elf`, and
   `fs.elf` because those are needed before `storage.fat` can be mounted; the
   normal service copies, shell, apps, and boot policy live in `storage.fat`.
@@ -454,5 +481,7 @@ The `/sbin` service set contains `init.elf`, `uart.elf`, `keyboard.elf`,
 
 - Add IOMMU-style device domains and per-device DMA authority.
 - Add host-side automated QEMU smoke scripts with SMP assertions.
-- Add work stealing and broader SMP hardening around global kernel tables.
+- Extend migration to blocked/timer-owned tasks with explicit ownership
+  transfer, then evaluate service-task migration.
+- Add IRQ-safe locks and a concurrent TLB shootdown request protocol.
 - Replace fixed-size v1 object tables with growable or reclaiming allocators.

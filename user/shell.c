@@ -596,30 +596,55 @@ static void run_lazyexec_demo(void) {
 }
 
 static void run_taskstress_demo(void) {
-  uint32_t tids[32];
-  uint32_t spawned = 0;
+  enum { TASKSTRESS_ROUNDS = 4, TASKSTRESS_BATCH = 8 };
+  uint32_t tids[TASKSTRESS_BATCH];
+  uint32_t total_spawned = 0;
+  uint32_t total_killed = 0;
+  uint32_t timeouts = 0;
+  uint32_t start_capacity = sys_task_capacity();
 
-  for (uint32_t i = 0; i < 32; i++) {
-    uint32_t tid = spawn_program(SPIN_FILE, PONG_PRIORITY);
-    if ((int)tid < 0) {
-      break;
-    }
-    tids[spawned++] = tid;
-  }
-
-  uint32_t killed = 0;
-  for (uint32_t i = 0; i < spawned; i++) {
-    if (sys_kill(tids[i]) == 0) {
-      wait_info_t info = sys_wait(tids[i]);
-      if (info.reason == TASK_TERM_KILLED) {
-        killed++;
+  for (uint32_t round = 0; round < TASKSTRESS_ROUNDS; round++) {
+    uint32_t spawned = 0;
+    for (uint32_t i = 0; i < TASKSTRESS_BATCH; i++) {
+      uint32_t tid = spawn_program(SPIN_FILE, PONG_PRIORITY);
+      if ((int)tid < 0) {
+        break;
       }
+      tids[spawned++] = tid;
+      total_spawned++;
+      sys_yield();
+    }
+
+    for (uint32_t i = 0; i < spawned; i++) {
+      if (sys_kill(tids[i]) == 0) {
+        wait_info_t info = poll_until_done(tids[i], 200, 5);
+        if (info.status == WAIT_STATUS_DONE && info.reason == TASK_TERM_KILLED) {
+          info = sys_wait(tids[i]);
+          if (info.reason == TASK_TERM_KILLED) {
+            total_killed++;
+          }
+        } else {
+          timeouts++;
+        }
+      } else {
+        wait_info_t info = poll_until_done(tids[i], 50, 5);
+        if (info.status == WAIT_STATUS_DONE && info.reason == TASK_TERM_KILLED) {
+          sys_wait(tids[i]);
+          total_killed++;
+        }
+      }
+      sys_yield();
     }
   }
 
-  printf("taskstress: %s spawned=%u killed=%u capacity=%u\n",
-         spawned == 32 && killed == spawned ? "ok" : "failed",
-         spawned, killed, sys_task_capacity());
+  uint32_t end_capacity = sys_task_capacity();
+  int grew = end_capacity > start_capacity;
+  printf("taskstress: %s spawned=%u killed=%u timeouts=%u batches=%u capacity=%u->%u %s\n",
+         total_spawned == TASKSTRESS_ROUNDS * TASKSTRESS_BATCH &&
+             total_killed == total_spawned && timeouts == 0 ? "ok" : "failed",
+         total_spawned, total_killed, timeouts, TASKSTRESS_ROUNDS,
+         start_capacity, end_capacity,
+         grew ? "grown" : "reused");
 }
 
 static void print_wait_result(wait_info_t info) {
@@ -1541,7 +1566,7 @@ static const shell_command_t commands[] = {
   {"filelazy", "filelazy", "tests", "Read a file page through the VFS page path", cmd_filelazy},
   {"vmstress", "vmstress", "tests", "Stress VMA growth with file mappings", cmd_vmstress},
   {"lazyexec", "lazyexec", "tests", "Spawn badptr.elf through the VFS executable path", cmd_lazyexec},
-  {"taskstress", "taskstress", "tests", "Grow the kernel task table", cmd_taskstress},
+  {"taskstress", "taskstress", "tests", "Stress repeated task spawn, kill, and reap", cmd_taskstress},
   {"speed", "speed", "tests", "Benchmark syscalls, yield, faults, memory, and IPC", cmd_speed},
   {"pong", "pong", "tests", "Run the IPC pong demo", cmd_pong},
   {"fault", "fault", "tests", "Spawn a deliberate faulting task", cmd_fault},
@@ -1776,7 +1801,7 @@ static void cmd_spawn(int argc, char **argv, char *line) {
              (int)fault_tid, fault_tid);
     }
   } else if (_streq(argv[1], "spin")) {
-    uint32_t spin_tid = spawn_program(SPIN_FILE, PONG_PRIORITY);
+    uint32_t spin_tid = spawn_program(SPIN_FILE, 0);
     if ((int)spin_tid < 0) {
       printf("Error: Could not spawn spin task (task limit reached?)\n");
     } else {
@@ -2061,7 +2086,7 @@ static void print_demo_suites(void) {
   printf("  demo vfs      VFS call, injection, read, write, install, exec\n");
   printf("  demo ipc      Register IPC and cap transfer\n");
   printf("  demo mem      Share, transfer, cap lifetime, revoke, unmap, COW\n");
-  printf("  demo proc     Fault isolation, stack growth, task table growth\n");
+  printf("  demo proc     Fault isolation, stack growth, task lifecycle stress\n");
   printf("  demo all      Run every suite above\n");
 }
 

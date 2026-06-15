@@ -26,31 +26,12 @@ static int endpoint_tid_from_cap(tcb_t *task, uint32_t cap) {
     }
 
     uint32_t tid = endpoint.object_id;
-    return sched_find_task(tid) ? (int)tid : -1;
-}
-
-static void enqueue_caller(tcb_t *endpoint, tcb_t *caller) {
-    caller->ipc_next = NULL;
-    if (endpoint->ipc_call_tail) {
-        endpoint->ipc_call_tail->ipc_next = caller;
-    } else {
-        endpoint->ipc_call_head = caller;
+    tcb_t *endpoint_task = sched_find_task(tid);
+    if (!endpoint_task) {
+        return -1;
     }
-    endpoint->ipc_call_tail = caller;
-}
-
-static tcb_t *dequeue_caller(tcb_t *endpoint) {
-    if (!endpoint || !endpoint->ipc_call_head) {
-        return NULL;
-    }
-
-    tcb_t *caller = endpoint->ipc_call_head;
-    endpoint->ipc_call_head = caller->ipc_next;
-    if (endpoint->ipc_call_tail == caller) {
-        endpoint->ipc_call_tail = NULL;
-    }
-    caller->ipc_next = NULL;
-    return caller;
+    sched_task_put(endpoint_task);
+    return (int)tid;
 }
 
 static int copy_cap_to_task(tcb_t *src, tcb_t *dst, uint32_t src_cap) {
@@ -171,6 +152,7 @@ int ipc_call_syscall(uint64_t *regs) {
     if ((flags & ~(IPC_FLAG_MEM | IPC_FLAG_CAP)) != 0 ||
         ((flags & IPC_FLAG_MEM) == 0 && len > IPC_INLINE_BYTES)) {
         regs[0] = (uint64_t)-1;
+        sched_task_put(receiver);
         return -1;
     }
 
@@ -181,26 +163,44 @@ int ipc_call_syscall(uint64_t *regs) {
         current->ipc_msg_payload[i] = regs[ipc_reg_index(i)];
     }
 
+    int direct_deliver = 0;
+    int delivered = 0;
+    spin_lock(&receiver->lock);
     if (receiver->state == TASK_STATE_BLOCKED_ON_IPC_RECV &&
         receiver->ipc_target_tid == (uint32_t)endpoint_tid) {
         uint64_t *recv_regs = sched_task_trap_frame(receiver);
-        int delivered = (flags == 0) ?
+        delivered = (flags == 0) ?
             deliver_fast_ipc_call(current, receiver, recv_regs, regs, len) :
             deliver_ipc_call(current, receiver, recv_regs);
+        direct_deliver = 1;
+    } else {
+        current->state = TASK_STATE_BLOCKED_ON_IPC_CALL;
+        current->ticks_remaining = 0;
+        current->ipc_next = NULL;
+        if (receiver->ipc_call_tail) {
+            receiver->ipc_call_tail->ipc_next = current;
+        } else {
+            receiver->ipc_call_head = current;
+        }
+        receiver->ipc_call_tail = current;
+    }
+    spin_unlock(&receiver->lock);
+
+    if (direct_deliver) {
         if (delivered < 0) {
             sched_clear_ipc_state(current);
             regs[0] = (uint64_t)-1;
+            sched_task_put(receiver);
             return -1;
         }
         sched_make_ready(receiver);
         sched_handoff_to_task(receiver);
+        sched_task_put(receiver);
         return 0;
     }
 
-    enqueue_caller(receiver, current);
-    current->state = TASK_STATE_BLOCKED_ON_IPC_CALL;
-    current->ticks_remaining = 0;
     sched_reschedule();
+    sched_task_put(receiver);
     return (int)regs[0];
 }
 
@@ -216,7 +216,21 @@ void ipc_recv_syscall(uint64_t *regs) {
         return;
     }
 
-    tcb_t *caller = dequeue_caller(current);
+    spin_lock(&current->lock);
+    tcb_t *caller = current->ipc_call_head;
+    if (caller) {
+        current->ipc_call_head = caller->ipc_next;
+        if (current->ipc_call_tail == caller) {
+            current->ipc_call_tail = NULL;
+        }
+        caller->ipc_next = NULL;
+    } else {
+        current->state = TASK_STATE_BLOCKED_ON_IPC_RECV;
+        current->ipc_target_tid = current->tid;
+        current->ticks_remaining = 0;
+    }
+    spin_unlock(&current->lock);
+
     if (caller) {
         if (caller->state == TASK_STATE_BLOCKED_ON_IPC_CALL &&
             caller->ipc_target_tid == current->tid) {
@@ -233,9 +247,6 @@ void ipc_recv_syscall(uint64_t *regs) {
         return;
     }
 
-    current->state = TASK_STATE_BLOCKED_ON_IPC_RECV;
-    current->ipc_target_tid = current->tid;
-    current->ticks_remaining = 0;
     sched_reschedule();
 }
 
@@ -257,6 +268,9 @@ int ipc_reply_syscall(uint64_t *regs) {
     if (!caller || caller->state != TASK_STATE_BLOCKED_ON_IPC_REPLY) {
         ocap_revoke_slot(&current->caps, reply_cap);
         regs[0] = (uint64_t)-1;
+        if (caller) {
+            sched_task_put(caller);
+        }
         return -1;
     }
 
@@ -272,6 +286,7 @@ int ipc_reply_syscall(uint64_t *regs) {
         ((flags & IPC_FLAG_MEM) == 0 && len > IPC_REPLY_INLINE_WORDS * 8) ||
         (flags != 0 && prepare_ipc_payload(current, caller, flags, len, in, out) < 0)) {
         regs[0] = (uint64_t)-1;
+        sched_task_put(caller);
         return -1;
     }
 
@@ -295,5 +310,6 @@ int ipc_reply_syscall(uint64_t *regs) {
     sched_make_ready(caller);
     regs[0] = 0;
     sched_handoff_to_task(caller);
+    sched_task_put(caller);
     return 0;
 }

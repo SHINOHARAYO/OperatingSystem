@@ -398,6 +398,9 @@ static void unmap_mem_object_source_if_present(const mem_object_t *obj,
 
     tcb_t *owner = sched_find_task(obj->owner_tid);
     if (!owner || !owner->pgd) {
+        if (owner) {
+            sched_task_put(owner);
+        }
         return;
     }
 
@@ -407,11 +410,13 @@ static void unmap_mem_object_source_if_present(const mem_object_t *obj,
         vma_t *vma = vma_find(&owner->vm, va);
         if (!vma || va < vma->start || va >= vma->end ||
             !(vma->flags & VMA_USER) || (vma->flags & VMA_GUARD)) {
+            sched_task_put(owner);
             return;
         }
     }
 
     (void)vm_unmap_range(owner, start, size);
+    sched_task_put(owner);
 }
 
 static int cap_to_mem_object(tcb_t *task, uint32_t mem_cap,
@@ -454,6 +459,9 @@ static void revoke_mappings_for_object(uint32_t object_id) {
         tcb_t *target = sched_find_task(mapping->target_tid);
         if (target && target->pgd) {
             vm_unmap_range(target, mapping->dst_va, mapping->size);
+        }
+        if (target) {
+            sched_task_put(target);
         }
         clear_mem_mapping(mapping);
     }
@@ -617,6 +625,9 @@ int memcap_share_syscall(uint64_t *regs, uint32_t target_tid,
     if (!target || choose_import_destination(target, obj->size, dst_hint, &dst_va) < 0 ||
         map_mem_object_range(target, obj, 0, dst_va, obj->size, cap_rights) < 0) {
         regs[0] = 0;
+        if (target) {
+            sched_task_put(target);
+        }
         return -1;
     }
 
@@ -624,10 +635,12 @@ int memcap_share_syscall(uint64_t *regs, uint32_t target_tid,
                            obj->size, MEM_MAPPING_SHARE) < 0) {
         vm_unmap_range(target, dst_va, obj->size);
         regs[0] = 0;
+        sched_task_put(target);
         return -1;
     }
 
     regs[0] = dst_va;
+    sched_task_put(target);
     return 0;
 }
 
@@ -652,12 +665,16 @@ int memcap_transfer_syscall(uint64_t *regs, uint32_t target_tid,
     if (!target || choose_import_destination(target, obj->size, dst_hint, &dst_va) < 0 ||
         map_mem_object_range(target, obj, 0, dst_va, obj->size, cap_rights) < 0) {
         regs[0] = 0;
+        if (target) {
+            sched_task_put(target);
+        }
         return -1;
     }
 
     unmap_mem_object_source_if_present(obj, 0, obj->size);
     ocap_revoke_slot(&current->caps, mem_cap);
     regs[0] = dst_va;
+    sched_task_put(target);
     return 0;
 }
 
@@ -683,6 +700,9 @@ int memcap_lend_syscall(uint64_t *regs, uint32_t target_tid,
     if (!target || choose_import_destination(target, obj->size, dst_hint, &dst_va) < 0 ||
         map_mem_object_range(target, obj, 0, dst_va, obj->size, cap_rights) < 0) {
         regs[0] = 0;
+        if (target) {
+            sched_task_put(target);
+        }
         return -1;
     }
 
@@ -690,10 +710,12 @@ int memcap_lend_syscall(uint64_t *regs, uint32_t target_tid,
                            obj->size, MEM_MAPPING_LEND) < 0) {
         vm_unmap_range(target, dst_va, obj->size);
         regs[0] = 0;
+        sched_task_put(target);
         return -1;
     }
 
     regs[0] = dst_va;
+    sched_task_put(target);
     return 0;
 }
 
