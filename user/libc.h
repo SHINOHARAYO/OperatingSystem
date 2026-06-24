@@ -31,10 +31,10 @@ int isalnum(int c);
 int tolower(int c);
 int toupper(int c);
 
-void printf(const char *fmt, ...);
+int printf(const char *fmt, ...);
 int snprintf(char *buf, size_t size, const char *fmt, ...);
 int vsnprintf(char *buf, size_t size, const char *fmt, __builtin_va_list args);
-void puts(const char *s);
+int puts(const char *s);
 
 void *malloc(size_t size);
 void *calloc(size_t count, size_t size);

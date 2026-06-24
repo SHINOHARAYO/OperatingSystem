@@ -19,6 +19,8 @@ extern FILE *stdin;
 extern FILE *stdout;
 extern FILE *stderr;
 
+int printf(const char *fmt, ...);
+int puts(const char *s);
 FILE *fopen(const char *path, const char *mode);
 int fclose(FILE *stream);
 size_t fread(void *ptr, size_t size, size_t count, FILE *stream);

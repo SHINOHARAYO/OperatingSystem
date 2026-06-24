@@ -474,22 +474,29 @@ int atoi(const char *s) {
     return value * sign;
 }
 
-void puts(const char *s) {
+int puts(const char *s) {
+    if (!s) {
+        s = "(null)";
+    }
     int len = 0;
     while (s[len]) len++;
     if (len) _flush_buf(s, len);
+    _flush_buf("\n", 1);
+    return len + 1;
 }
 
-void printf(const char *fmt, ...) {
+int printf(const char *fmt, ...) {
     va_list args;
     va_start(args, fmt);
 
     char buf[256];
     int pos = 0;
+    int written = 0;
 
     for (const char *p = fmt; *p; p++) {
         if (*p != '%') {
             _put(buf, &pos, *p);
+            written++;
             _maybe_flush(buf, &pos);
             continue;
         }
@@ -499,57 +506,81 @@ void printf(const char *fmt, ...) {
         switch (*p) {
             case 'd': {
                 int val = va_arg(args, int);
-                if (val < 0) { _put(buf, &pos, '-'); val = -val; }
-                _fmt_uint(buf, &pos, (uint64_t)(unsigned int)val, 10);
+                char text[32];
+                int count = snprintf(text, sizeof(text), "%d", val);
+                for (int i = 0; i < count; i++) _put(buf, &pos, text[i]);
+                written += count;
                 break;
             }
             case 'u': {
                 unsigned int val = va_arg(args, unsigned int);
-                _fmt_uint(buf, &pos, (uint64_t)val, 10);
+                char text[32];
+                int count = snprintf(text, sizeof(text), "%u", val);
+                for (int i = 0; i < count; i++) _put(buf, &pos, text[i]);
+                written += count;
                 break;
             }
             case 'x': {
                 unsigned int val = va_arg(args, unsigned int);
-                _fmt_uint(buf, &pos, (uint64_t)val, 16);
+                char text[32];
+                int count = snprintf(text, sizeof(text), "%x", val);
+                for (int i = 0; i < count; i++) _put(buf, &pos, text[i]);
+                written += count;
                 break;
             }
             case 'l': {
                 p++;
                 if (*p == 'u') {
                     uint64_t val = va_arg(args, uint64_t);
-                    _fmt_uint(buf, &pos, val, 10);
+                    char text[32];
+                    int count = snprintf(text, sizeof(text), "%lu", val);
+                    for (int i = 0; i < count; i++) _put(buf, &pos, text[i]);
+                    written += count;
                 } else if (*p == 'x') {
                     uint64_t val = va_arg(args, uint64_t);
-                    _fmt_uint(buf, &pos, val, 16);
+                    char text[32];
+                    int count = snprintf(text, sizeof(text), "%lx", val);
+                    for (int i = 0; i < count; i++) _put(buf, &pos, text[i]);
+                    written += count;
                 } else if (*p == 'd') {
                     int64_t val = va_arg(args, int64_t);
-                    if (val < 0) { _put(buf, &pos, '-'); val = -val; }
-                    _fmt_uint(buf, &pos, (uint64_t)val, 10);
+                    char text[32];
+                    int count = snprintf(text, sizeof(text), "%ld", val);
+                    for (int i = 0; i < count; i++) _put(buf, &pos, text[i]);
+                    written += count;
                 } else {
                     _put(buf, &pos, '%');
                     _put(buf, &pos, 'l');
                     _put(buf, &pos, *p);
+                    written += 3;
                 }
                 break;
             }
             case 's': {
                 const char *s = va_arg(args, const char *);
                 if (!s) s = "(null)";
-                while (*s) { _put(buf, &pos, *s++); _maybe_flush(buf, &pos); }
+                while (*s) {
+                    _put(buf, &pos, *s++);
+                    written++;
+                    _maybe_flush(buf, &pos);
+                }
                 break;
             }
             case 'c': {
                 char c = (char)va_arg(args, int);
                 _put(buf, &pos, c);
+                written++;
                 break;
             }
             case '%': {
                 _put(buf, &pos, '%');
+                written++;
                 break;
             }
             default: {
                 _put(buf, &pos, '%');
                 _put(buf, &pos, *p);
+                written += 2;
                 break;
             }
         }
@@ -558,6 +589,7 @@ void printf(const char *fmt, ...) {
 
     if (pos > 0) _flush_buf(buf, pos);
     va_end(args);
+    return written;
 }
 
 void __assert_fail(const char *expr, const char *file, int line) {

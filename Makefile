@@ -300,11 +300,12 @@ $(TCC_RUNTIME_DIR)/crt1.o: ports/tcc/runtime/crt1.S | $(TCC_RUNTIME_DIR)
 $(TCC_RUNTIME_DIR)/crti.o $(TCC_RUNTIME_DIR)/crtn.o: ports/tcc/runtime/empty.S | $(TCC_RUNTIME_DIR)
 	clang -target aarch64-linux-gnu -ffreestanding -c $< -o $@
 
-$(TCC_RUNTIME_DIR)/libc.a: user/lib.c user/fd.c user/malloc.c user/lib.h user/libc.h user/malloc.h | $(TCC_RUNTIME_DIR)
+$(TCC_RUNTIME_DIR)/libc.a: user/lib.c user/fd.c user/malloc.c ports/tcc/runtime/stdio.c user/lib.h user/libc.h user/malloc.h user/stdio.h user/stdlib.h | $(TCC_RUNTIME_DIR)
+	clang $(USER_CFLAGS) -c ports/tcc/runtime/stdio.c -o $(TCC_RUNTIME_DIR)/stdio.o
 	clang $(USER_CFLAGS) -c user/lib.c -o $(TCC_RUNTIME_DIR)/lib.o
 	clang $(USER_CFLAGS) -c user/fd.c -o $(TCC_RUNTIME_DIR)/fd.o
 	clang $(USER_CFLAGS) -c user/malloc.c -o $(TCC_RUNTIME_DIR)/malloc.o
-	ar rcs $@ $(TCC_RUNTIME_DIR)/lib.o $(TCC_RUNTIME_DIR)/fd.o $(TCC_RUNTIME_DIR)/malloc.o
+	ar rcs $@ $(TCC_RUNTIME_DIR)/stdio.o $(TCC_RUNTIME_DIR)/lib.o $(TCC_RUNTIME_DIR)/fd.o $(TCC_RUNTIME_DIR)/malloc.o
 
 $(TCC_RUNTIME_DIR)/libtcc1.a: | $(TCC_RUNTIME_DIR)
 	ar rcs $@
