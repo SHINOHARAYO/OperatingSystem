@@ -87,6 +87,12 @@ static block_meta_t *get_block_ptr(void *ptr) {
     return (block_meta_t *)ptr - 1;
 }
 
+static int blocks_are_adjacent(const block_meta_t *left,
+                               const block_meta_t *right) {
+    return (const uint8_t *)(left + 1) + left->size ==
+           (const uint8_t *)right;
+}
+
 void *calloc(size_t count, size_t size) {
     if (count != 0 && size > ((size_t)-1) / count) {
         return 0;
@@ -130,7 +136,8 @@ void free(void *ptr) {
     block_ptr->free = 1;
     block_meta_t *current = global_base;
     while (current != 0 && current->next != 0) {
-        if (current->free && current->next->free) {
+        if (current->free && current->next->free &&
+            blocks_are_adjacent(current, current->next)) {
             current->size += META_SIZE + current->next->size;
             current->next = current->next->next;
         } else {

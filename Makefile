@@ -15,6 +15,7 @@ QEMU_SMP ?= 4
 QEMU_CPU ?= cortex-a57
 QEMU_WIN_CPU ?= host
 LOG_LEVEL ?= 1
+APP_STORAGE_MB ?= 8
 
 CC = clang
 LD = lld-link
@@ -169,7 +170,7 @@ $(BUILD)/fs.elf: user/fs.c user/fat_diskio.c user/fat_diskio.h user/fat_unicode.
 
 $(BUILD)/apps.fat: user_apps $(BOOT_MANIFEST) $(TCC_SDK_HEADERS) $(TCC_RUNTIME_LIBS) user/sys/time.h | $(BUILD)
 	rm -f $(BUILD)/apps.fat
-	dd if=/dev/zero of=$(BUILD)/apps.fat bs=1M count=4
+	dd if=/dev/zero of=$(BUILD)/apps.fat bs=1M count=$(APP_STORAGE_MB)
 	mkfs.fat -F 12 $(BUILD)/apps.fat
 	mmd -i $(BUILD)/apps.fat ::/bin
 	mmd -i $(BUILD)/apps.fat ::/sbin
@@ -305,6 +306,7 @@ $(TCC_RUNTIME_DIR)/libc.a: user/lib.c user/fd.c user/malloc.c ports/tcc/runtime/
 	clang $(USER_CFLAGS) -c user/lib.c -o $(TCC_RUNTIME_DIR)/lib.o
 	clang $(USER_CFLAGS) -c user/fd.c -o $(TCC_RUNTIME_DIR)/fd.o
 	clang $(USER_CFLAGS) -c user/malloc.c -o $(TCC_RUNTIME_DIR)/malloc.o
+	rm -f $@
 	ar rcs $@ $(TCC_RUNTIME_DIR)/stdio.o $(TCC_RUNTIME_DIR)/lib.o $(TCC_RUNTIME_DIR)/fd.o $(TCC_RUNTIME_DIR)/malloc.o
 
 $(TCC_RUNTIME_DIR)/libtcc1.a: | $(TCC_RUNTIME_DIR)

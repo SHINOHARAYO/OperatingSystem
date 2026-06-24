@@ -27,6 +27,18 @@ Windows QEMU smoke tests have verified `tcc -v`, `tcc -c t.c`, and the full
 creates a statically linked AArch64 ELF executable through Neptune's writable
 VFS path.
 
+`tests/runtime_smoke.c` is the integration test for guest-built executables.
+It verifies `argc`/`argv`, `snprintf`, `malloc`/`realloc`/`calloc`,
+`fprintf`/`fflush`, and `open`/`read`/`write`/`close`. Run it as:
+
+```text
+tcc runtime_smoke.c -o runtime_smoke.elf
+run runtime_smoke.elf alpha beta
+```
+
+`tests/runtime_exit.c` verifies that a `main` return value becomes the task
+exit status.
+
 The app disk now installs a compact target SDK under `/tcc/include`. It
 contains Neptune's current `stdio`, `stdlib`, `string`, file, time, and error
 headers, plus `stdint.h`, `stddef.h`, `stdbool.h`, `ctype.h`, and TinyCC's
@@ -36,10 +48,11 @@ those headers into an AArch64 ELF relocatable object.
 ## Port Boundary
 
 The current target is an AArch64 ELF command-line compiler that produces
-relocatable objects and static Neptune executables. A Neptune wrapper injects
-`-static` for executable links because the kernel intentionally has no
-dynamic ELF loader. `-c`, `-E`, `-r`, and `-shared` retain their normal TCC
-behavior.
+relocatable objects and static Neptune executables. Its runtime provides
+basic process startup, stream I/O, allocation, and VFS-backed file I/O. A
+Neptune wrapper injects `-static` for executable links because the kernel
+intentionally has no dynamic ELF loader. `-c`, `-E`, `-r`, and `-shared`
+retain their normal TCC behavior.
 
 In-process `-run`, dynamic loading, PE/Mach-O output, bounds-checking, full
 Linux ABI startup, and compiler builtin coverage are not enabled yet.
