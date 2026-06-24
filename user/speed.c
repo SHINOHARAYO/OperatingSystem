@@ -21,6 +21,7 @@ static uint64_t elapsed_ns_since(uint64_t start) {
 static void print_rate(const char *name, uint64_t ops, uint64_t ns, const char *unit) {
     if (ns == 0) {
         printf("%s: %lu %s in <1 us\n", name, ops, unit);
+        terminal_flush();
         return;
     }
 
@@ -28,6 +29,7 @@ static void print_rate(const char *name, uint64_t ops, uint64_t ns, const char *
     uint64_t ns_per_op = ops ? ns / ops : 0;
     printf("%s: %lu %s in %lu us = %lu %s/s (%lu ns/op)\n",
            name, ops, unit, ns / 1000, per_sec, unit, ns_per_op);
+    terminal_flush();
 }
 
 static void bench_cpu_loop(void) {
@@ -118,7 +120,11 @@ static void bench_memory(void) {
 
 
 static void bench_ipc(void) {
+#if NEPTUNE_PLATFORM_PI4
+    spawn_result_t helper = sys_spawn_file2(SPEEDIPC_FILE, 5);
+#else
     spawn_result_t helper = vfs_spawn_program(SPEEDIPC_FILE, 5);
+#endif
 
     if ((int)helper.tid < 0 || helper.endpoint_cap < 0) {
         printf("ipc-call: helper spawn failed\n");
@@ -161,6 +167,7 @@ static void bench_ipc(void) {
 void _start(void) {
     printf("speed: starting benchmark\n");
     printf("timer: generic counter nanoseconds\n");
+    terminal_flush();
 
     bench_cpu_loop();
     bench_syscall();
@@ -169,5 +176,6 @@ void _start(void) {
     bench_ipc();
 
     printf("speed: done\n");
+    terminal_flush();
     sys_exit(0);
 }

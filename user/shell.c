@@ -2,10 +2,14 @@
 #include "malloc.h"
 #include "fs_proto.h"
 #include "ns_proto.h"
+#include "display_proto.h"
+#include "compositor_proto.h"
+#include "keyboard_proto.h"
+#include "mouse_proto.h"
 
 #define MAX_CMD 256
 #define SHELL_HISTORY 32
-#define SHELL_PROMPT "Neptune> "
+#define SHELL_PROMPT "\x1b[92mNeptune>\x1b[0m "
 #define INITIAL_JOBS 16
 #define PONG_PRIORITY 50
 
@@ -21,6 +25,13 @@
 #define IPCCAP_FILE "ipccap.elf"
 #define IPCKILL_FILE "ipckill.elf"
 #define SPEED_FILE "speed.elf"
+#define SNAKE_FILE "snake.elf"
+#define GFXDEMO_FILE "gfxdemo.elf"
+#define GFXBENCH_FILE "gfxbench.elf"
+#define LIBCTEST_FILE "libctest.elf"
+#define ARGFDTEST_FILE "argfdtest.elf"
+#define PIPETEST_FILE "pipetest.elf"
+#define TCC_FILE "tcc.elf"
 #define PAGE_BYTES 4096ULL
 
 #define IPCKILL_SERVER_HOLD        1
@@ -43,9 +54,15 @@ static shell_job_t *jobs;
 static uint32_t job_capacity;
 static int keyboard_cap = -1;
 static int last_spawn_endpoint_cap = -1;
+static int graphical_terminal;
+static char pending_key_chars[3];
+static uint32_t pending_key_count;
+static uint32_t pending_key_index;
 
 static void print_wait_result(wait_info_t info);
 static uint32_t spawn_program(const char *name, uint8_t priority);
+static uint32_t spawn_program_args(const char *name, uint8_t priority,
+                                   char *const argv[], uint32_t argc);
 static wait_info_t poll_until_done(uint32_t tid, uint32_t attempts, uint64_t sleep_ms);
 static void run_vfstest_demo(void);
 static void run_vfsinject_demo(void);
@@ -1047,17 +1064,72 @@ static int get_keyboard_cap(void) {
 }
 
 static char read_console_char(void) {
-  (void)get_keyboard_cap();
-  ipc_msg_t key = sys_ipc_recv(CAP_SELF);
-  char c = (char)key.payload[0];
-  sys_ipc_reply(key.reply_cap, 0, 0, 0, 0);
-  return c;
+  if (graphical_terminal) {
+    char c = terminal_read_char();
+    if (c) {
+      return c;
+    }
+    graphical_terminal = 0;
+  }
+  if (pending_key_index < pending_key_count) {
+    return pending_key_chars[pending_key_index++];
+  }
+  pending_key_count = 0;
+  pending_key_index = 0;
+
+  while (1) {
+    uint64_t request[IPC_INLINE_WORDS] = {KEYBOARD_REQ_READ};
+    ipc_msg_t reply =
+        sys_ipc_call((uint32_t)get_keyboard_cap(), 0, 8, request);
+    if (reply.status < 0) {
+      sys_sleep(10);
+      continue;
+    }
+    uint64_t event = reply.payload[0];
+    if (KEYBOARD_EVENT_TYPE(event) != KEYBOARD_EVENT_KEY ||
+        (KEYBOARD_EVENT_VALUE(event) != KEYBOARD_KEY_PRESS &&
+         KEYBOARD_EVENT_VALUE(event) != KEYBOARD_KEY_REPEAT)) {
+      continue;
+    }
+    char c = KEYBOARD_EVENT_CHAR(event);
+    if (c) {
+      return c;
+    }
+    uint32_t code = (uint32_t)KEYBOARD_EVENT_CODE(event);
+    char suffix = 0;
+    if (code == 103) suffix = 'A';
+    else if (code == 108) suffix = 'B';
+    else if (code == 106) suffix = 'C';
+    else if (code == 105) suffix = 'D';
+    else if (code == 102) suffix = 'H';
+    else if (code == 107) suffix = 'F';
+    else if (code == 111) {
+      pending_key_chars[0] = '[';
+      pending_key_chars[1] = '3';
+      pending_key_chars[2] = '~';
+      pending_key_count = 3;
+      pending_key_index = 0;
+      return 27;
+    }
+    if (suffix) {
+      pending_key_chars[0] = '[';
+      pending_key_chars[1] = suffix;
+      pending_key_count = 2;
+      pending_key_index = 0;
+      return 27;
+    }
+  }
 }
 
 
 static uint32_t spawn_program(const char *name, uint8_t priority) {
+  return spawn_program_args(name, priority, 0, 0);
+}
+
+static uint32_t spawn_program_args(const char *name, uint8_t priority,
+                                   char *const argv[], uint32_t argc) {
   last_spawn_endpoint_cap = -1;
-  spawn_result_t spawned = vfs_spawn_program(name, priority);
+  spawn_result_t spawned = vfs_spawn_program_args(name, priority, argv, argc);
   if (spawned.tid != (uint32_t)-1) {
     last_spawn_endpoint_cap = spawned.endpoint_cap;
   }
@@ -1476,6 +1548,7 @@ static void cmd_rm(int argc, char **argv, char *line);
 static void cmd_mkdir(int argc, char **argv, char *line);
 static void cmd_mounts(int argc, char **argv, char *line);
 static void cmd_run(int argc, char **argv, char *line);
+static void cmd_runbg(int argc, char **argv, char *line);
 static void cmd_spawn(int argc, char **argv, char *line);
 static void cmd_ps(int argc, char **argv, char *line);
 static void cmd_jobs(int argc, char **argv, char *line);
@@ -1486,6 +1559,19 @@ static void cmd_mem(int argc, char **argv, char *line);
 static void cmd_vmmap(int argc, char **argv, char *line);
 static void cmd_capstat(int argc, char **argv, char *line);
 static void cmd_debug(int argc, char **argv, char *line);
+static void cmd_ipcstat(int argc, char **argv, char *line);
+static void cmd_termtest(int argc, char **argv, char *line);
+static void cmd_gfx(int argc, char **argv, char *line);
+static void cmd_gfxstat(int argc, char **argv, char *line);
+static void cmd_mouse(int argc, char **argv, char *line);
+static void cmd_desktop(int argc, char **argv, char *line);
+static void cmd_gfxdemo(int argc, char **argv, char *line);
+static void cmd_gfxbench(int argc, char **argv, char *line);
+static void cmd_snake(int argc, char **argv, char *line);
+static void cmd_libctest(int argc, char **argv, char *line);
+static void cmd_argfdtest(int argc, char **argv, char *line);
+static void cmd_pipetest(int argc, char **argv, char *line);
+static void cmd_tcc(int argc, char **argv, char *line);
 static void cmd_pong(int argc, char **argv, char *line);
 static void cmd_fault(int argc, char **argv, char *line);
 static void cmd_badptr(int argc, char **argv, char *line);
@@ -1534,7 +1620,8 @@ static const shell_command_t commands[] = {
   {"vfswrite", "vfswrite", "files", "Create and verify notes.txt through writable FatFs", cmd_vfswrite},
   {"vfsinstall", "vfsinstall", "files", "Copy and run an ELF from the writable FS", cmd_vfsinstall},
   {"vfsexec", "vfsexec", "files", "Resolve an executable through VFS, create an exec cap, and spawn it", cmd_vfsexec},
-  {"run", "run <file>", "files", "Spawn an ELF through a kernel-owned VFS exec object", cmd_run},
+  {"run", "run <file> [args...]", "files", "Run an ELF in the foreground with argv", cmd_run},
+  {"runbg", "runbg <file> [args...]", "files", "Spawn an ELF in the background with argv", cmd_runbg},
 
   {"ps", "ps", "process", "Show task scheduler state", cmd_ps},
   {"jobs", "jobs", "process", "Show shell child jobs", cmd_jobs},
@@ -1547,6 +1634,19 @@ static const shell_command_t commands[] = {
   {"vmmap", "vmmap", "diagnostics", "Show this task's VMA table", cmd_vmmap},
   {"capstat", "capstat", "diagnostics", "Show this task's capability slots", cmd_capstat},
   {"debug", "debug", "diagnostics", "Show kernel/runtime debug info", cmd_debug},
+  {"ipcstat", "ipcstat", "diagnostics", "Show IPC fast-path profile counters", cmd_ipcstat},
+  {"termtest", "termtest", "diagnostics", "Render terminal font, color, wrap, cursor, and scrollback test page", cmd_termtest},
+  {"gfx", "gfx", "diagnostics", "Query and redraw the graphical display", cmd_gfx},
+  {"gfxstat", "gfxstat [reset]", "diagnostics", "Show or reset compositor dirty-rect counters", cmd_gfxstat},
+  {"mouse", "mouse", "diagnostics", "Show mouse driver event counters", cmd_mouse},
+  {"desktop", "desktop", "diagnostics", "Draw capability-shared compositor surfaces", cmd_desktop},
+  {"gfxdemo", "gfxdemo", "diagnostics", "Run a bounded animated compositor stress demo", cmd_gfxdemo},
+  {"gfxbench", "gfxbench", "diagnostics", "Run bounded compositor/GPU benchmark and print counters", cmd_gfxbench},
+  {"snake", "snake", "diagnostics", "Play graphical Snake with WASD", cmd_snake},
+  {"libctest", "libctest", "tests", "Run Neptune libc regression checks", cmd_libctest},
+  {"argfdtest", "argfdtest", "tests", "Verify argv and libc file descriptors", cmd_argfdtest},
+  {"pipetest", "pipetest", "tests", "Verify kernel pipes, endpoint duplication, and EOF", cmd_pipetest},
+  {"tcc", "tcc [options...]", "development", "Run the native Tiny C Compiler", cmd_tcc},
 
   {"demo", "demo [quick|vfs|ipc|mem|proc|all]", "tests", "Run curated bounded demo suites", cmd_demo},
   {"smoke", "smoke", "tests", "Run bounded core regression checks", cmd_smoke},
@@ -1599,6 +1699,7 @@ static void print_grouped_help(void) {
   static const char *groups[] = {
     "core", "files", "process", "diagnostics", "ipc/memory", "tests"
   };
+  static const char spaces[] = "                        ";
 
   printf("Available commands:\n");
   for (uint32_t g = 0; g < sizeof(groups) / sizeof(groups[0]); g++) {
@@ -1608,7 +1709,7 @@ static void print_grouped_help(void) {
         printf("  %s", commands[i].usage);
         uint32_t len = 0;
         while (commands[i].usage[len]) len++;
-        while (len++ < 24) printf(" ");
+        puts(spaces + (len < 24 ? len : 24));
         printf("%s\n", commands[i].description);
       }
     }
@@ -1756,11 +1857,30 @@ static void cmd_mounts(int argc, char **argv, char *line) {
 
 static void cmd_run(int argc, char **argv, char *line) {
   (void)line;
-  if (argc != 2) {
+  if (argc < 2) {
     print_usage(find_command("run"));
     return;
   }
-  uint32_t tid = spawn_program(argv[1], PONG_PRIORITY);
+  uint32_t tid = spawn_program_args(argv[1], PONG_PRIORITY,
+                                    &argv[1], (uint32_t)(argc - 1));
+  if ((int)tid < 0) {
+    printf("Error: could not run '%s'\n", argv[1]);
+  } else {
+    wait_info_t result = sys_wait(tid);
+    if (result.reason != TASK_TERM_EXITED || result.exit_code != 0) {
+      print_wait_result(result);
+    }
+  }
+}
+
+static void cmd_runbg(int argc, char **argv, char *line) {
+  (void)line;
+  if (argc < 2) {
+    print_usage(find_command("runbg"));
+    return;
+  }
+  uint32_t tid = spawn_program_args(argv[1], PONG_PRIORITY,
+                                    &argv[1], (uint32_t)(argc - 1));
   if ((int)tid < 0) {
     printf("Error: could not run '%s'\n", argv[1]);
   } else {
@@ -1910,6 +2030,478 @@ static void cmd_capstat(int argc, char **argv, char *line) {
 static void cmd_debug(int argc, char **argv, char *line) {
   (void)argc; (void)argv; (void)line;
   print_debug_info();
+}
+
+static void cmd_ipcstat(int argc, char **argv, char *line) {
+  (void)argc; (void)argv; (void)line;
+  ipc_profile_t p = sys_ipc_profile();
+  uint64_t completed = p.replies ? p.replies : 1;
+  uint64_t direct = p.direct_calls ? p.direct_calls : 1;
+  uint64_t lookup_ticks = p.calls ? p.cap_lookup_cycles / p.calls : 0;
+  uint64_t roundtrip_ticks = p.total_roundtrip_cycles / completed;
+  uint64_t direct_ticks = p.direct_roundtrip_cycles / direct;
+  uint64_t hz = p.counter_hz ? p.counter_hz : 1;
+  printf("ipc: calls=%lu direct=%lu slow=%lu replies=%lu\n",
+         p.calls, p.direct_calls, p.slow_calls, p.replies);
+  printf("ipc: avg-cap-lookup=%lu ticks %lu ns\n",
+         lookup_ticks, lookup_ticks * 1000000000ULL / hz);
+  if (p.total_roundtrip_cycles != 0) {
+    printf("ipc: avg-roundtrip=%lu ticks %lu ns\n",
+           roundtrip_ticks, roundtrip_ticks * 1000000000ULL / hz);
+    printf("ipc: avg-direct-roundtrip=%lu ticks %lu ns\n",
+           direct_ticks, direct_ticks * 1000000000ULL / hz);
+  } else {
+    printf("ipc: cycle timing is disabled in the hot path\n");
+  }
+}
+
+static void print_color_sample(uint32_t color, const char *name) {
+  printf("\x1b[%um%s\x1b[0m ", 30 + color, name);
+}
+
+static void print_bright_color_sample(uint32_t color, const char *name) {
+  printf("\x1b[%um%s\x1b[0m ", 90 + color, name);
+}
+
+static void cmd_termtest(int argc, char **argv, char *line) {
+  (void)argc; (void)argv; (void)line;
+  printf("\x1b[2J\x1b[H");
+  printf("Neptune terminal visual test\n");
+  printf("============================\n\n");
+
+  printf("Font samples:\n");
+  printf("  ABCDEFGHIJKLMNOPQRSTUVWXYZ\n");
+  printf("  abcdefghijklmnopqrstuvwxyz\n");
+  printf("  0123456789\n");
+  printf("  !\"#$%%&'()*+,-./:;<=>?@[\\]^_`{|}~\n\n");
+
+  printf("ANSI colors:\n");
+  print_color_sample(0, "black");
+  print_color_sample(1, "red");
+  print_color_sample(2, "green");
+  print_color_sample(3, "yellow");
+  print_color_sample(4, "blue");
+  print_color_sample(5, "magenta");
+  print_color_sample(6, "cyan");
+  print_color_sample(7, "white");
+  printf("\n");
+  print_bright_color_sample(0, "gray");
+  print_bright_color_sample(1, "bright-red");
+  print_bright_color_sample(2, "bright-green");
+  print_bright_color_sample(3, "bright-yellow");
+  print_bright_color_sample(4, "bright-blue");
+  print_bright_color_sample(5, "bright-magenta");
+  print_bright_color_sample(6, "bright-cyan");
+  print_bright_color_sample(7, "bright-white");
+  printf("\n\n");
+
+  printf("Cursor movement: start");
+  printf("\x1b[5D#####");
+  printf(" ok\n");
+
+  printf("Wrapping:\n");
+  printf("  |----10----|----20----|----30----|----40----|----50----|----60----|----70----|----80----|----90----|---100---|---110---|---120---|---130---|---140---|---150---|---160---|---170---|---180---|\n");
+  printf("  The quick brown fox jumps over the lazy dog. 0123456789. This long line should wrap cleanly at the terminal edge without smearing stale pixels.\n\n");
+
+  printf("Scrollback fill follows. Use PageUp/PageDown, Ctrl+Home, Ctrl+End.\n");
+  for (uint32_t i = 0; i < 48; i++) {
+    printf("  scrollback line %02u  AaBbCc 12345 !?[]{} <> /\\ _-| color=", i);
+    print_bright_color_sample(i % 8, "sample");
+    printf("\n");
+  }
+  printf("\ntermtest: done\n");
+  terminal_flush();
+}
+
+static const char *display_backend_name(uint64_t backend) {
+  switch (backend) {
+    case DISPLAY_BACKEND_RAMFB: return "ramfb";
+    case DISPLAY_BACKEND_VIRTIO_GPU: return "virtio-gpu";
+    default: return "none";
+  }
+}
+
+static void print_display_features(uint64_t features) {
+  int any = 0;
+  if (features & DISPLAY_FEATURE_FILL_RECT) {
+    printf("fill"); any = 1;
+  }
+  if (features & DISPLAY_FEATURE_REGISTER_BUFFER) {
+    printf("%sregister-buffer", any ? "," : ""); any = 1;
+  }
+  if (features & DISPLAY_FEATURE_BLIT_BUFFER) {
+    printf("%sblit-buffer", any ? "," : ""); any = 1;
+  }
+  if (features & DISPLAY_FEATURE_CPU_RGB888) {
+    printf("%scpu-rgb888", any ? "," : ""); any = 1;
+  }
+  if (features & DISPLAY_FEATURE_SYNC_PRESENT) {
+    printf("%ssync-present", any ? "," : ""); any = 1;
+  }
+  if (features & DISPLAY_FEATURE_PRESENT_QUEUE) {
+    printf("%spresent-queue", any ? "," : ""); any = 1;
+  }
+  if (!any) {
+    printf("none");
+  }
+}
+
+static void cmd_gfx(int argc, char **argv, char *line) {
+  (void)argc; (void)argv; (void)line;
+  int display_cap = ns_resolve("display");
+  if (display_cap < 0) {
+    printf("gfx: display service unavailable\n");
+    return;
+  }
+
+  uint64_t request[IPC_INLINE_WORDS] = {DISPLAY_REQ_INFO};
+  ipc_msg_t info = sys_ipc_call((uint32_t)display_cap, 0, 8, request);
+  if (info.status < 0) {
+    printf("gfx: no graphical framebuffer available\n");
+    uint64_t stats_request[IPC_INLINE_WORDS] = {DISPLAY_REQ_STATS};
+    ipc_msg_t stats = sys_ipc_call((uint32_t)display_cap, 0, 8, stats_request);
+    if (stats.status == 0) {
+      printf("gfx: backend=%s gpu-init-error=%lu display-errors=%lu\n",
+             display_backend_name(stats.payload[4]), stats.payload[5],
+             stats.payload[3]);
+    }
+    return;
+  }
+
+  uint32_t width = (uint32_t)(info.payload[0] >> 32);
+  uint32_t height = (uint32_t)info.payload[0];
+  uint32_t stride = (uint32_t)(info.payload[1] >> 32);
+  uint32_t format = (uint32_t)info.payload[1];
+  printf("gfx: %ux%u stride=%u format=%u bytes=%lu\n",
+         width, height, stride, format, info.payload[2]);
+
+  uint64_t caps_request[IPC_INLINE_WORDS] = {DISPLAY_REQ_CAPS};
+  ipc_msg_t caps = sys_ipc_call((uint32_t)display_cap, 0, 8, caps_request);
+  if (caps.status == 0) {
+    printf("gfx: backend=%s max-buffers=%lu features=",
+           display_backend_name(caps.payload[0]), caps.payload[2]);
+    print_display_features(caps.payload[1]);
+    printf("\n");
+  }
+
+  uint64_t stats_request[IPC_INLINE_WORDS] = {DISPLAY_REQ_STATS};
+  ipc_msg_t stats = sys_ipc_call((uint32_t)display_cap, 0, 8, stats_request);
+  if (stats.status == 0) {
+    printf("gfx: display-stats fills=%lu registers=%lu blits=%lu errors=%lu gpu-init-error=%lu\n",
+           stats.payload[0], stats.payload[1], stats.payload[2],
+           stats.payload[3], stats.payload[5]);
+    printf("gfx: display present-queue=%lu\n", stats.payload[14]);
+    if (stats.payload[4] == DISPLAY_BACKEND_VIRTIO_GPU) {
+      printf("gfx: gpu commands=%lu transfers=%lu flushes=%lu bytes=%lu\n",
+             stats.payload[6], stats.payload[7], stats.payload[8],
+             stats.payload[9]);
+      printf("gfx: gpu queued=%lu merged=%lu batches=%lu max-dirty=%lu\n",
+             stats.payload[10], stats.payload[11], stats.payload[12],
+             stats.payload[13]);
+    }
+  }
+
+  request[0] = DISPLAY_REQ_CLEAR;
+  request[1] = 0x071A2B;
+  sys_ipc_call((uint32_t)display_cap, 0, 16, request);
+
+  static const uint32_t colors[5] = {
+    0x12B8A6, 0xF4C95D, 0xEF6F6C, 0x5DADE2, 0xF4F7FA
+  };
+  uint32_t margin = width / 12;
+  uint32_t gap = width / 80;
+  uint32_t bar_width = (width - margin * 2 - gap * 4) / 5;
+  uint32_t bar_height = height / 3;
+  uint32_t y = (height - bar_height) / 2;
+  for (uint32_t i = 0; i < 5; i++) {
+    request[0] = DISPLAY_REQ_FILL_RECT;
+    request[1] = display_pack_pair(margin + i * (bar_width + gap), y);
+    request[2] = display_pack_pair(bar_width, bar_height);
+    request[3] = colors[i];
+    sys_ipc_call((uint32_t)display_cap, 0, 32, request);
+  }
+}
+
+static void cmd_gfxstat(int argc, char **argv, char *line) {
+  (void)line;
+  int compositor_cap = ns_resolve("compositor");
+  if (compositor_cap < 0) {
+    printf("gfxstat: compositor unavailable\n");
+    return;
+  }
+
+  uint64_t request[IPC_INLINE_WORDS] = {COMPOSITOR_REQ_STATS};
+  if (argc > 1 && _streq(argv[1], "reset")) {
+    request[0] = COMPOSITOR_REQ_RESET_STATS;
+    ipc_msg_t reset = sys_ipc_call((uint32_t)compositor_cap, 0, 8, request);
+    printf(reset.status < 0 ? "gfxstat: reset failed\n" :
+                              "gfxstat: reset compositor counters\n");
+    return;
+  }
+
+  ipc_msg_t stats = sys_ipc_call((uint32_t)compositor_cap, 0, 8, request);
+  if (stats.status < 0) {
+    printf("gfxstat: query failed\n");
+    return;
+  }
+  printf("gfxstat: damage=%lu queued=%lu merged=%lu collapses=%lu\n",
+         stats.payload[0], stats.payload[1], stats.payload[2],
+         stats.payload[3]);
+  printf("gfxstat: flushes=%lu presented=%lu max-dirty=%lu full=%lu\n",
+         stats.payload[4], stats.payload[5], stats.payload[6],
+         stats.payload[7]);
+  printf("gfxstat: present-queue-drops=%lu\n", stats.payload[8]);
+}
+
+static void print_mouse_stats(const char *prefix, ipc_msg_t stats) {
+  if (stats.status < 0) {
+    printf("%s: query failed\n", prefix);
+    return;
+  }
+  uint32_t x = (uint32_t)(stats.payload[6] >> 32);
+  uint32_t y = (uint32_t)stats.payload[6];
+  printf("%s: found=%lu mode=%s reads=%lu raw=%lu queued=%lu dropped=%lu pos=%u,%u buttons=%lu\n",
+         prefix, stats.payload[0],
+         stats.payload[1] ? "absolute" : "relative",
+         stats.payload[2], stats.payload[3], stats.payload[4],
+         stats.payload[5], x, y, stats.payload[7]);
+}
+
+static void cmd_mouse(int argc, char **argv, char *line) {
+  (void)argc; (void)argv; (void)line;
+  int mouse_cap = ns_resolve("mouse");
+  if (mouse_cap < 0) {
+    printf("mouse: service unavailable\n");
+    return;
+  }
+
+  uint64_t request[IPC_INLINE_WORDS] = {MOUSE_REQ_INFO};
+  ipc_msg_t info = sys_ipc_call((uint32_t)mouse_cap, 0, 8, request);
+  if (info.status < 0) {
+    printf("mouse: info failed\n");
+    return;
+  }
+  printf("mouse: max=%u,%u ready=%lu mode=%s\n",
+         (uint32_t)(info.payload[0] >> 32), (uint32_t)info.payload[0],
+         info.payload[1], info.payload[2] ? "absolute" : "relative");
+
+  request[0] = MOUSE_REQ_STATS;
+  ipc_msg_t before = sys_ipc_call((uint32_t)mouse_cap, 0, 8, request);
+  print_mouse_stats("mouse-before", before);
+  printf("mouse: move/click now, sampling for 2 seconds...\n");
+  for (uint32_t i = 0; i < 20; i++) {
+    uint64_t read_request[IPC_INLINE_WORDS] = {MOUSE_REQ_READ};
+    (void)sys_ipc_call((uint32_t)mouse_cap, 0, 8, read_request);
+    sys_sleep(100);
+  }
+  ipc_msg_t after = sys_ipc_call((uint32_t)mouse_cap, 0, 8, request);
+  print_mouse_stats("mouse-after", after);
+}
+
+typedef struct {
+  uint32_t *pixels;
+  uint64_t size;
+  int mem_cap;
+  uint32_t surface_id;
+} desktop_surface_t;
+
+static desktop_surface_t desktop_surfaces[3];
+
+static uint64_t page_round(uint64_t size) {
+  return (size + PAGE_BYTES - 1) & ~(PAGE_BYTES - 1);
+}
+
+static void desktop_fill(uint32_t *pixels, uint32_t stride,
+                         uint32_t x, uint32_t y, uint32_t width, uint32_t height,
+                         uint32_t color) {
+  for (uint32_t row = 0; row < height; row++) {
+    for (uint32_t col = 0; col < width; col++) {
+      pixels[(uint64_t)(y + row) * stride + x + col] = color;
+    }
+  }
+}
+
+static void desktop_destroy_old(int compositor_cap) {
+  for (uint32_t i = 0; i < 3; i++) {
+    desktop_surface_t *surface = &desktop_surfaces[i];
+    if (!surface->surface_id) {
+      continue;
+    }
+    uint64_t payload[IPC_INLINE_WORDS] = {
+      COMPOSITOR_REQ_DESTROY_SURFACE, surface->surface_id
+    };
+    (void)sys_ipc_call((uint32_t)compositor_cap, 0, 16, payload);
+    (void)sys_mem_revoke((uint32_t)surface->mem_cap);
+    (void)sys_munmap(surface->pixels, surface->size);
+    surface->surface_id = 0;
+    surface->pixels = 0;
+    surface->size = 0;
+    surface->mem_cap = -1;
+  }
+}
+
+static int desktop_create_surface(int compositor_cap, desktop_surface_t *surface,
+                                  uint32_t width, uint32_t height,
+                                  uint32_t x, uint32_t y,
+                                  uint32_t body, uint32_t accent) {
+  surface->size = page_round((uint64_t)width * height * sizeof(uint32_t));
+  surface->pixels = (uint32_t *)sys_mmap(surface->size);
+  if (!surface->pixels) {
+    return -1;
+  }
+  desktop_fill(surface->pixels, width, 0, 0, width, height, body);
+  desktop_fill(surface->pixels, width, 0, 0, width, height / 8, accent);
+  desktop_fill(surface->pixels, width, width / 14, height / 4,
+               width * 6 / 7, 3, accent);
+  desktop_fill(surface->pixels, width, width / 14, height / 2,
+               width * 4 / 7, 3, accent);
+  desktop_fill(surface->pixels, width, width / 14, height * 3 / 4,
+               width * 5 / 7, 3, accent);
+
+  surface->mem_cap = sys_mem_export(surface->pixels, surface->size,
+                                    MEM_RIGHT_READ | MEM_RIGHT_WRITE |
+                                    MEM_RIGHT_LEND);
+  if (surface->mem_cap < 0) {
+    sys_munmap(surface->pixels, surface->size);
+    return -1;
+  }
+  uint64_t payload[IPC_INLINE_WORDS] = {
+    [0] = (uint64_t)surface->mem_cap,
+    [1] = 0,
+    [2] = surface->size,
+    [3] = MEM_RIGHT_READ | IPC_MEM_MODE_LEND,
+    [4] = COMPOSITOR_REQ_CREATE_SURFACE,
+    [5] = display_pack_pair(width, height),
+    [6] = display_pack_pair(x, y),
+    [7] = width
+  };
+  ipc_msg_t created =
+      sys_ipc_call((uint32_t)compositor_cap, IPC_FLAG_MEM, 64, payload);
+  if (created.status < 0 || created.payload[0] == 0) {
+    sys_mem_revoke((uint32_t)surface->mem_cap);
+    sys_munmap(surface->pixels, surface->size);
+    return -1;
+  }
+  surface->surface_id = (uint32_t)created.payload[0];
+  return 0;
+}
+
+static void cmd_desktop(int argc, char **argv, char *line) {
+  (void)argc; (void)argv; (void)line;
+  int compositor_cap = ns_resolve("compositor");
+  if (compositor_cap < 0) {
+    printf("desktop: compositor unavailable\n");
+    return;
+  }
+  uint64_t request[IPC_INLINE_WORDS] = {COMPOSITOR_REQ_INFO};
+  ipc_msg_t info = sys_ipc_call((uint32_t)compositor_cap, 0, 8, request);
+  if (info.status < 0) {
+    printf("desktop: graphical display unavailable\n");
+    return;
+  }
+  uint32_t screen_width = (uint32_t)(info.payload[0] >> 32);
+  uint32_t screen_height = (uint32_t)info.payload[0];
+  desktop_destroy_old(compositor_cap);
+
+  uint32_t width = screen_width / 3;
+  uint32_t height = screen_height / 3;
+  int ok = 0;
+  ok |= desktop_create_surface(compositor_cap, &desktop_surfaces[0],
+                               width, height, screen_width / 12,
+                               screen_height / 8, 0x153349, 0x12B8A6);
+  ok |= desktop_create_surface(compositor_cap, &desktop_surfaces[1],
+                               width, height, screen_width / 3,
+                               screen_height / 3, 0x2B2945, 0xF4C95D);
+  ok |= desktop_create_surface(compositor_cap, &desktop_surfaces[2],
+                               width, height, screen_width * 7 / 12,
+                               screen_height / 5, 0x3D2636, 0xEF6F6C);
+  printf(ok == 0 ? "desktop: composed three shared surfaces\n" :
+                   "desktop: one or more surfaces failed\n");
+}
+
+static void cmd_gfxdemo(int argc, char **argv, char *line) {
+  (void)argc; (void)argv; (void)line;
+  uint32_t tid = spawn_program(GFXDEMO_FILE, PONG_PRIORITY);
+  if ((int)tid < 0) {
+    printf("gfxdemo: could not spawn %s\n", GFXDEMO_FILE);
+    return;
+  }
+  print_wait_result(sys_wait(tid));
+}
+
+static void cmd_gfxbench(int argc, char **argv, char *line) {
+  (void)argc; (void)argv; (void)line;
+  uint32_t tid = spawn_program(GFXBENCH_FILE, PONG_PRIORITY);
+  if ((int)tid < 0) {
+    printf("gfxbench: could not spawn %s\n", GFXBENCH_FILE);
+    return;
+  }
+  print_wait_result(sys_wait(tid));
+}
+
+static void cmd_snake(int argc, char **argv, char *line) {
+  (void)argc; (void)argv; (void)line;
+  uint32_t tid = spawn_program(SNAKE_FILE, PONG_PRIORITY);
+  if ((int)tid < 0) {
+    printf("snake: could not spawn %s\n", SNAKE_FILE);
+    return;
+  }
+  print_wait_result(sys_wait(tid));
+}
+
+static void cmd_libctest(int argc, char **argv, char *line) {
+  (void)argc; (void)argv; (void)line;
+  uint32_t tid = spawn_program(LIBCTEST_FILE, PONG_PRIORITY);
+  if ((int)tid < 0) {
+    printf("libctest: could not spawn %s\n", LIBCTEST_FILE);
+    return;
+  }
+  print_wait_result(sys_wait(tid));
+}
+
+static void cmd_argfdtest(int argc, char **argv, char *line) {
+  (void)argc; (void)argv; (void)line;
+  char *child_argv[] = {ARGFDTEST_FILE, "alpha", "beta"};
+  uint32_t tid = spawn_program_args(ARGFDTEST_FILE, PONG_PRIORITY,
+                                    child_argv, 3);
+  if ((int)tid < 0) {
+    printf("argfdtest: could not spawn %s\n", ARGFDTEST_FILE);
+    return;
+  }
+  print_wait_result(sys_wait(tid));
+}
+
+static void cmd_pipetest(int argc, char **argv, char *line) {
+  (void)argc; (void)argv; (void)line;
+  uint32_t tid = spawn_program(PIPETEST_FILE, PONG_PRIORITY);
+  if ((int)tid < 0) {
+    printf("pipetest: could not spawn %s\n", PIPETEST_FILE);
+    return;
+  }
+  print_wait_result(sys_wait(tid));
+}
+
+static void cmd_tcc(int argc, char **argv, char *line) {
+  (void)line;
+  if (argc > 8) {
+    printf("tcc: at most 7 arguments are supported\n");
+    return;
+  }
+  char *child_argv[8];
+  child_argv[0] = TCC_FILE;
+  for (int i = 1; i < argc; i++) {
+    child_argv[i] = argv[i];
+  }
+  uint32_t tid = spawn_program_args(TCC_FILE, PONG_PRIORITY,
+                                    child_argv, (uint32_t)argc);
+  if ((int)tid < 0) {
+    printf("tcc: could not spawn %s\n", TCC_FILE);
+    return;
+  }
+  wait_info_t result = sys_wait(tid);
+  if (result.reason != TASK_TERM_EXITED || result.exit_code != 0) {
+    print_wait_result(result);
+  }
 }
 
 static void cmd_pong(int argc, char **argv, char *line) {
@@ -2072,12 +2664,21 @@ static void cmd_taskstress(int argc, char **argv, char *line) {
 
 static void cmd_speed(int argc, char **argv, char *line) {
   (void)argc; (void)argv; (void)line;
+#if NEPTUNE_PLATFORM_PI4
+  spawn_result_t speed = sys_spawn_file2(SPEED_FILE, PONG_PRIORITY);
+  if ((int)speed.tid < 0) {
+    printf("Error: Could not spawn speed benchmark\n");
+  } else {
+    print_wait_result(sys_wait(speed.tid));
+  }
+#else
   uint32_t speed_tid = spawn_program(SPEED_FILE, PONG_PRIORITY);
   if ((int)speed_tid < 0) {
     printf("Error: Could not spawn speed benchmark\n");
   } else {
     print_wait_result(sys_wait(speed_tid));
   }
+#endif
 }
 
 static void print_demo_suites(void) {
@@ -2164,7 +2765,161 @@ static void cmd_demo(int argc, char **argv, char *line) {
   }
 }
 
+#define PIPELINE_MAX_STAGES 6
+
+static char *trim_stage(char *text) {
+  while (*text == ' ' || *text == '\t') text++;
+  char *end = text;
+  while (*end) end++;
+  while (end > text && (end[-1] == ' ' || end[-1] == '\t')) end--;
+  *end = '\0';
+  return text;
+}
+
+static spawn_result_t spawn_pipeline_stage(char *text, uint32_t stdin_cap,
+                                           uint32_t stdout_cap) {
+  spawn_result_t fail = {.tid = (uint32_t)-1, .endpoint_cap = -1};
+  char *argv[8];
+  int argc = parse_args(text, argv, 8);
+  if (argc == 0) return fail;
+
+  char filename[64];
+  char **child_argv = argv;
+  uint32_t child_argc = (uint32_t)argc;
+  if (_streq(argv[0], "run")) {
+    if (argc < 2) return fail;
+    child_argv = &argv[1];
+    child_argc--;
+    shell_copy(filename, argv[1], sizeof(filename));
+  } else {
+    int has_suffix = 0;
+    for (const char *p = argv[0]; *p; p++) {
+      if (*p == '.') has_suffix = 1;
+    }
+    if (has_suffix) shell_copy(filename, argv[0], sizeof(filename));
+    else snprintf(filename, sizeof(filename), "%s.elf", argv[0]);
+  }
+  return vfs_spawn_program_stdio(filename, PONG_PRIORITY, child_argv,
+                                 child_argc, stdin_cap, stdout_cap, 0);
+}
+
+static void dispatch_pipeline(char *line) {
+  char *stages[PIPELINE_MAX_STAGES];
+  char input_stage[96];
+  char output_stage[96];
+  uint32_t stage_count = 1;
+  stages[0] = line;
+  for (char *p = line; *p; p++) {
+    if (*p != '|') continue;
+    if (stage_count == PIPELINE_MAX_STAGES) {
+      printf("pipeline: at most %u stages are supported\n", PIPELINE_MAX_STAGES);
+      return;
+    }
+    *p = '\0';
+    stages[stage_count++] = p + 1;
+  }
+  for (uint32_t i = 0; i < stage_count; i++) {
+    stages[i] = trim_stage(stages[i]);
+    if (!stages[i][0]) {
+      printf("pipeline: empty stage\n");
+      return;
+    }
+  }
+
+
+  char *input_path = 0;
+  for (char *p = stages[0]; *p; p++) {
+    if (*p == '<') {
+      *p = '\0';
+      input_path = trim_stage(p + 1);
+      stages[0] = trim_stage(stages[0]);
+      break;
+    }
+  }
+  char *output_path = 0;
+  for (char *p = stages[stage_count - 1]; *p; p++) {
+    if (*p == '>') {
+      *p = '\0';
+      output_path = trim_stage(p + 1);
+      stages[stage_count - 1] = trim_stage(stages[stage_count - 1]);
+      break;
+    }
+  }
+  if ((input_path && (!input_path[0] || !stages[0][0])) ||
+      (output_path && (!output_path[0] || !stages[stage_count - 1][0]))) {
+    printf("redirection: command and filename are required\n");
+    return;
+  }
+  if (input_path) {
+    if (stage_count == PIPELINE_MAX_STAGES) {
+      printf("pipeline: too many stages after input redirection\n");
+      return;
+    }
+    for (uint32_t i = stage_count; i > 0; i--) stages[i] = stages[i - 1];
+    snprintf(input_stage, sizeof(input_stage), "cat %s", input_path);
+    stages[0] = input_stage;
+    stage_count++;
+  }
+  if (output_path) {
+    if (stage_count == PIPELINE_MAX_STAGES) {
+      printf("pipeline: too many stages after output redirection\n");
+      return;
+    }
+    snprintf(output_stage, sizeof(output_stage), "writefile %s", output_path);
+    stages[stage_count++] = output_stage;
+  }
+
+  pipe_cap_pair_t links[PIPELINE_MAX_STAGES - 1];
+  uint32_t created = 0;
+  for (; created + 1 < stage_count; created++) {
+    links[created] = sys_pipe_create();
+    if (links[created].read_cap < 0 || links[created].write_cap < 0) {
+      printf("pipeline: cannot create pipe\n");
+      break;
+    }
+  }
+  if (created + 1 != stage_count) {
+    for (uint32_t i = 0; i < created; i++) {
+      sys_pipe_close((uint32_t)links[i].read_cap);
+      sys_pipe_close((uint32_t)links[i].write_cap);
+    }
+    return;
+  }
+
+  uint32_t tids[PIPELINE_MAX_STAGES];
+  uint32_t spawned = 0;
+  for (; spawned < stage_count; spawned++) {
+    uint32_t input = spawned == 0 ? 0 : (uint32_t)links[spawned - 1].read_cap;
+    uint32_t output = spawned + 1 == stage_count
+                          ? 0 : (uint32_t)links[spawned].write_cap;
+    spawn_result_t result = spawn_pipeline_stage(stages[spawned], input, output);
+    if (result.tid == (uint32_t)-1) {
+      printf("pipeline: cannot start stage %u\n", spawned + 1);
+      break;
+    }
+    tids[spawned] = result.tid;
+  }
+
+  for (uint32_t i = 0; i + 1 < stage_count; i++) {
+    sys_pipe_close((uint32_t)links[i].read_cap);
+    sys_pipe_close((uint32_t)links[i].write_cap);
+  }
+  for (uint32_t i = 0; i < spawned; i++) {
+    wait_info_t status = sys_wait(tids[i]);
+    if (status.status != WAIT_STATUS_DONE || status.reason != TASK_TERM_EXITED ||
+        status.exit_code != 0) {
+      print_wait_result(status);
+    }
+  }
+}
+
 static void dispatch_command(char *line) {
+  for (char *p = line; *p; p++) {
+    if (*p == '|' || *p == '<' || *p == '>') {
+      dispatch_pipeline(line);
+      return;
+    }
+  }
   char original[MAX_CMD];
   char *argv[8];
   shell_copy(original, line, sizeof(original));
@@ -2215,20 +2970,63 @@ static void history_add(const char *cmd) {
   shell_copy(history[slot], cmd, MAX_CMD);
 }
 
-static void redraw_input(const char *cmd) {
+static void redraw_input(const char *cmd, int len, int cursor) {
   printf("\r\x1b[2K%s%s", SHELL_PROMPT, cmd);
+  if (cursor < len) {
+    printf("\x1b[%uD", (uint32_t)(len - cursor));
+  }
+  terminal_commit();
 }
 
-static void print_prompt(void) { printf("\n%s", SHELL_PROMPT); }
+static void set_input_from_history(char *cmd, int *len, int *cursor,
+                                   const char *history_line) {
+  shell_copy(cmd, history_line, MAX_CMD);
+  *len = 0;
+  while (cmd[*len]) (*len)++;
+  *cursor = *len;
+  redraw_input(cmd, *len, *cursor);
+}
+
+static void delete_input_range(char *cmd, int *len, int cursor, int count) {
+  if (count <= 0 || cursor >= *len) {
+    return;
+  }
+  if (count > *len - cursor) {
+    count = *len - cursor;
+  }
+  for (int i = cursor; i + count <= *len; i++) {
+    cmd[i] = cmd[i + count];
+  }
+  *len -= count;
+}
+
+static void insert_input_char(char *cmd, int *len, int *cursor, char c) {
+  if (*len >= MAX_CMD - 1) {
+    return;
+  }
+  for (int i = *len; i >= *cursor; i--) {
+    cmd[i + 1] = cmd[i];
+  }
+  cmd[*cursor] = c;
+  (*len)++;
+  (*cursor)++;
+}
+
+static void print_prompt(void) {
+  printf("%s", SHELL_PROMPT);
+  terminal_commit();
+}
 
 void _start(void) {
   char cmd[MAX_CMD];
   int len = 0;
+  int cursor = 0;
   int history_cursor = -1;
 
   while (ns_register("shell") < 0) {
     sys_sleep(10);
   }
+  graphical_terminal = terminal_enable() == 0;
 
   printf("  _   _            _                     __   ___  \n");
   printf(" | \\ | | ___ _ __ | |_ _   _ _ __   ___ / _ \\/ ___| \n");
@@ -2246,68 +3044,117 @@ void _start(void) {
 
     if (c == '\r' || c == '\n') {
       printf("\n");
+      terminal_flush();
       cmd[len] = '\0';
       history_add(cmd);
       dispatch_command(cmd);
       len = 0;
+      cursor = 0;
       cmd[0] = '\0';
       history_cursor = -1;
       print_prompt();
     } else if (c == 3) {
-      printf("^C");
+      printf("^C\n");
       len = 0;
+      cursor = 0;
       cmd[0] = '\0';
       history_cursor = -1;
       print_prompt();
     } else if (c == 12) {
       printf("\x1b[2J\x1b[H");
-      redraw_input(cmd);
+      redraw_input(cmd, len, cursor);
     } else if (c == 21) {
       len = 0;
+      cursor = 0;
       cmd[0] = '\0';
       history_cursor = -1;
-      redraw_input(cmd);
+      redraw_input(cmd, len, cursor);
     } else if (c == 27) {
       char c1 = read_console_char();
       if (c1 == '[') {
         char c2 = read_console_char();
+        int value = 0;
+        int saw_value = 0;
+        while (c2 >= '0' && c2 <= '9') {
+          saw_value = 1;
+          value = value * 10 + (c2 - '0');
+          c2 = read_console_char();
+        }
         if (c2 == 'A' && history_len > 0) {
           if (history_cursor < 0) {
             history_cursor = history_len - 1;
           } else if (history_cursor > 0) {
             history_cursor--;
           }
-          shell_copy(cmd, history_get(history_cursor), MAX_CMD);
-          len = 0;
-          while (cmd[len]) len++;
-          redraw_input(cmd);
+          set_input_from_history(cmd, &len, &cursor,
+                                 history_get(history_cursor));
         } else if (c2 == 'B' && history_len > 0) {
           if (history_cursor >= 0 && history_cursor < history_len - 1) {
             history_cursor++;
-            shell_copy(cmd, history_get(history_cursor), MAX_CMD);
+            set_input_from_history(cmd, &len, &cursor,
+                                   history_get(history_cursor));
           } else {
             history_cursor = -1;
+            len = 0;
+            cursor = 0;
             cmd[0] = '\0';
+            redraw_input(cmd, len, cursor);
           }
-          len = 0;
-          while (cmd[len]) len++;
-          redraw_input(cmd);
-        } else if (c2 == '3') {
-          (void)read_console_char();
+        } else if (c2 == 'C') {
+          if (cursor < len) {
+            cursor++;
+            printf("\x1b[1C");
+            terminal_commit();
+          }
+        } else if (c2 == 'D') {
+          if (cursor > 0) {
+            cursor--;
+            printf("\x1b[1D");
+            terminal_commit();
+          }
+        } else if (c2 == 'H') {
+          cursor = 0;
+          redraw_input(cmd, len, cursor);
+        } else if (c2 == 'F') {
+          cursor = len;
+          redraw_input(cmd, len, cursor);
+        } else if (c2 == '~') {
+          if (saw_value && value == 3) {
+            delete_input_range(cmd, &len, cursor, 1);
+            history_cursor = -1;
+            redraw_input(cmd, len, cursor);
+          } else if (saw_value && (value == 1 || value == 7)) {
+            cursor = 0;
+            redraw_input(cmd, len, cursor);
+          } else if (saw_value && (value == 4 || value == 8)) {
+            cursor = len;
+            redraw_input(cmd, len, cursor);
+          }
         }
       }
     } else if (c == 127 || c == '\b') {
-      if (len > 0) {
-        len--;
-        cmd[len] = '\0';
+      if (cursor > 0) {
+        int erase_tail = cursor == len;
+        cursor--;
+        delete_input_range(cmd, &len, cursor, 1);
         history_cursor = -1;
-        printf("\b \b");
+        if (erase_tail) {
+          printf("\b \b");
+          terminal_commit();
+        } else {
+          redraw_input(cmd, len, cursor);
+        }
       }
     } else if (c >= 32 && c < 127 && len < MAX_CMD - 1) {
-      cmd[len++] = c;
-      cmd[len] = '\0';
+      int append = cursor == len;
+      insert_input_char(cmd, &len, &cursor, c);
       history_cursor = -1;
-      printf("%c", c);
+      if (append) {
+        printf("%c", c);
+        terminal_commit();
+      } else {
+        redraw_input(cmd, len, cursor);
+      }
     }
   }
 }

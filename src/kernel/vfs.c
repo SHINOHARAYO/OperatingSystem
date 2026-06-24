@@ -52,9 +52,9 @@ static tcb_t *dequeue_vfs_caller(tcb_t *fs) {
     if (!fs) {
         return 0;
     }
-    spin_lock(&fs->lock);
+    uint64_t irq_flags = spin_lock_irqsave(&fs->lock);
     if (!fs->vfs_call_head) {
-        spin_unlock(&fs->lock);
+        spin_unlock_irqrestore(&fs->lock, irq_flags);
         return 0;
     }
 
@@ -64,7 +64,7 @@ static tcb_t *dequeue_vfs_caller(tcb_t *fs) {
         fs->vfs_call_tail = 0;
     }
     caller->vfs_next = 0;
-    spin_unlock(&fs->lock);
+    spin_unlock_irqrestore(&fs->lock, irq_flags);
     return caller;
 }
 
@@ -79,7 +79,7 @@ static void unlink_vfs_caller(tcb_t *caller) {
         return;
     }
 
-    spin_lock(&fs->lock);
+    uint64_t irq_flags = spin_lock_irqsave(&fs->lock);
     tcb_t *prev = 0;
     tcb_t *cur = fs->vfs_call_head;
     while (cur) {
@@ -93,14 +93,14 @@ static void unlink_vfs_caller(tcb_t *caller) {
                 fs->vfs_call_tail = prev;
             }
             cur->vfs_next = 0;
-            spin_unlock(&fs->lock);
+            spin_unlock_irqrestore(&fs->lock, irq_flags);
             sched_task_put(fs);
             return;
         }
         prev = cur;
         cur = cur->vfs_next;
     }
-    spin_unlock(&fs->lock);
+    spin_unlock_irqrestore(&fs->lock, irq_flags);
     sched_task_put(fs);
 }
 
@@ -160,7 +160,7 @@ void vfs_recv_syscall(uint64_t *regs) {
         return;
     }
 
-    spin_lock(&current->lock);
+    uint64_t current_irq_flags = spin_lock_irqsave(&current->lock);
     tcb_t *caller = current->vfs_call_head;
     if (caller) {
         current->vfs_call_head = caller->vfs_next;
@@ -172,7 +172,7 @@ void vfs_recv_syscall(uint64_t *regs) {
         current->state = TASK_STATE_BLOCKED_ON_VFS_RECV;
         current->ticks_remaining = 0;
     }
-    spin_unlock(&current->lock);
+    spin_unlock_irqrestore(&current->lock, current_irq_flags);
 
     if (caller && caller->state == TASK_STATE_BLOCKED_ON_VFS_CALL &&
         caller->vfs_reply_tid == current->tid) {
@@ -215,7 +215,7 @@ void vfs_call_syscall(uint64_t *regs) {
     caller->ticks_remaining = 0;
 
     int direct_deliver = 0;
-    spin_lock(&fs->lock);
+    uint64_t fs_irq_flags = spin_lock_irqsave(&fs->lock);
     if (fs->state == TASK_STATE_BLOCKED_ON_VFS_RECV) {
         uint64_t *fs_tf = sched_task_trap_frame(fs);
         deliver_vfs_call(caller, fs, fs_tf);
@@ -229,7 +229,7 @@ void vfs_call_syscall(uint64_t *regs) {
         }
         fs->vfs_call_tail = caller;
     }
-    spin_unlock(&fs->lock);
+    spin_unlock_irqrestore(&fs->lock, fs_irq_flags);
 
     if (direct_deliver) {
         sched_make_ready(fs);
@@ -254,7 +254,7 @@ int vfs_enqueue_kernel_call(tcb_t *caller, tcb_t *fs, uint32_t vfs_id, uint64_t 
     caller->ticks_remaining = 0;
 
     int direct_deliver = 0;
-    spin_lock(&fs->lock);
+    uint64_t fs_irq_flags = spin_lock_irqsave(&fs->lock);
     if (fs->state == TASK_STATE_BLOCKED_ON_VFS_RECV) {
         uint64_t *fs_tf = sched_task_trap_frame(fs);
         deliver_vfs_call(caller, fs, fs_tf);
@@ -268,7 +268,7 @@ int vfs_enqueue_kernel_call(tcb_t *caller, tcb_t *fs, uint32_t vfs_id, uint64_t 
         }
         fs->vfs_call_tail = caller;
     }
-    spin_unlock(&fs->lock);
+    spin_unlock_irqrestore(&fs->lock, fs_irq_flags);
 
     if (direct_deliver) {
         sched_make_ready(fs);

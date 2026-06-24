@@ -5,6 +5,7 @@
 #include "vmm.h"
 #include "mmu.h"
 #include "log.h"
+#include "cache.h"
 
 #define PAGE_SIZE 4096
 
@@ -160,6 +161,9 @@ uint64_t elf_load(const uint8_t *elf_data, uint64_t elf_size, uint64_t *pgd, uin
                 for (uint64_t b = 0; b < copy_len; b++) {
                     dst[b] = src[b];
                 }
+            }
+            if (phdr->p_flags & PF_X) {
+                arch_sync_icache(page_ptr, PAGE_SIZE);
             }
 
             if (vmm_map_page_asid(pgd, asid, va, frame->paddr, vmm_flags) < 0) {

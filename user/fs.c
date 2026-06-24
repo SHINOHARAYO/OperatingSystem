@@ -723,11 +723,20 @@ static void handle_vfs_statfs(void) {
 }
 
 static uint32_t boot_flags_for_exec(const char *name) {
-    if (streq(name, "sbin/uart.elf") || streq(name, "sbin/keyboard.elf")) {
+    if (streq(name, "sbin/uart.elf")) {
         return VFS_EXEC_BOOT_UART;
+    }
+    if (streq(name, "sbin/keyboard.elf")) {
+        return VFS_EXEC_BOOT_UART | VFS_EXEC_BOOT_INPUT;
+    }
+    if (streq(name, "sbin/mouse.elf")) {
+        return VFS_EXEC_BOOT_INPUT;
     }
     if (streq(name, "sbin/block.elf")) {
         return VFS_EXEC_BOOT_BLOCK;
+    }
+    if (streq(name, "sbin/display.elf")) {
+        return VFS_EXEC_BOOT_DISPLAY;
     }
     return 0;
 }

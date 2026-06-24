@@ -3,15 +3,13 @@
 #include "log.h"
 #include "uart.h"
 #include "sched.h"
+#include "platform.h"
 
-// The ARM generic timer uses the following system registers:
+// The ARM generic virtual timer uses the following system registers:
 // CNTFRQ_EL0 - Timer Frequency
-// CNTP_TVAL_EL0 - Timer Value (down counter)
-// CNTP_CTL_EL0 - Timer Control
-// CNTPCT_EL0 - Physical Count
-
-// The physical timer is typically routed to PPI 30 on the GIC
-#define TIMER_IRQ 30
+// CNTV_TVAL_EL0 - Timer Value (down counter)
+// CNTV_CTL_EL0 - Timer Control
+// CNTVCT_EL0 - Virtual Count
 
 static uint64_t timer_freq_hz;
 static uint64_t timer_period_counts;
@@ -34,15 +32,24 @@ static void timer_program_local(void) {
         }
     }
 
-    __asm__ volatile("msr cntp_tval_el0, %0" : : "r"(timer_period_counts));
-    __asm__ volatile("msr cntp_ctl_el0, %0" : : "r"(1ULL));
-    gic_enable_interrupt(TIMER_IRQ);
+    if (platform_get()->timer_kind == PLATFORM_TIMER_PHYSICAL) {
+        __asm__ volatile("msr cntp_tval_el0, %0" : : "r"(timer_period_counts));
+        __asm__ volatile("msr cntp_ctl_el0, %0" : : "r"(1ULL));
+    } else {
+        __asm__ volatile("msr cntv_tval_el0, %0" : : "r"(timer_period_counts));
+        __asm__ volatile("msr cntv_ctl_el0, %0" : : "r"(1ULL));
+    }
+    gic_enable_interrupt(platform_get()->timer_irq);
 }
 
 void timer_init(void) {
     LOG_DEBUG("TIMER: Initializing ARM Generic Timer...");
     __asm__ volatile("mrs %0, cntfrq_el0" : "=r"(timer_freq_hz));
-    __asm__ volatile("mrs %0, cntpct_el0" : "=r"(timer_base_count));
+    if (platform_get()->timer_kind == PLATFORM_TIMER_PHYSICAL) {
+        __asm__ volatile("mrs %0, cntpct_el0" : "=r"(timer_base_count));
+    } else {
+        __asm__ volatile("mrs %0, cntvct_el0" : "=r"(timer_base_count));
+    }
     LOG_DEBUG_HEX("TIMER: Frequency (Hz): ", timer_freq_hz);
 
     if (timer_freq_hz == 0) {
@@ -66,7 +73,11 @@ void timer_handle_interrupt(void) {
     if (timer_current_core_id() == 0) {
         __atomic_add_fetch(&ticks, 1, __ATOMIC_RELAXED);
     }
-    __asm__ volatile("msr cntp_tval_el0, %0" : : "r"(timer_period_counts));
+    if (platform_get()->timer_kind == PLATFORM_TIMER_PHYSICAL) {
+        __asm__ volatile("msr cntp_tval_el0, %0" : : "r"(timer_period_counts));
+    } else {
+        __asm__ volatile("msr cntv_tval_el0, %0" : : "r"(timer_period_counts));
+    }
 }
 uint64_t timer_get_uptime_seconds(void) {
     return __atomic_load_n(&ticks, __ATOMIC_RELAXED) / 1000;
@@ -78,6 +89,10 @@ uint64_t timer_get_uptime_ms(void) {
 
 uint64_t timer_get_uptime_ns(void) {
     uint64_t count = 0;
-    __asm__ volatile("mrs %0, cntpct_el0" : "=r"(count));
+    if (platform_get()->timer_kind == PLATFORM_TIMER_PHYSICAL) {
+        __asm__ volatile("mrs %0, cntpct_el0" : "=r"(count));
+    } else {
+        __asm__ volatile("mrs %0, cntvct_el0" : "=r"(count));
+    }
     return ((count - timer_base_count) * 1000000000ULL) / timer_freq_hz;
 }

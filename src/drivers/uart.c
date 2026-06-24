@@ -1,32 +1,27 @@
 #include "uart.h"
+#include "platform.h"
 
-// QEMU virt machine PL011 UART base address
-#define UART_BASE 0x09000000
-
-#define UART_DR   (*(volatile uint32_t *)(UART_BASE + 0x000))
-#define UART_FR   (*(volatile uint32_t *)(UART_BASE + 0x018))
-#define UART_IBRD (*(volatile uint32_t *)(UART_BASE + 0x024))
-#define UART_FBRD (*(volatile uint32_t *)(UART_BASE + 0x028))
-#define UART_LCRH (*(volatile uint32_t *)(UART_BASE + 0x02C))
-#define UART_CR   (*(volatile uint32_t *)(UART_BASE + 0x030))
+static volatile uint32_t *uart_reg(uint64_t offset) {
+    return (volatile uint32_t *)(platform_get()->uart_pa + offset);
+}
 
 void uart_init(void) {
-    UART_CR = 0;
-
-    // Set baud rate (assuming 24MHz UART clock)
-    // 115200 baud -> IBRD=13, FBRD=1
-    UART_IBRD = 13;
-    UART_FBRD = 1;
-
-    // 8 bit data, 1 stop bit, no parity, FIFOs enabled
-    UART_LCRH = (3 << 5) | (1 << 4);
-    UART_CR = (1 << 0) | (1 << 8) | (1 << 9);
+    *uart_reg(0x030) = 0;
+    if (platform_is_pi4()) {
+        *uart_reg(0x024) = 26;
+        *uart_reg(0x028) = 3;
+    } else {
+        *uart_reg(0x024) = 13;
+        *uart_reg(0x028) = 1;
+    }
+    *uart_reg(0x02C) = (3 << 5) | (1 << 4);
+    *uart_reg(0x030) = (1 << 0) | (1 << 8) | (1 << 9);
 }
 
 void uart_putc(char c) {
-    while (UART_FR & (1 << 5)) {
+    while (*uart_reg(0x018) & (1 << 5)) {
     }
-    UART_DR = c;
+    *uart_reg(0x000) = (uint32_t)c;
 }
 
 void uart_puts(const char *s) {

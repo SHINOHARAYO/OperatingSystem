@@ -5,10 +5,15 @@
 #include "orange_cat.h"
 #include "spinlock.h"
 #include "vma.h"
+#include "display_boot.h"
 
 #define TASK_STACK_SIZE 4096
 #define CAP_SELF 1
 #define CAP_NS 2
+#define CAP_STDIN 3
+#define CAP_STDOUT 4
+#define CAP_STDERR 5
+#define CAP_FIRST_DYNAMIC 6
 #define USER_STACK_TOP 0x90001000ULL
 #define USER_STACK_BASE (USER_STACK_TOP - TASK_STACK_SIZE)
 #define USER_STACK_GUARD_BASE (USER_STACK_BASE - TASK_STACK_SIZE)
@@ -75,7 +80,7 @@ typedef struct tcb_t {
     uint8_t sched_queued;
     uint8_t timer_queued;
     uint8_t kill_requested;
-    uint8_t sched_padding;
+    uint8_t sched_has_run;
     uint32_t sched_core_id;
     uint64_t wake_tick;
     struct tcb_t *sched_next;
@@ -88,6 +93,16 @@ typedef struct tcb_t {
     uint64_t ipc_msg_flags;
     uint64_t ipc_msg_len;
     uint64_t ipc_msg_payload[IPC_INLINE_WORDS];
+    struct tcb_t *ipc_fast_reply_caller;
+    uint32_t ipc_fast_reply_caller_tid;
+    uint32_t ipc_fast_reply_generation;
+    uint8_t ipc_fast_reply_active;
+    uint8_t ipc_fast_receive;
+    uint8_t ipc_fast_reply_padding[2];
+    struct tcb_t *ipc_cached_endpoint;
+    uint32_t ipc_cached_endpoint_tid;
+    uint32_t ipc_cached_endpoint_padding;
+    uint64_t ipc_profile_start;
     struct tcb_t *ipc_next;
     struct tcb_t *ipc_call_head;
     struct tcb_t *ipc_call_tail;
@@ -119,6 +134,7 @@ typedef struct tcb_t {
 } tcb_t;
 
 void sched_init(void);
+void sched_set_display_boot_info(const display_boot_info_t *info);
 
 void sched_secondary_core_online(uint32_t core_id);
 uint32_t sched_online_core_count(void);
@@ -138,6 +154,15 @@ void sched_sleep_syscall(uint64_t *regs, uint64_t ms);
 int sched_spawn_syscall(uint64_t *regs, uint64_t elf_data, uint64_t elf_size, uint8_t priority);
 int sched_spawn_file_syscall(uint64_t *regs, uint64_t name_ptr, uint8_t priority);
 int sched_spawn_exec_syscall(uint64_t *regs, uint32_t exec_cap, uint8_t priority);
+int sched_spawn_exec_args_syscall(uint64_t *regs, uint32_t exec_cap,
+                                  uint8_t priority, uint64_t argv_ptr,
+                                  uint32_t argc);
+int sched_spawn_exec_args_stdio_syscall(uint64_t *regs, uint32_t exec_cap,
+                                        uint8_t priority, uint64_t argv_ptr,
+                                        uint32_t argc, uint32_t stdin_cap,
+                                        uint32_t stdout_cap,
+                                        uint32_t stderr_cap);
+int sched_bind_stdio_syscall(uint64_t *regs, uint32_t endpoint_cap);
 int sched_vfs_exec_create_syscall(uint64_t *regs, uint32_t client_tid,
                                   uint64_t elf_data, uint64_t elf_size,
                                   uint32_t file_index, uint32_t boot_flags);
@@ -168,15 +193,22 @@ int vm_unmap_range(tcb_t *task, uint64_t start, uint64_t size);
 uint32_t sched_task_capacity(void);
 tcb_t *sched_task_at(uint32_t index);
 tcb_t *sched_find_task(uint32_t tid);
+tcb_t *sched_find_task_local(uint32_t tid);
 tcb_t *sched_task_get(uint32_t tid);
+int sched_task_hold(tcb_t *task);
 void sched_task_put(tcb_t *task);
 tcb_t *sched_current_task(void);
 uint64_t *sched_task_trap_frame(tcb_t *task);
 void sched_clear_ipc_state(tcb_t *task);
+void sched_arm_timeout(tcb_t *task, uint64_t timeout_ms);
+void sched_cancel_timeout(tcb_t *task);
 void sched_handoff_to_task(tcb_t *target);
+int sched_ipc_direct_handoff(tcb_t *target);
+int sched_ipc_direct_reply_handoff(tcb_t *target);
 void sched_make_ready(tcb_t *task);
 int sched_current_is_user(void);
-void sched_fault_current_task(uint64_t esr, uint64_t elr, uint64_t far);
+void sched_fault_current_task(uint64_t esr, uint64_t elr, uint64_t far,
+                              uint64_t vector_source);
 
 uint64_t* sched_get_task_pgd(uint32_t tid);
 uint16_t sched_get_task_asid(uint32_t tid);

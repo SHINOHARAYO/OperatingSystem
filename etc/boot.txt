@@ -1,3 +1,7 @@
 service /sbin/uart.elf
 service /sbin/keyboard.elf
+service /sbin/mouse.elf
+service /sbin/display.elf
+service /sbin/compositor.elf
+service /sbin/terminal.elf
 shell /bin/shell.elf

@@ -1,0 +1,4 @@
+# Neptune serial bring-up configuration for Raspberry Pi 4 UEFI firmware.
+arm_64bit=1
+enable_uart=1
+dtoverlay=disable-bt

@@ -3,6 +3,8 @@
 #include "initrd.h"
 #include "mmu.h"
 #include "log.h"
+#include "spinlock.h"
+#include "cache.h"
 
 #define MAX_INITRD_CACHE_PAGES 128
 
@@ -16,8 +18,11 @@ typedef struct {
 
 static page_cache_entry_t initrd_cache[MAX_INITRD_CACHE_PAGES];
 static uint64_t page_cache_clock = 1;
+static spinlock_t page_cache_lock;
 
 int page_cache_init(void) {
+    page_cache_lock.value = 0;
+    uint64_t irq_flags = spin_lock_irqsave(&page_cache_lock);
     for (uint32_t i = 0; i < MAX_INITRD_CACHE_PAGES; i++) {
         initrd_cache[i].present = 0;
         initrd_cache[i].file_index = 0;
@@ -27,6 +32,7 @@ int page_cache_init(void) {
     }
 
     page_cache_clock = 1;
+    spin_unlock_irqrestore(&page_cache_lock, irq_flags);
     LOG_OK_HEX("PAGECACHE: boot archive cache pages: ", MAX_INITRD_CACHE_PAGES);
     return 0;
 }
@@ -37,16 +43,19 @@ int page_cache_get_initrd_page(uint32_t file_index, uint64_t file_offset,
         return -1;
     }
 
+    uint64_t irq_flags = spin_lock_irqsave(&page_cache_lock);
     uint64_t page_offset = file_offset & ~(PAGE_SIZE - 1);
     for (uint32_t i = 0; i < MAX_INITRD_CACHE_PAGES; i++) {
         page_cache_entry_t *entry = &initrd_cache[i];
         if (entry->present && entry->file_index == file_index &&
             entry->page_offset == page_offset) {
             if (frame_ref(entry->paddr) < 0) {
+                spin_unlock_irqrestore(&page_cache_lock, irq_flags);
                 return -1;
             }
             entry->last_used = page_cache_clock++;
             *out_paddr = entry->paddr;
+            spin_unlock_irqrestore(&page_cache_lock, irq_flags);
             return 0;
         }
     }
@@ -60,6 +69,7 @@ int page_cache_get_initrd_page(uint32_t file_index, uint64_t file_offset,
     }
 
     if (free_slot < 0) {
+        spin_unlock_irqrestore(&page_cache_lock, irq_flags);
         return -1;
     }
 
@@ -67,11 +77,13 @@ int page_cache_get_initrd_page(uint32_t file_index, uint64_t file_offset,
     uint64_t file_size = 0;
     if (initrd_get_file(file_index, &file_data, &file_size) < 0 ||
         page_offset >= file_size) {
+        spin_unlock_irqrestore(&page_cache_lock, irq_flags);
         return -1;
     }
 
     frame_t *frame = frame_alloc(0, FRAME_FLAG_USER | FRAME_FLAG_PINNED);
     if (!frame) {
+        spin_unlock_irqrestore(&page_cache_lock, irq_flags);
         return -1;
     }
 
@@ -89,6 +101,7 @@ int page_cache_get_initrd_page(uint32_t file_index, uint64_t file_offset,
     for (uint64_t i = 0; i < copy_len; i++) {
         dst[i] = src[i];
     }
+    arch_sync_icache(dst, PAGE_SIZE);
 
     page_cache_entry_t *entry = &initrd_cache[free_slot];
     entry->present = 1;
@@ -101,9 +114,11 @@ int page_cache_get_initrd_page(uint32_t file_index, uint64_t file_offset,
         entry->present = 0;
         entry->paddr = 0;
         frame_unref(frame->paddr);
+        spin_unlock_irqrestore(&page_cache_lock, irq_flags);
         return -1;
     }
 
     *out_paddr = frame->paddr;
+    spin_unlock_irqrestore(&page_cache_lock, irq_flags);
     return 0;
 }

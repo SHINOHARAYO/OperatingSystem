@@ -1,16 +1,78 @@
 #include "mmu.h"
 #include "uart.h"
 #include "log.h"
+#include "platform.h"
+#include "efi.h"
+
+#ifndef NEPTUNE_PLATFORM_PI4
+#define NEPTUNE_PLATFORM_PI4 0
+#endif
 
 // TTBR0 uses a 39-bit VA space, so 512 L1 entries cover 512 GiB.
 // This bootstrap map is identity mapped: Virt == Phys.
 
 uint64_t l1_table[512] __attribute__((aligned(PAGE_SIZE)));
 uint64_t high_l1_table[512] __attribute__((aligned(PAGE_SIZE)));
+#if NEPTUNE_PLATFORM_PI4
+#define PI4_BOOTSTRAP_L2_TABLES 8
+static uint64_t pi4_l2_tables[PI4_BOOTSTRAP_L2_TABLES][512]
+    __attribute__((aligned(PAGE_SIZE)));
 
-void mmu_init(void) {
-    volatile uint64_t *l1 = l1_table;
-    volatile uint64_t *high_l1 = high_l1_table;
+static int pi4_range_is_memory(void *memory_map, uint64_t map_size,
+                               uint64_t desc_size, uint64_t pa) {
+    if (!memory_map || desc_size < sizeof(EFI_MEMORY_DESCRIPTOR)) return 0;
+    for (uint64_t offset = 0; offset + desc_size <= map_size; offset += desc_size) {
+        EFI_MEMORY_DESCRIPTOR *desc =
+            (EFI_MEMORY_DESCRIPTOR *)((uint8_t *)memory_map + offset);
+        uint64_t end = desc->PhysicalStart + desc->NumberOfPages * PAGE_SIZE;
+        if (pa >= desc->PhysicalStart && pa < end && desc->Type != 11 &&
+            desc->Type != 12) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+static uint64_t pi4_block_attributes(uint64_t pa) {
+    const platform_info_t *info = platform_get();
+    if (pa >= info->device_pa && pa < info->device_pa + info->device_size) {
+        return PTE_ATTRINDX(MT_DEVICE_nGnRnE);
+    }
+    return PTE_ATTRINDX(MT_NORMAL) | PTE_SH_INNER;
+}
+
+static void mmu_build_pi4_tables(void *memory_map, uint64_t map_size,
+                                 uint64_t desc_size) {
+    const platform_info_t *info = platform_get();
+    uint64_t table_count = info->bootstrap_ram_limit >> 30;
+    if (table_count > PI4_BOOTSTRAP_L2_TABLES) table_count = PI4_BOOTSTRAP_L2_TABLES;
+
+    for (uint32_t i = 0; i < 512; i++) {
+        l1_table[i] = 0;
+        high_l1_table[i] = 0;
+    }
+    for (uint64_t l1_index = 0; l1_index < table_count; l1_index++) {
+        for (uint64_t l2_index = 0; l2_index < 512; l2_index++) {
+            uint64_t pa = (l1_index << 30) | (l2_index << 21);
+            if ((pa >= info->device_pa &&
+                 pa < info->device_pa + info->device_size) ||
+                pi4_range_is_memory(memory_map, map_size, desc_size, pa)) {
+                pi4_l2_tables[l1_index][l2_index] =
+                    pa | PTE_VALID | PTE_BLOCK | PTE_AF | pi4_block_attributes(pa);
+            } else {
+                pi4_l2_tables[l1_index][l2_index] = 0;
+            }
+        }
+        l1_table[l1_index] = ((uint64_t)pi4_l2_tables[l1_index]) |
+                             PTE_VALID | PTE_TABLE;
+    }
+}
+#endif
+
+void mmu_init(void *memory_map, uint64_t map_size, uint64_t desc_size) {
+    (void)memory_map;
+    (void)map_size;
+    (void)desc_size;
 
     LOG_DEBUG("MMU: Configuring MAIR_EL1...");
     // MAIR_EL1 index 0: Device-nGnRnE (0x00)
@@ -19,21 +81,22 @@ void mmu_init(void) {
     __asm__ volatile("msr mair_el1, %0" : : "r"(mair) : "memory");
 
     LOG_DEBUG("MMU: Building initial Page Tables.");
+#if NEPTUNE_PLATFORM_PI4
+    mmu_build_pi4_tables(memory_map, map_size, desc_size);
+#else
+    volatile uint64_t *l1 = l1_table;
+    volatile uint64_t *high_l1 = high_l1_table;
     for (int i = 0; i < 512; i++) {
         l1[i] = 0;
         high_l1[i] = 0;
     }
-
-    // Map 0x0000_0000 to 0x3FFF_FFFF (1 GiB) as Device Memory.
-    // QEMU virt places MMIO such as UART/GIC in this range.
-    l1[0] = 0x00000000 | PTE_VALID | PTE_BLOCK | PTE_AF | PTE_ATTRINDX(MT_DEVICE_nGnRnE);
-
-    // Map the rest of the 39-bit lower VA space as normal memory.
-    // QEMU virt DRAM starts at 0x4000_0000 and grows upward as -m increases.
+    l1[0] = PTE_VALID | PTE_BLOCK | PTE_AF |
+            PTE_ATTRINDX(MT_DEVICE_nGnRnE);
     for (uint64_t i = 1; i < 512; i++) {
         l1[i] = (i << 30) | PTE_VALID | PTE_BLOCK | PTE_AF |
                 PTE_ATTRINDX(MT_NORMAL) | PTE_SH_INNER;
     }
+#endif
     __asm__ volatile("dsb ishst" : : : "memory");
     __asm__ volatile("msr ttbr0_el1, %0" : : "r"((uint64_t)l1_table) : "memory");
     __asm__ volatile("msr ttbr1_el1, %0" : : "r"((uint64_t)high_l1_table) : "memory");

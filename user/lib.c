@@ -1,9 +1,15 @@
 #include "lib.h"
 #include "ns_proto.h"
 #include "fs_proto.h"
+#include "terminal_proto.h"
 #include <stdarg.h>
 
 static int uart_cap = -1;
+static int terminal_cap = CAP_STDOUT;
+static int terminal_output_enabled = 1;
+#define TERMINAL_PENDING_BYTES 16384
+static char terminal_pending[TERMINAL_PENDING_BYTES];
+static uint32_t terminal_pending_len;
 static void vfs_copy_name(char *dst, const char *src, uint64_t cap);
 
 static int get_uart_cap(void) {
@@ -13,22 +19,128 @@ static int get_uart_cap(void) {
     return uart_cap;
 }
 
+static int send_terminal_pending(void) {
+    uint32_t offset = 0;
+    while (terminal_output_enabled && offset < terminal_pending_len) {
+        uint64_t request[IPC_INLINE_WORDS] = {TERMINAL_REQ_WRITE};
+        char *terminal_bytes = (char *)&request[1];
+        uint32_t count = 0;
+        while (count < IPC_INLINE_BYTES - 8 && offset < terminal_pending_len) {
+            terminal_bytes[count++] = terminal_pending[offset++];
+        }
+        ipc_msg_t reply =
+            sys_ipc_call((uint32_t)terminal_cap, 0, (uint64_t)count + 8,
+                         request);
+        if (reply.status < 0) {
+            terminal_output_enabled = 0;
+            terminal_cap = -1;
+            return -1;
+        }
+    }
+    terminal_pending_len = 0;
+    return 0;
+}
+
+static void append_terminal(const char *buf, int len) {
+    if (!terminal_output_enabled) {
+        return;
+    }
+    for (int i = 0; i < len; i++) {
+        if (terminal_pending_len == TERMINAL_PENDING_BYTES &&
+            send_terminal_pending() < 0) {
+            return;
+        }
+        terminal_pending[terminal_pending_len++] = buf[i];
+    }
+}
+
 static void _flush_buf(const char *buf, int len) {
     int offset = 0;
     while (offset < len) {
         uint64_t chunks[IPC_INLINE_WORDS] = {0};
         char *dst = (char *)chunks;
         int i;
-        for (i = 0; i < (int)IPC_INLINE_BYTES && offset < len; i++, offset++) {
+        for (i = 0; i < (int)IPC_INLINE_BYTES - 8 && offset < len; i++, offset++) {
             dst[i] = buf[offset];
         }
         int cap = get_uart_cap();
-        if (cap < 0) {
-            return;
+        if (cap >= 0) {
+            sys_ipc_call((uint32_t)cap, 0, (uint64_t)i, chunks);
         }
-
-        sys_ipc_call((uint32_t)cap, 0, (uint64_t)i, chunks);
     }
+    append_terminal(buf, len);
+}
+
+int terminal_enable(void) {
+    uint64_t request[IPC_INLINE_WORDS] = {TERMINAL_REQ_FLUSH};
+    ipc_msg_t probe = sys_ipc_call(CAP_STDOUT, 0, 8, request);
+    if (probe.status >= 0) {
+        terminal_cap = CAP_STDOUT;
+        terminal_output_enabled = 1;
+        return 0;
+    }
+
+    int resolved = ns_resolve("terminal");
+    if (resolved < 0 || sys_bind_stdio((uint32_t)resolved) < 0) {
+        terminal_output_enabled = 0;
+        terminal_cap = -1;
+        return -1;
+    }
+    terminal_cap = CAP_STDOUT;
+    terminal_output_enabled = 1;
+    return terminal_output_enabled ? 0 : -1;
+}
+
+void terminal_commit(void) {
+    if (!terminal_output_enabled || terminal_cap < 0) {
+        return;
+    }
+    (void)send_terminal_pending();
+}
+
+void terminal_flush(void) {
+    if (!terminal_output_enabled || terminal_cap < 0) {
+        return;
+    }
+    if (send_terminal_pending() < 0) {
+        return;
+    }
+    uint64_t request[IPC_INLINE_WORDS] = {TERMINAL_REQ_FLUSH};
+    ipc_msg_t reply =
+        sys_ipc_call((uint32_t)terminal_cap, 0, 8, request);
+    if (reply.status < 0) {
+        terminal_cap = -1;
+    }
+}
+
+char terminal_read_char(void) {
+    if (!terminal_output_enabled) {
+        return 0;
+    }
+    terminal_commit();
+    uint64_t request[IPC_INLINE_WORDS] = {TERMINAL_REQ_READ};
+    ipc_msg_t reply =
+        sys_ipc_call(CAP_STDIN, 0, 8, request);
+    if (reply.status < 0) {
+        terminal_output_enabled = 0;
+        return 0;
+    }
+    return (char)reply.payload[0];
+}
+
+int terminal_write(const void *buf, size_t count) {
+    if (!buf) {
+        return -1;
+    }
+    const char *bytes = (const char *)buf;
+    while (count) {
+        int chunk = count > 240 ? 240 : (int)count;
+        _flush_buf(bytes, chunk);
+        bytes += chunk;
+        count -= (size_t)chunk;
+    }
+    terminal_commit();
+    return 0;
 }
 
 static inline void _put(char *buf, int *pos, char c) {
@@ -50,28 +162,185 @@ static void _fmt_uint(char *buf, int *pos, uint64_t val, unsigned int base) {
     for (int i = n - 1; i >= 0; i--) _put(buf, pos, tmp[i]);
 }
 
+typedef struct {
+    char *buf;
+    size_t size;
+    size_t pos;
+    size_t total;
+} fmt_out_t;
 
-void *memcpy(void *dst, const void *src, uint64_t n) {
+static void fmt_put(fmt_out_t *out, char c) {
+    if (out->buf && out->size && out->pos + 1 < out->size) {
+        out->buf[out->pos] = c;
+    }
+    out->pos++;
+    out->total++;
+}
+
+static void fmt_uint_out(fmt_out_t *out, uint64_t val, unsigned int base) {
+    const char *digits = "0123456789abcdef";
+    char tmp[32];
+    int n = 0;
+    if (val == 0) {
+        fmt_put(out, '0');
+        return;
+    }
+    while (val) {
+        tmp[n++] = digits[val % base];
+        val /= base;
+    }
+    while (n > 0) {
+        fmt_put(out, tmp[--n]);
+    }
+}
+
+int vsnprintf(char *buf, size_t size, const char *fmt, va_list args) {
+    fmt_out_t out = {buf, size, 0, 0};
+    if (!fmt) {
+        fmt = "(null)";
+    }
+
+    for (const char *p = fmt; *p; p++) {
+        if (*p != '%') {
+            fmt_put(&out, *p);
+            continue;
+        }
+        p++;
+        if (!*p) {
+            break;
+        }
+
+        switch (*p) {
+            case 'd': {
+                int val = va_arg(args, int);
+                uint64_t mag;
+                if (val < 0) {
+                    fmt_put(&out, '-');
+                    mag = (uint64_t)(-(int64_t)val);
+                } else {
+                    mag = (uint64_t)val;
+                }
+                fmt_uint_out(&out, mag, 10);
+                break;
+            }
+            case 'u': {
+                unsigned int val = va_arg(args, unsigned int);
+                fmt_uint_out(&out, (uint64_t)val, 10);
+                break;
+            }
+            case 'x': {
+                unsigned int val = va_arg(args, unsigned int);
+                fmt_uint_out(&out, (uint64_t)val, 16);
+                break;
+            }
+            case 'l': {
+                p++;
+                if (*p == 'u') {
+                    uint64_t val = va_arg(args, uint64_t);
+                    fmt_uint_out(&out, val, 10);
+                } else if (*p == 'x') {
+                    uint64_t val = va_arg(args, uint64_t);
+                    fmt_uint_out(&out, val, 16);
+                } else if (*p == 'd') {
+                    int64_t val = va_arg(args, int64_t);
+                    uint64_t mag;
+                    if (val < 0) {
+                        fmt_put(&out, '-');
+                        mag = (uint64_t)(-(val + 1)) + 1ULL;
+                    } else {
+                        mag = (uint64_t)val;
+                    }
+                    fmt_uint_out(&out, mag, 10);
+                } else {
+                    fmt_put(&out, '%');
+                    fmt_put(&out, 'l');
+                    if (*p) {
+                        fmt_put(&out, *p);
+                    }
+                }
+                break;
+            }
+            case 's': {
+                const char *s = va_arg(args, const char *);
+                if (!s) {
+                    s = "(null)";
+                }
+                while (*s) {
+                    fmt_put(&out, *s++);
+                }
+                break;
+            }
+            case 'c': {
+                fmt_put(&out, (char)va_arg(args, int));
+                break;
+            }
+            case '%': {
+                fmt_put(&out, '%');
+                break;
+            }
+            default: {
+                fmt_put(&out, '%');
+                fmt_put(&out, *p);
+                break;
+            }
+        }
+    }
+
+    if (buf && size) {
+        size_t nul = out.pos < size ? out.pos : size - 1;
+        buf[nul] = '\0';
+    }
+    return (int)out.total;
+}
+
+int snprintf(char *buf, size_t size, const char *fmt, ...) {
+    va_list args;
+    va_start(args, fmt);
+    int written = vsnprintf(buf, size, fmt, args);
+    va_end(args);
+    return written;
+}
+
+
+void *memcpy(void *dst, const void *src, size_t n) {
     uint8_t *d = (uint8_t *)dst;
     const uint8_t *s = (const uint8_t *)src;
-    for (uint64_t i = 0; i < n; i++) {
+    for (size_t i = 0; i < n; i++) {
         d[i] = s[i];
     }
     return dst;
 }
 
-void *memset(void *dst, int value, uint64_t n) {
+void *memmove(void *dst, const void *src, size_t n) {
     uint8_t *d = (uint8_t *)dst;
-    for (uint64_t i = 0; i < n; i++) {
+    const uint8_t *s = (const uint8_t *)src;
+    if (d == s || n == 0) {
+        return dst;
+    }
+    if (d < s) {
+        for (size_t i = 0; i < n; i++) {
+            d[i] = s[i];
+        }
+    } else {
+        for (size_t i = n; i > 0; i--) {
+            d[i - 1] = s[i - 1];
+        }
+    }
+    return dst;
+}
+
+void *memset(void *dst, int value, size_t n) {
+    uint8_t *d = (uint8_t *)dst;
+    for (size_t i = 0; i < n; i++) {
         d[i] = (uint8_t)value;
     }
     return dst;
 }
 
-int memcmp(const void *a, const void *b, uint64_t n) {
+int memcmp(const void *a, const void *b, size_t n) {
     const uint8_t *pa = (const uint8_t *)a;
     const uint8_t *pb = (const uint8_t *)b;
-    for (uint64_t i = 0; i < n; i++) {
+    for (size_t i = 0; i < n; i++) {
         if (pa[i] != pb[i]) {
             return (int)pa[i] - (int)pb[i];
         }
@@ -79,8 +348,8 @@ int memcmp(const void *a, const void *b, uint64_t n) {
     return 0;
 }
 
-uint64_t strlen(const char *s) {
-    uint64_t len = 0;
+size_t strlen(const char *s) {
+    size_t len = 0;
     while (s && s[len]) {
         len++;
     }
@@ -98,6 +367,111 @@ char *strchr(const char *s, int c) {
         s++;
     }
     return c == 0 ? (char *)s : 0;
+}
+
+char *strrchr(const char *s, int c) {
+    const char *found = 0;
+    do {
+        if (*s == (char)c) found = s;
+    } while (*s++);
+    return (char *)found;
+}
+
+int strcmp(const char *a, const char *b) {
+    if (!a) a = "";
+    if (!b) b = "";
+    while (*a && *b && *a == *b) {
+        a++;
+        b++;
+    }
+    return (int)(unsigned char)*a - (int)(unsigned char)*b;
+}
+
+int strncmp(const char *a, const char *b, size_t n) {
+    if (!a) a = "";
+    if (!b) b = "";
+    for (size_t i = 0; i < n; i++) {
+        unsigned char ca = (unsigned char)a[i];
+        unsigned char cb = (unsigned char)b[i];
+        if (ca != cb || ca == 0 || cb == 0) {
+            return (int)ca - (int)cb;
+        }
+    }
+    return 0;
+}
+
+char *strcpy(char *dst, const char *src) {
+    char *out = dst;
+    if (!dst) {
+        return 0;
+    }
+    if (!src) {
+        src = "";
+    }
+    while ((*dst++ = *src++)) {
+    }
+    return out;
+}
+
+char *strncpy(char *dst, const char *src, size_t n) {
+    if (!dst) {
+        return 0;
+    }
+    if (!src) {
+        src = "";
+    }
+    size_t i = 0;
+    for (; i < n && src[i]; i++) {
+        dst[i] = src[i];
+    }
+    for (; i < n; i++) {
+        dst[i] = '\0';
+    }
+    return dst;
+}
+
+int isdigit(int c) {
+    return c >= '0' && c <= '9';
+}
+
+int isspace(int c) {
+    return c == ' ' || c == '\t' || c == '\n' ||
+           c == '\r' || c == '\f' || c == '\v';
+}
+
+int isalpha(int c) {
+    return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z');
+}
+
+int isalnum(int c) {
+    return isalpha(c) || isdigit(c);
+}
+
+int tolower(int c) {
+    return (c >= 'A' && c <= 'Z') ? c + ('a' - 'A') : c;
+}
+
+int toupper(int c) {
+    return (c >= 'a' && c <= 'z') ? c - ('a' - 'A') : c;
+}
+
+int atoi(const char *s) {
+    int sign = 1;
+    int value = 0;
+    while (s && isspace(*s)) {
+        s++;
+    }
+    if (s && (*s == '-' || *s == '+')) {
+        if (*s == '-') {
+            sign = -1;
+        }
+        s++;
+    }
+    while (s && isdigit(*s)) {
+        value = value * 10 + (*s - '0');
+        s++;
+    }
+    return value * sign;
 }
 
 void puts(const char *s) {
@@ -186,12 +560,14 @@ void printf(const char *fmt, ...) {
     va_end(args);
 }
 
+void __assert_fail(const char *expr, const char *file, int line) {
+    printf("assertion failed: %s at %s:%d\n",
+           expr ? expr : "(null)", file ? file : "(unknown)", line);
+    sys_exit(127);
+}
+
 int streq(const char *a, const char *b) {
-    while (*a && *b && (*a == *b)) {
-        a++;
-        b++;
-    }
-    return *a == '\0' && *b == '\0';
+    return strcmp(a, b) == 0;
 }
 
 static int vfs_bound = 0;
@@ -441,7 +817,24 @@ void vfs_close_handle(uint32_t handle) {
 }
 
 spawn_result_t vfs_spawn_program(const char *name, uint8_t priority) {
+    return vfs_spawn_program_args(name, priority, 0, 0);
+}
+
+spawn_result_t vfs_spawn_program_args(const char *name, uint8_t priority,
+                                      char *const argv[], uint32_t argc) {
+    return vfs_spawn_program_stdio(name, priority, argv, argc, 0, 0, 0);
+}
+
+spawn_result_t vfs_spawn_program_stdio(const char *name, uint8_t priority,
+                                       char *const argv[], uint32_t argc,
+                                       uint32_t stdin_cap,
+                                       uint32_t stdout_cap,
+                                       uint32_t stderr_cap) {
     spawn_result_t fail = { .tid = (uint32_t)-1, .endpoint_cap = -1 };
+
+    if (argc > 8 || (argc != 0 && !argv)) {
+        return fail;
+    }
 
     vfs_file_info_t info = vfs_open_file(name);
     if (info.status < 0 || info.size == 0) {
@@ -455,7 +848,11 @@ spawn_result_t vfs_spawn_program(const char *name, uint8_t priority) {
         return fail;
     }
 
-    return sys_spawn_exec2((uint32_t)exec.value0, priority);
+    if (stdin_cap || stdout_cap || stderr_cap) {
+        return sys_spawn_exec_stdio((uint32_t)exec.value0, priority, argv, argc,
+                                    stdin_cap, stdout_cap, stderr_cap);
+    }
+    return sys_spawn_exec_args((uint32_t)exec.value0, priority, argv, argc);
 }
 
 uint64_t page_align_size(uint64_t size) {

@@ -16,12 +16,8 @@
 #include "smp.h"
 #include "elf.h"
 #include "initrd.h"
-
-#define UART_MMIO_PA 0x09000000ULL
-#define USER_UART_MMIO_VA 0xB0000000ULL
-#define USER_VIRTIO_BLK_MMIO_VA 0xB0010000ULL
-#define VIRTIO_BLK_MMIO_PA 0x0A000000ULL
-#define VIRTIO_BLK_MMIO_SIZE 0x4000ULL
+#include "display_boot.h"
+#include "platform.h"
 
 #define PANIC(msg)                                                             \
   do {                                                                         \
@@ -33,11 +29,17 @@
   } while (0)
 
 #define BOOT_ARCHIVE_MAX_SIZE (8 * 1024 * 1024)
+#if NEPTUNE_PLATFORM_PI4
+#define BOOT_FILE_COUNT 7
+#else
 #define BOOT_FILE_COUNT 4
+#endif
 static uint8_t boot_archive_storage[BOOT_ARCHIVE_MAX_SIZE] __attribute__((aligned(4096)));
 
 void neptune_kmain(void *memory_map, uint64_t map_size, uint64_t desc_size,
-                   void *rsdp_ptr, void *initrd_data, uint64_t initrd_size) {
+                   void *rsdp_ptr, void *initrd_data, uint64_t initrd_size,
+                   const display_boot_info_t *display_info) {
+  platform_early_init();
   uart_init();
   uart_puts("\n========================================\n");
   uart_puts("    Neptune Microkernel (AArch64)\n");
@@ -65,7 +67,7 @@ void neptune_kmain(void *memory_map, uint64_t map_size, uint64_t desc_size,
   LOG_OK("Exceptions Initialized (VBAR_EL1 set).");
 
   LOG_DEBUG("Enabling MMU...");
-  mmu_init();
+  mmu_init(memory_map, map_size, desc_size);
   LOG_OK("MMU is active. We are running with Virtual Memory mapped!");
 
   LOG_DEBUG("Starting Physical Memory Manager (PMM)...");
@@ -110,16 +112,27 @@ void neptune_kmain(void *memory_map, uint64_t map_size, uint64_t desc_size,
   LOG_DEBUG("Starting ACPI Parsing for Hardware Discovery...");
   if (acpi_init(rsdp_ptr) < 0) {
     LOG_FAIL("Failed to parse ACPI tables!");
+    if (platform_is_pi4()) {
+      while (1) __asm__ volatile("wfi");
+    }
+  }
+  if (platform_validate_acpi() < 0) {
+    while (1) __asm__ volatile("wfi");
   }
 
   LOG_DEBUG("Starting Generic Interrupt Controller (GICv2)...");
   gic_init();
 
   LOG_DEBUG("Starting Task Scheduler...");
+  sched_set_display_boot_info(display_info);
   sched_init();
 
-  LOG_DEBUG("Starting secondary cores...");
-  smp_init();
+  if (platform_get()->supports_smp) {
+    LOG_DEBUG("Starting secondary cores...");
+    smp_init();
+  } else {
+    LOG_OK("SMP: disabled for Pi 4 serial bring-up.");
+  }
 
   const uint8_t *init_elf = 0;
   uint64_t init_elf_len = 0;
@@ -211,10 +224,20 @@ static EFI_STATUS load_boot_archive(EFI_HANDLE ImageHandle,
   } boot_file_t;
 
   static boot_file_t files[BOOT_FILE_COUNT] = {
+#if NEPTUNE_PLATFORM_PI4
+      {(CHAR16 *)L"\\boot\\init.elf", "init.elf"},
+      {(CHAR16 *)L"\\boot\\ns.elf", "ns.elf"},
+      {(CHAR16 *)L"\\boot\\uart.elf", "uart.elf"},
+      {(CHAR16 *)L"\\boot\\keyboard.elf", "keyboard.elf"},
+      {(CHAR16 *)L"\\boot\\shell.elf", "shell.elf"},
+      {(CHAR16 *)L"\\boot\\speed.elf", "speed.elf"},
+      {(CHAR16 *)L"\\boot\\speedipc.elf", "speedipc.elf"},
+#else
       {(CHAR16 *)L"\\boot\\init.elf", "init.elf"},
       {(CHAR16 *)L"\\boot\\ns.elf", "ns.elf"},
       {(CHAR16 *)L"\\boot\\block.elf", "block.elf"},
       {(CHAR16 *)L"\\boot\\fs.elf", "fs.elf"},
+#endif
   };
 
   if (!buffer || !buffer_size || *buffer_size < sizeof(initrd_header_t) +
@@ -295,6 +318,61 @@ EFI_STATUS efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable) {
     PANIC(L"Failed to find ACPI 2.0 RSDP!\r\n");
   }
 
+  static display_boot_info_t display_info;
+  EFI_GUID gop_guid = {0x9042a9de,
+                       0x23dc,
+                       0x4a38,
+                       {0x96, 0xfb, 0x7a, 0xde, 0xd0, 0x80, 0x51, 0x6a}};
+  EFI_GRAPHICS_OUTPUT_PROTOCOL *gop = 0;
+  if (SystemTable->BootServices->LocateProtocol &&
+      SystemTable->BootServices->LocateProtocol(&gop_guid, 0,
+                                                (void **)&gop) == EFI_SUCCESS &&
+      gop && gop->Mode && gop->Mode->Info) {
+    uint32_t best_mode = gop->Mode->Mode;
+    uint64_t best_pixels =
+        (uint64_t)gop->Mode->Info->HorizontalResolution *
+        gop->Mode->Info->VerticalResolution;
+    if (gop->QueryMode && gop->SetMode) {
+      for (uint32_t mode = 0; mode < gop->Mode->MaxMode; mode++) {
+        EFI_GRAPHICS_OUTPUT_MODE_INFORMATION *candidate = 0;
+        uint64_t candidate_size = 0;
+        if (gop->QueryMode(gop, mode, &candidate_size, &candidate) != EFI_SUCCESS ||
+            !candidate || candidate->PixelFormat > DISPLAY_PIXEL_BIT_MASK) {
+          continue;
+        }
+        uint64_t pixels =
+            (uint64_t)candidate->HorizontalResolution *
+            candidate->VerticalResolution;
+        if (candidate->HorizontalResolution <= 1920 &&
+            candidate->VerticalResolution <= 1080 && pixels > best_pixels) {
+          best_mode = mode;
+          best_pixels = pixels;
+        }
+      }
+      if (best_mode != gop->Mode->Mode) {
+        (void)gop->SetMode(gop, best_mode);
+      }
+    }
+  }
+  if (gop && gop->Mode && gop->Mode->Info &&
+      gop->Mode->FrameBufferBase && gop->Mode->FrameBufferSize &&
+      gop->Mode->Info->PixelFormat <= DISPLAY_PIXEL_BIT_MASK) {
+    display_info.magic = DISPLAY_BOOT_MAGIC;
+    display_info.version = DISPLAY_BOOT_VERSION;
+    display_info.width = gop->Mode->Info->HorizontalResolution;
+    display_info.height = gop->Mode->Info->VerticalResolution;
+    display_info.pixels_per_scan_line = gop->Mode->Info->PixelsPerScanLine;
+    display_info.pixel_format = gop->Mode->Info->PixelFormat;
+    display_info.red_mask = gop->Mode->Info->PixelInformation.RedMask;
+    display_info.green_mask = gop->Mode->Info->PixelInformation.GreenMask;
+    display_info.blue_mask = gop->Mode->Info->PixelInformation.BlueMask;
+    display_info.reserved_mask = gop->Mode->Info->PixelInformation.ReservedMask;
+    display_info.framebuffer_pa = gop->Mode->FrameBufferBase;
+    display_info.framebuffer_size = gop->Mode->FrameBufferSize;
+    display_info.framebuffer_va = DISPLAY_FRAMEBUFFER_VA +
+                                  (display_info.framebuffer_pa & 0xFFFULL);
+  }
+
   uint64_t boot_archive_size = BOOT_ARCHIVE_MAX_SIZE;
   EFI_STATUS boot_status =
       load_boot_archive(ImageHandle, SystemTable, boot_archive_storage,
@@ -335,7 +413,7 @@ EFI_STATUS efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable) {
     }
   }
   neptune_kmain(MemoryMap, MemoryMapSize, DescriptorSize, rsdp_ptr,
-                boot_archive_storage, boot_archive_size);
+                boot_archive_storage, boot_archive_size, &display_info);
 
   return EFI_SUCCESS;
 }

@@ -10,6 +10,8 @@
 #include "pmm.h"
 #include "kmalloc.h"
 #include "smp.h"
+#include "pipe.h"
+#include "platform.h"
 
 #define SYS_YIELD 1
 #define SYS_SEND  2
@@ -58,6 +60,17 @@
 #define SYS_DMA_EXPORT   48
 #define SYS_DMA_PADDR    49
 #define SYS_DMA_RELEASE  50
+#define SYS_IPC_RECV_TIMEOUT 51
+#define SYS_BIND_STDIO       52
+#define SYS_IPC_PROFILE      53
+#define SYS_IPC_REPLY_RECV   54
+#define SYS_SPAWN_EXEC_ARGS  55
+#define SYS_PIPE_CREATE      56
+#define SYS_PIPE_READ        57
+#define SYS_PIPE_WRITE       58
+#define SYS_PIPE_CLOSE       59
+#define SYS_PIPE_DUP         60
+#define SYS_SPAWN_EXEC_STDIO 61
 
 #define EC_IABORT_LOWER_EL 0x20
 #define EC_PC_ALIGN_FAULT  0x22
@@ -71,7 +84,7 @@ void exceptions_init(void) {
     __asm__ volatile("msr daifclr, #2");
 }
 
-void handle_sync(uint64_t *regs) {
+void handle_sync(uint64_t *regs, uint64_t vector_source) {
     uint64_t esr, elr, far;
     __asm__ volatile("mrs %0, esr_el1" : "=r"(esr));
     __asm__ volatile("mrs %0, elr_el1" : "=r"(elr));
@@ -185,6 +198,35 @@ void handle_sync(uint64_t *regs) {
             sched_dma_paddr_syscall(regs, (uint32_t)arg0, arg1);
         } else if (syscall_num == SYS_DMA_RELEASE) {
             sched_dma_release_syscall(regs, (uint32_t)arg0);
+        } else if (syscall_num == SYS_IPC_RECV_TIMEOUT) {
+            ipc_recv_timeout_syscall(regs, arg1);
+        } else if (syscall_num == SYS_BIND_STDIO) {
+            sched_bind_stdio_syscall(regs, (uint32_t)arg0);
+        } else if (syscall_num == SYS_IPC_PROFILE) {
+            ipc_profile_syscall(regs);
+        } else if (syscall_num == SYS_IPC_REPLY_RECV) {
+            ipc_reply_recv_syscall(regs);
+        } else if (syscall_num == SYS_SPAWN_EXEC_ARGS) {
+            sched_spawn_exec_args_syscall(regs, (uint32_t)arg0,
+                                          (uint8_t)arg1, arg2,
+                                          (uint32_t)regs[3]);
+        } else if (syscall_num == SYS_PIPE_CREATE) {
+            pipe_create_syscall(regs);
+        } else if (syscall_num == SYS_PIPE_READ) {
+            pipe_read_syscall(regs, (uint32_t)arg0, arg1, arg2);
+        } else if (syscall_num == SYS_PIPE_WRITE) {
+            pipe_write_syscall(regs, (uint32_t)arg0, arg1, arg2);
+        } else if (syscall_num == SYS_PIPE_CLOSE) {
+            pipe_close_syscall(regs, (uint32_t)arg0);
+        } else if (syscall_num == SYS_PIPE_DUP) {
+            pipe_dup_syscall(regs, (uint32_t)arg0);
+        } else if (syscall_num == SYS_SPAWN_EXEC_STDIO) {
+            sched_spawn_exec_args_stdio_syscall(regs, (uint32_t)arg0,
+                                                (uint8_t)arg1, arg2,
+                                                (uint32_t)regs[3],
+                                                (uint32_t)regs[4],
+                                                (uint32_t)regs[5],
+                                                (uint32_t)regs[6]);
         } else {
             uart_puts("Unknown Syscall: ");
             uart_hex(syscall_num);
@@ -197,7 +239,7 @@ void handle_sync(uint64_t *regs) {
     if (sched_current_is_user() &&
         (ec == EC_IABORT_LOWER_EL || ec == EC_DABORT_LOWER_EL ||
          ec == EC_PC_ALIGN_FAULT || ec == EC_SP_ALIGN_FAULT || ec == 0)) {
-        sched_fault_current_task(esr, elr, far);
+        sched_fault_current_task(esr, elr, far, vector_source);
         return;
     }
 
@@ -226,7 +268,7 @@ void handle_irq(void) {
         reschedule_ipi = 1;
     } else if (int_id == 2) {
         tlb_shootdown_ipi = 1;
-    } else if (int_id == 30) {
+    } else if (int_id == platform_get()->timer_irq) {
         timer_handle_interrupt();
         timer_tick = 1;
     } else if (int_id > 31 && int_id < 1020) {

@@ -1,0 +1,5 @@
+name: TinyCC
+upstream: https://repo.or.cz/tinycc.git
+commit: a338258d309c888bde96b2d1f206299231a54ddf
+license: LGPL-2.1-or-later
+vendored-path: third_party/tcc

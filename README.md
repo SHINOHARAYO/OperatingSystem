@@ -3,7 +3,7 @@
 Neptune is an experimental AArch64 microkernel-style OS that boots as a UEFI
 application under QEMU. It has isolated EL0 user tasks, capability-based IPC,
 lazy virtual memory, zero-copy memory sharing, a user-space service model, an
-EL1 VFS fast channel, and an SMP-shaped per-core O(1) MLFQ scheduler.
+EL1 VFS fast channel, and a four-core per-core O(1) MLFQ scheduler.
 
 This is a teaching and research OS. It is not production software.
 
@@ -34,10 +34,35 @@ Useful targets:
 | `make image` | Create `build/fat.img`, copy the `/boot` seed into it, create `build/storage.fat` only if missing, and refresh app ELFs in place |
 | `make update-storage-apps` | Copy freshly built user ELFs into existing `build/storage.fat` without formatting it |
 | `make run` | Rebuild the image targets and boot QEMU in `-nographic` mode |
-| `make run_g` | Rebuild the image targets and boot QEMU with a graphical display |
+| `make run_g` | Rebuild and boot QEMU with the firmware `ramfb` graphical display |
 | `make reset-storage` | Replace `build/storage.fat` with a fresh copy of `apps.fat` |
 | `make clean` | Remove generated build output but preserve `build/storage.fat` |
 | `make distclean` | Remove all generated build output, including `build/storage.fat` |
+
+## Raspberry Pi 4 Serial Bring-Up
+
+The Pi 4 target is a separate, serial-only UEFI bring-up profile. It does not
+yet provide HDMI graphics, USB input, SD-card storage, or SMP; those services
+currently depend on QEMU virtio devices.
+
+Build its deployable EFI tree from WSL:
+
+```sh
+make PLATFORM=pi4 pi4-image
+```
+
+This creates `build/pi4/pi4-esp`, containing Neptune at
+`EFI/BOOT/BOOTAA64.EFI`, its small initrd boot set, and a `config.txt` that
+enables the PL011 UART on the GPIO header. Extract a Pi 4 UEFI firmware release
+to a directory, then from PowerShell prepare the FAT32 SD-card partition:
+
+```powershell
+.\tools\prepare-pi4-boot.ps1 -FirmwareDir C:\path\to\RPi4-UEFI -Destination E:\
+```
+
+Use a 3.3 V USB-to-TTL adapter at 115200 8N1: adapter RX to GPIO14/pin 8,
+adapter TX to GPIO15/pin 10, and ground to pin 6. Do not connect the adapter's
+5 V lead. The initial shell must be used over this serial connection.
 
 The default QEMU memory size is `2048M`; the default QEMU CPU count is `4`.
 
@@ -77,8 +102,11 @@ Neptune currently boots this service stack:
 | `name_server` | EL0 | Service registry and endpoint lookup |
 | `block_server` | EL0 | Virtio PCI block driver for persistent storage |
 | `fs_server` | EL0 | FatFs-backed filesystem and VFS service |
+| `display_server` | EL0 | Firmware framebuffer drawing service |
+| `compositor` | EL0 | Capability-shared surfaces and damage composition |
+| `terminal` | EL0 | Graphical text console and focused keyboard bridge |
 | `init` | EL0 | First user process; owns service startup policy |
-| `shell` | EL0 | Interactive command shell launched from `storage.fat` |
+| `shell` | EL0 | Command engine attached to graphical terminal or serial fallback |
 
 The kernel keeps authority, scheduling, memory mappings, faults, and IPC
 handoff. Filesystem metadata and directory state now live in `fs.elf` user
@@ -107,11 +135,60 @@ such as `/sbin/uart.elf`, `/sbin/keyboard.elf`, and `/bin/shell.elf`.
 - 39-bit lower-half virtual address layout.
 - 40-bit physical-address support.
 - ASID-aware user address spaces with targeted TLB invalidation.
-- Per-ASID CPU residency masks keep ordinary VA+ASID and ASID shootdowns
-  limited to cores that have actually executed that address space.
-- Cross-core TLB shootdown uses GIC SGIs with per-core acknowledgements for
-  VA+ASID, VA-all-ASID, ASID, and full invalidations.
+- Per-ASID CPU residency masks track the cores that have executed each address
+  space.
+- Cross-core TLB invalidation uses AArch64 inner-shareable `TLBI ...IS`
+  operations followed by `DSB ISH` and `ISB`, giving architectural broadcast
+  completion without software SGI acknowledgement waits.
 - ACPI/PCI discovery for the EL0 virtio block driver.
+
+### Graphics
+
+- The EFI stage discovers UEFI Graphics Output Protocol state before
+  `ExitBootServices`.
+- The EFI stage selects the highest supported GOP mode up to `1920x1080`
+  before handing the framebuffer to the display service.
+- The kernel maps the framebuffer only into the authorized `display.elf`
+  service, together with a read-only display boot-info page.
+- `display.elf` owns framebuffer drawing in EL0 and registers itself with the
+  name server.
+- RGB, BGR, and bitmask framebuffer pixel formats are supported.
+- The display service draws a minimal console-style graphical boot log on a
+  black background and exposes IPC
+  operations for display information, clearing, clipped rectangle fills, and
+  registered-buffer blits.
+- `compositor.elf` owns a canonical RGB backbuffer and accepts client surfaces
+  through lent memory capabilities. Uncovered compositor space remains black.
+- Surface creation, ownership checks, movement, damage, and destruction happen
+  in EL0. Only damaged rectangles are recomposed and sent to `display.elf`.
+- The compositor assigns keyboard focus to the owner of the topmost newly
+  created surface. `keyboard.elf` enforces that focus and restores shell input
+  when no graphical surface owns it.
+- The compositor uses timed IPC receive maintenance cycles to remove surfaces
+  whose owner task exited, crashed, or was killed before destroying them.
+- The shell `gfx` command queries the service and draws a color test.
+- The shell `desktop` command creates three capability-shared compositor
+  surfaces and safely destroys/revokes its previous demo surfaces when rerun.
+- `/bin/snake.elf` is a standalone graphical application. The shell `snake`
+  command launches it, and the game owns keyboard focus while its lent
+  compositor surface exists. Its board scales to the active framebuffer
+  resolution.
+- `terminal.elf` owns a compositor surface containing a text grid, colored
+  cursor, a 1,000-line scrollback ring, and basic ANSI color, clear-screen,
+  cursor-home, and line-erase handling. Page Up, Page Down, Home, and End
+  navigate scrollback while focused.
+- User-space output is buffered before being enqueued to `terminal.elf`; the
+  terminal replies to writers before compositor presentation and continues
+  serving output while the shell waits for keyboard input.
+- The shell binds reserved inherited `stdin`, `stdout`, and `stderr` endpoint
+  capability slots. Spawned and forked programs therefore write to the same
+  graphical terminal automatically, while output remains mirrored to
+  `uart.elf` for serial fallback and diagnostics.
+- `keyboard.elf` buffers UART and virtio-keyboard press, release, repeat, and
+  modifier events. Focused clients use blocking input IPC; the driver uses a
+  short scheduler sleep while waiting so clients do not repeatedly poll and
+  focus-control IPC cannot deadlock.
+- `make run_g` boots QEMU with firmware `ramfb`; `make run` remains serial-only.
 
 ### Scheduler
 
@@ -122,10 +199,11 @@ such as `/sbin/uart.elf`, `/sbin/keyboard.elf`, and `/bin/shell.elf`.
 - Secondary cores are started with PSCI, get private stacks, initialize their
   GIC CPU interface and local timer, register as online scheduler cores, and
   enter the scheduler through per-core idle TCBs.
-- Bootstrap services and IPC/VFS-heavy tasks stay on CPU0; normal priority-0
-  user workloads can be placed on or stolen by secondary cores.
+- Bootstrap services stay on CPU0; ordinary user tasks, including IPC, VFS,
+  and memory-capability clients, can be placed on or stolen by secondary cores.
 - GICv2 SGI send support is present for IPI plumbing.
-- Per-core ready queues are protected by scheduler spinlocks.
+- Per-core ready queues and timer wheels are protected by IRQ-save scheduler
+  spinlocks, preventing timer/reschedule IRQ self-deadlocks.
 - Cross-core reschedule requests can be delivered through SGI/IPI.
 - ASID allocation and task lookup/growth have first-pass SMP locks.
 - Task slots are stable non-moving TCB allocations behind a growable pointer
@@ -133,15 +211,18 @@ such as `/sbin/uart.elf`, `/sbin/keyboard.elf`, and `/bin/shell.elf`.
 - Public task lookup uses held references with deferred slot recycling, so
   killed tasks are removed immediately but their TCB slot is not reused until
   outstanding kernel references are released.
-- IPC endpoint queues and VFS service queues use endpoint-task locks so
-  enqueue/dequeue/block transitions are atomic enough for the current SMP
-  model.
+- IPC endpoint queues and VFS service queues use IRQ-save endpoint-task locks
+  for atomic enqueue/dequeue/block transitions.
 - Tasks carry a scheduler core id so ready/timer ownership survives task-table
   growth and ready-task migration.
 - Idle cores use lock-ordered queue-transfer work stealing for eligible
   `READY` user tasks. A stolen task remains visible on exactly one ready queue.
 - Remote kill requests are completed by the target task's owner core, avoiding
   cross-core address-space teardown.
+- Child termination records and wait transitions are serialized, preventing
+  lost wakeups when a child exits on another core.
+- Four simultaneous normal EL0 workloads execute on CPUs 0 through 3 under
+  QEMU, and remote kill/wait lifecycle cleanup works across those cores.
 - O(1) MLFQ with 32 circular ready queues.
 - Bitmap readiness tracking with native AArch64 `CLZ` selection.
 - Queue 0 is highest priority and maps to bitmap bit 31.
@@ -151,7 +232,8 @@ such as `/sbin/uart.elf`, `/sbin/keyboard.elf`, and `/bin/shell.elf`.
   - queues 8-15: 4 ms
   - queues 16-23: 8 ms
   - queues 24-31: 16 ms
-- 1024-bucket timer wheel for sleep and IRQ timeout wakeups.
+- 1024-bucket owner-core timer wheels with locked insert, remove, timeout, and
+  IRQ-wakeup paths.
 - Per-core local priority boost every 1000 ticks avoids cross-core ready-queue
   rebuilding while preventing starvation on each CPU.
 - Yield keeps priority; CPU-bound quantum exhaustion demotes.
@@ -162,6 +244,9 @@ such as `/sbin/uart.elf`, `/sbin/keyboard.elf`, and `/bin/shell.elf`.
 - Physical page allocator.
 - Kernel heap diagnostics.
 - Frame objects with refcounts above PMM pages.
+- PMM allocation, frame refcounts, page-table mutation, VM objects, and the
+  page cache are serialized for concurrent use by user tasks on different
+  cores.
 - VM objects for anonymous and boot-archive-backed mappings.
 - Per-task VMA tables for ELF, stack, guard, mmap, imports, and file mappings.
 - Dynamically growing VMA tables with sorted lookup.
@@ -187,9 +272,12 @@ such as `/sbin/uart.elf`, `/sbin/keyboard.elf`, and `/bin/shell.elf`.
 ### Object Capabilities
 
 - Unified per-task capability table.
+- Per-task capability table growth, lookup, install, copy, clear, and revoke
+  operations are serialized by Orange Cat.
 - Typed slots with object IDs, rights, and flags.
 - Endpoint, reply, exec, file, VMA, frame, and DMA cap types.
-- Reserved `CAP_SELF = 1` and `CAP_NS = 2`.
+- Reserved `CAP_SELF = 1`, `CAP_NS = 2`, and inherited endpoint slots
+  `CAP_STDIN = 3`, `CAP_STDOUT = 4`, and `CAP_STDERR = 5`.
 - Capability checks for IPC, spawn, file access, memory mapping, and DMA
   address resolution.
 - `capstat` shell command.
@@ -197,12 +285,21 @@ such as `/sbin/uart.elf`, `/sbin/keyboard.elf`, and `/bin/shell.elf`.
 ### IPC
 
 - Capability-based synchronous IPC.
-- `ipc_call`, `ipc_recv`, and one-shot `ipc_reply`.
+- `ipc_call`, `ipc_recv`, one-shot `ipc_reply`, and atomic `ipc_reply_recv`.
 - Register-only fast path for payloads up to 128 bytes in `x3` through `x18`.
+- `ipc_reply_recv` parks a server on its receive endpoint before handing control
+  back to the caller, allowing repeated same-core request/reply traffic to avoid
+  ready-queue insertion and dynamic reply-cap allocation.
+- Direct rendezvous uses a generation-tagged one-shot reply token held entirely
+  in kernel task state. Ordinary `ipc_recv` keeps the capability-backed reply
+  path, so services opt into the tighter fast-path lifecycle explicitly.
 - Slow path with one zero-copy memory attachment.
 - Memory attachment modes: share, transfer, lend, revoke.
 - Handoff scheduling from caller to waiting receiver and replier to caller.
 - Kill/exit cleanup unwinds IPC queues and reply caps.
+- Per-core IPC profiling records call-path selection, capability lookup counter
+  ticks, and round-trip time; inspect aggregate ticks and nanoseconds with
+  `ipcstat`.
 - IPC implementation lives in `src/kernel/ipc.c`.
 
 ### VFS And Files
@@ -270,7 +367,9 @@ Neptune>
 
 The shell supports a 256-byte command line, end-of-line editing, Backspace,
 Delete, Ctrl-U to clear the current line, Ctrl-C to cancel the line, Ctrl-L to
-clear the screen, and Up/Down history recall for the last 32 commands.
+clear the screen, and Up/Down history recall for the last 32 commands. The
+graphical terminal keeps 1,000 lines of scrollback navigable with Page Up,
+Page Down, Home, and End.
 
 Use `help` for grouped command help, or `help <command>` for one command.
 
@@ -324,6 +423,9 @@ Diagnostic commands:
 | `vmmap` | Show this task's VMA table |
 | `capstat` | Show this task's capability slots |
 | `debug` | Show kernel/runtime debug info |
+| `gfx` | Query and exercise the EL0 display service |
+| `desktop` | Draw capability-shared compositor surfaces |
+| `snake` | Play graphical Snake using WASD |
 
 IPC and memory commands:
 
@@ -332,6 +434,7 @@ IPC and memory commands:
 | `ipcfast` | Test 0/8/64/128-byte register IPC payloads |
 | `ipccap` | Transfer an endpoint cap through IPC |
 | `ipckill` | Verify IPC cleanup on task kill |
+| `ipcstat` | Show IPC fast-path hit rate and cycle counters |
 | `memshare` | Share one page with another task |
 | `memxfer` | Transfer one page to another task |
 | `memcaplife` | Use a memory cap after unmapping the old VA |
@@ -446,28 +549,39 @@ The `/bin` app set contains:
 | `ipckill.elf` | `user/ipckill.c` | IPC kill cleanup test |
 | `speed.elf` | `user/speed.c` | Performance benchmark |
 | `speedipc.elf` | `user/speedipc.c` | IPC benchmark helper |
+| `snake.elf` | `user/snake.c` | Standalone graphical Snake game |
 
 The `/sbin` service set contains `init.elf`, `uart.elf`, `keyboard.elf`,
-`ns.elf`, `block.elf`, and `fs.elf`.
+`display.elf`, `compositor.elf`, `terminal.elf`, `ns.elf`, `block.elf`, and
+`fs.elf`.
 
 ## Known Limitations
 
-- Secondary cores run and steal normal EL0 workloads, but IPC/VFS-heavy tasks
-  remain pinned to CPU0 until shared service handoff paths are fully
-  SMP-hardened.
+- Bootstrap and hardware-facing service tasks remain pinned to CPU0. Ordinary
+  IPC/VFS clients migrate, but migrating the services themselves still needs a
+  complete device-state and service-lifecycle audit.
 - Work stealing currently moves only eligible `READY` tasks. Running, blocked,
   sleeping, timer-owned, and service tasks do not migrate yet.
-- TLB shootdowns use one request mailbox per target core. ASID residency keeps
-  contention low, but fully concurrent cross-core mapping mutation still needs
-  a serialized or generation-queued shootdown protocol.
-- Timer-wheel ownership, IPC/VFS queues, and remaining shared object tables
-  still need a complete IRQ-safe locking audit before arbitrary tasks can
-  migrate between cores.
+- Direct register IPC currently requires a same-core caller/server rendezvous
+  and an `ipc_reply_recv` server loop. Cross-core calls and ordinary receive
+  loops use the queue-based capability reply path.
+- Memory-cap mapping/object lifecycle, VMA metadata mutation, and some
+  device-state tables still need stronger synchronization before arbitrary
+  service tasks can migrate.
+- Page-table mutation and page-cache fills currently use global locks. They are
+  correct for current SMP workloads but may become contention points.
 - The `/boot` seed still contains `init.elf`, `ns.elf`, `block.elf`, and
   `fs.elf` because those are needed before `storage.fat` can be mounted; the
   normal service copies, shell, apps, and boot policy live in `storage.fat`.
 - The block driver requires a modern virtio-blk PCI device for `storage.fat`;
   there is no RAM-disk fallback yet.
+- Graphics currently use a firmware `ramfb` linear framebuffer. There is no
+  virtio-gpu modesetting, acceleration, or pointer input yet.
+- The compositor uses fixed-size surface and display-buffer tables. Clients
+  cannot resize surfaces or request window chrome.
+- The graphical terminal uses a compact built-in ASCII bitmap font and one
+  shared console session. It does not yet support selectable text, Unicode,
+  multiple sessions, or a general PTY byte-stream object.
 - DMA caps pin frame-backed user pages, but there is still no IOMMU or device
   isolation layer.
 - VFS currently fronts one FatFs-backed volume only.
@@ -480,8 +594,17 @@ The `/sbin` service set contains `init.elf`, `uart.elf`, `keyboard.elf`,
 ## Good Next Steps
 
 - Add IOMMU-style device domains and per-device DMA authority.
+- Add pointer routing, stacking controls, resize events, and window chrome,
+  then replace firmware `ramfb` with a user-space virtio-gpu driver.
+- Generalize the inherited standard-stream endpoints into reusable PTY session
+  objects so multiple graphical terminals and shells can coexist.
+- Establish a `no_std` Rust userspace target, then evaluate Slint's software
+  renderer as an optional high-level application toolkit while keeping display,
+  compositor, terminal, and input protocols toolkit-independent.
 - Add host-side automated QEMU smoke scripts with SMP assertions.
 - Extend migration to blocked/timer-owned tasks with explicit ownership
   transfer, then evaluate service-task migration.
-- Add IRQ-safe locks and a concurrent TLB shootdown request protocol.
+- Add per-address-space VMA locking and finish memory-cap and device-state
+  lifecycle synchronization.
+- Replace the global page-table mutation lock with per-address-space locks.
 - Replace fixed-size v1 object tables with growable or reclaiming allocators.

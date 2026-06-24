@@ -5,6 +5,7 @@
 #include "uart.h"
 #include "log.h"
 #include "smp.h"
+#include "spinlock.h"
 
 // Pointer to the root page table (L1 for 39-bit VA space)
 extern uint64_t l1_table[512];
@@ -12,6 +13,7 @@ extern uint64_t high_l1_table[512];
 
 #define PTE_MASK 0x0000FFFFFFFFF000ULL
 #define VMM_ASID_ALL 0xFFFFU
+static spinlock_t vmm_page_table_lock;
 
 void vmm_flush_va_asid(uint64_t va, uint16_t asid) {
     smp_tlb_shootdown_va_asid(va, asid);
@@ -59,6 +61,7 @@ static inline uint64_t get_l3_index(uint64_t va) {
 }
 
 int vmm_map_page_asid(uint64_t* pgd, uint16_t asid, uint64_t va, uint64_t pa, uint64_t flags) {
+    uint64_t irq_flags = spin_lock_irqsave(&vmm_page_table_lock);
     uint64_t *root_l1 = pgd;
     if (!root_l1) {
         root_l1 = (va & (1ULL << 63)) ? high_l1_table : l1_table;
@@ -80,7 +83,10 @@ int vmm_map_page_asid(uint64_t* pgd, uint16_t asid, uint64_t va, uint64_t pa, ui
         }
         
         l2_table = (uint64_t *)pmm_alloc_page();
-        if (!l2_table) return -1;
+        if (!l2_table) {
+            spin_unlock_irqrestore(&vmm_page_table_lock, irq_flags);
+            return -1;
+        }
         
         if (is_block) {
             // Split the 1GB block into 512 x 2MB blocks to preserve mappings!
@@ -97,7 +103,10 @@ int vmm_map_page_asid(uint64_t* pgd, uint16_t asid, uint64_t va, uint64_t pa, ui
     }
     if ((l2_table[l2_idx] & PTE_VALID) == 0 || (l2_table[l2_idx] & PTE_TABLE) == 0) {
         l3_table = (uint64_t *)pmm_alloc_page();
-        if (!l3_table) return -1;
+        if (!l3_table) {
+            spin_unlock_irqrestore(&vmm_page_table_lock, irq_flags);
+            return -1;
+        }
         l2_table[l2_idx] = ((uint64_t)l3_table & PTE_MASK) | PTE_VALID | PTE_TABLE;
     } else {
         l3_table = (uint64_t *)(l2_table[l2_idx] & PTE_MASK);
@@ -110,6 +119,7 @@ int vmm_map_page_asid(uint64_t* pgd, uint16_t asid, uint64_t va, uint64_t pa, ui
         }
     }
     l3_table[l3_idx] = (pa & PTE_MASK) | PTE_VALID | PTE_PAGE | flags;
+    spin_unlock_irqrestore(&vmm_page_table_lock, irq_flags);
     
     if (asid == VMM_ASID_ALL) {
         vmm_flush_va_all_asids(va);
@@ -125,6 +135,7 @@ int vmm_map_page(uint64_t* pgd, uint64_t va, uint64_t pa, uint64_t flags) {
 }
 
 void vmm_unmap_page_asid(uint64_t* pgd, uint16_t asid, uint64_t va) {
+    uint64_t irq_flags = spin_lock_irqsave(&vmm_page_table_lock);
     uint64_t *root_l1 = pgd;
     if (!root_l1) {
         root_l1 = (va & (1ULL << 63)) ? high_l1_table : l1_table;
@@ -134,10 +145,16 @@ void vmm_unmap_page_asid(uint64_t* pgd, uint16_t asid, uint64_t va) {
     uint64_t l2_idx = get_l2_index(va);
     uint64_t l3_idx = get_l3_index(va);
 
-    if ((root_l1[l1_idx] & PTE_VALID) == 0 || (root_l1[l1_idx] & PTE_TABLE) == 0) return;
+    if ((root_l1[l1_idx] & PTE_VALID) == 0 || (root_l1[l1_idx] & PTE_TABLE) == 0) {
+        spin_unlock_irqrestore(&vmm_page_table_lock, irq_flags);
+        return;
+    }
     uint64_t *l2_table = (uint64_t *)(root_l1[l1_idx] & PTE_MASK);
 
-    if ((l2_table[l2_idx] & PTE_VALID) == 0 || (l2_table[l2_idx] & PTE_TABLE) == 0) return;
+    if ((l2_table[l2_idx] & PTE_VALID) == 0 || (l2_table[l2_idx] & PTE_TABLE) == 0) {
+        spin_unlock_irqrestore(&vmm_page_table_lock, irq_flags);
+        return;
+    }
     uint64_t *l3_table = (uint64_t *)(l2_table[l2_idx] & PTE_MASK);
 
     if ((l3_table[l3_idx] & PTE_VALID) && (l3_table[l3_idx] & PTE_SW_OWNED)) {
@@ -147,6 +164,7 @@ void vmm_unmap_page_asid(uint64_t* pgd, uint16_t asid, uint64_t va) {
         }
     }
     l3_table[l3_idx] = 0;
+    spin_unlock_irqrestore(&vmm_page_table_lock, irq_flags);
 
     if (asid == VMM_ASID_ALL) {
         vmm_flush_va_all_asids(va);
@@ -168,6 +186,7 @@ uint64_t vmm_get_physical(uint64_t* pgd, uint64_t va) {
 }
 
 int vmm_query_page(uint64_t* pgd, uint64_t va, uint64_t *pa, uint64_t *entry) {
+    uint64_t irq_flags = spin_lock_irqsave(&vmm_page_table_lock);
     uint64_t *root_l1 = pgd;
     if (!root_l1) {
         root_l1 = (va & (1ULL << 63)) ? high_l1_table : l1_table;
@@ -177,31 +196,44 @@ int vmm_query_page(uint64_t* pgd, uint64_t va, uint64_t *pa, uint64_t *entry) {
     uint64_t l2_idx = get_l2_index(va);
     uint64_t l3_idx = get_l3_index(va);
 
-    if ((root_l1[l1_idx] & PTE_VALID) == 0) return -1;
+    if ((root_l1[l1_idx] & PTE_VALID) == 0) {
+        spin_unlock_irqrestore(&vmm_page_table_lock, irq_flags);
+        return -1;
+    }
     if ((root_l1[l1_idx] & PTE_TABLE) == 0) {
         if (pa) *pa = (root_l1[l1_idx] & PTE_MASK) + (va & 0x3FFFFFFFULL);
         if (entry) *entry = root_l1[l1_idx];
+        spin_unlock_irqrestore(&vmm_page_table_lock, irq_flags);
         return 0;
     }
 
     uint64_t *l2_table = (uint64_t *)(root_l1[l1_idx] & PTE_MASK);
-    if ((l2_table[l2_idx] & PTE_VALID) == 0) return -1;
+    if ((l2_table[l2_idx] & PTE_VALID) == 0) {
+        spin_unlock_irqrestore(&vmm_page_table_lock, irq_flags);
+        return -1;
+    }
     if ((l2_table[l2_idx] & PTE_TABLE) == 0) {
         if (pa) *pa = (l2_table[l2_idx] & PTE_MASK) + (va & 0x1FFFFFULL);
         if (entry) *entry = l2_table[l2_idx];
+        spin_unlock_irqrestore(&vmm_page_table_lock, irq_flags);
         return 0;
     }
 
     uint64_t *l3_table = (uint64_t *)(l2_table[l2_idx] & PTE_MASK);
-    if ((l3_table[l3_idx] & PTE_VALID) == 0) return -1;
+    if ((l3_table[l3_idx] & PTE_VALID) == 0) {
+        spin_unlock_irqrestore(&vmm_page_table_lock, irq_flags);
+        return -1;
+    }
 
     if (pa) *pa = (l3_table[l3_idx] & PTE_MASK) + (va & 0xFFFULL);
     if (entry) *entry = l3_table[l3_idx];
+    spin_unlock_irqrestore(&vmm_page_table_lock, irq_flags);
     return 0;
 }
 
 int vmm_update_page_flags_asid(uint64_t* pgd, uint16_t asid, uint64_t va,
                                uint64_t clear_mask, uint64_t set_mask) {
+    uint64_t irq_flags = spin_lock_irqsave(&vmm_page_table_lock);
     uint64_t *root_l1 = pgd;
     if (!root_l1) {
         root_l1 = (va & (1ULL << 63)) ? high_l1_table : l1_table;
@@ -213,21 +245,25 @@ int vmm_update_page_flags_asid(uint64_t* pgd, uint16_t asid, uint64_t va,
 
     if ((root_l1[l1_idx] & PTE_VALID) == 0 ||
         (root_l1[l1_idx] & PTE_TABLE) == 0) {
+        spin_unlock_irqrestore(&vmm_page_table_lock, irq_flags);
         return -1;
     }
 
     uint64_t *l2_table = (uint64_t *)(root_l1[l1_idx] & PTE_MASK);
     if ((l2_table[l2_idx] & PTE_VALID) == 0 ||
         (l2_table[l2_idx] & PTE_TABLE) == 0) {
+        spin_unlock_irqrestore(&vmm_page_table_lock, irq_flags);
         return -1;
     }
 
     uint64_t *l3_table = (uint64_t *)(l2_table[l2_idx] & PTE_MASK);
     if ((l3_table[l3_idx] & PTE_VALID) == 0) {
+        spin_unlock_irqrestore(&vmm_page_table_lock, irq_flags);
         return -1;
     }
 
     l3_table[l3_idx] = (l3_table[l3_idx] & ~clear_mask) | set_mask;
+    spin_unlock_irqrestore(&vmm_page_table_lock, irq_flags);
     if (asid == VMM_ASID_ALL) {
         vmm_flush_va_all_asids(va);
     } else {
@@ -238,6 +274,7 @@ int vmm_update_page_flags_asid(uint64_t* pgd, uint16_t asid, uint64_t va,
 
 void vmm_destroy_address_space(uint64_t* pgd) {
     if (!pgd) return;
+    uint64_t irq_flags = spin_lock_irqsave(&vmm_page_table_lock);
 
     for (int l1_idx = 0; l1_idx < 512; l1_idx++) {
         if ((pgd[l1_idx] & PTE_VALID) && (pgd[l1_idx] & PTE_TABLE)) {
@@ -264,4 +301,5 @@ void vmm_destroy_address_space(uint64_t* pgd) {
         }
     }
     pmm_free_page(pgd);
+    spin_unlock_irqrestore(&vmm_page_table_lock, irq_flags);
 }

@@ -1,0 +1,5 @@
+#pragma once
+
+#define TERMINAL_REQ_WRITE 1ULL
+#define TERMINAL_REQ_READ  2ULL
+#define TERMINAL_REQ_FLUSH 3ULL

@@ -65,7 +65,7 @@ vector_table_el1:
 
     // Current EL with SPx
     .align 7
-    b sync_entry
+    b sync_entry_current
     .align 7
     b irq_entry
     .align 7
@@ -75,7 +75,7 @@ vector_table_el1:
 
     // Lower EL using AArch64
     .align 7
-    b sync_entry
+    b sync_entry_lower64
     .align 7
     b irq_entry
     .align 7
@@ -109,9 +109,18 @@ trap_sync_lower32:  b handle_sync
 trap_fiq_lower32:   b handle_fiq
 trap_serror_lower32:b handle_serror
 
-sync_entry:
+sync_entry_current:
     save_all
     mov x0, sp
+    mov x1, #1
+    bl handle_sync
+    restore_all
+    eret
+
+sync_entry_lower64:
+    save_all
+    mov x0, sp
+    mov x1, #2
     bl handle_sync
     restore_all
     eret

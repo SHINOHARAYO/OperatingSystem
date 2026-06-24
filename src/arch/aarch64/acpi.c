@@ -52,6 +52,7 @@ typedef struct {
 
 #define MADT_TYPE_GIC_CPU_INTERFACE 11
 #define MADT_TYPE_GIC_DISTRIBUTOR   12
+#define MADT_TYPE_GIC_REDISTRIBUTOR 14
 
 typedef struct {
     ACPI_SUBTABLE_HEADER Header;
@@ -83,9 +84,19 @@ typedef struct {
     uint8_t Reserved2[3];
 } __attribute__((packed)) ACPI_MADT_GICD;
 
+typedef struct {
+    ACPI_SUBTABLE_HEADER Header;
+    uint16_t Reserved;
+    uint64_t DiscoveryRangeBaseAddress;
+    uint32_t DiscoveryRangeLength;
+} __attribute__((packed)) ACPI_MADT_GICR;
+
 static uint64_t gicd_base = 0;
 static uint64_t gicc_base = 0;
-static acpi_virtio_blk_info_t virtio_blk_info;
+static uint64_t gicr_base = 0;
+static uint32_t gicr_length = 0;
+static acpi_virtio_pci_info_t virtio_blk_info;
+static acpi_virtio_pci_info_t virtio_gpu_info;
 static uint64_t cpu_mpidrs[8];
 static uint32_t cpu_count = 0;
 
@@ -102,6 +113,7 @@ static uint32_t cpu_count = 0;
 #define PCI_CAP_ID_VENDOR_SPECIFIC 0x09
 #define PCI_VENDOR_VIRTIO          0x1AF4
 #define PCI_DEVICE_VIRTIO_BLK      0x1042
+#define PCI_DEVICE_VIRTIO_GPU      0x1050
 #define VIRTIO_PCI_CAP_COMMON_CFG  1
 #define VIRTIO_PCI_CAP_NOTIFY_CFG  2
 #define VIRTIO_PCI_CAP_ISR_CFG     3
@@ -169,7 +181,9 @@ static uint64_t round_up_page(uint64_t value) {
 }
 
 static int parse_virtio_pci_caps(const ACPI_MCFG_ALLOCATION *alloc, uint8_t bus,
-                                 uint8_t device, uint8_t function) {
+                                 uint8_t device, uint8_t function,
+                                 acpi_virtio_pci_info_t *out,
+                                 const char *name) {
     uint16_t status = pci_read16(alloc, bus, device, function, PCI_STATUS);
     if (!(status & PCI_STATUS_CAP_LIST)) {
         return -1;
@@ -228,7 +242,7 @@ static int parse_virtio_pci_caps(const ACPI_MCFG_ALLOCATION *alloc, uint8_t bus,
     }
     if (common_bar != notify_bar || common_bar != isr_bar ||
         common_bar != device_bar) {
-        LOG_WARN("ACPI: virtio-pci block uses split BARs; unsupported in this build.");
+        LOG_WARN("ACPI: virtio-pci device uses split BARs; unsupported in this build.");
         return -1;
     }
 
@@ -241,38 +255,40 @@ static int parse_virtio_pci_caps(const ACPI_MCFG_ALLOCATION *alloc, uint8_t bus,
     command |= PCI_COMMAND_MEMORY | PCI_COMMAND_BUS_MASTER;
     pci_write16(alloc, bus, device, function, PCI_COMMAND, command);
 
-    virtio_blk_info.present = 1;
-    virtio_blk_info.segment = alloc->SegmentGroup;
-    virtio_blk_info.bus = bus;
-    virtio_blk_info.device = device;
-    virtio_blk_info.function = function;
-    virtio_blk_info.bar_pa = bar_pa;
-    virtio_blk_info.bar_size = round_up_page(required_size ? required_size : 4096);
-    virtio_blk_info.common_off = common_off;
-    virtio_blk_info.notify_off = notify_off;
-    virtio_blk_info.isr_off = isr_off;
-    virtio_blk_info.device_off = device_off;
-    virtio_blk_info.notify_multiplier = notify_multiplier;
+    out->present = 1;
+    out->segment = alloc->SegmentGroup;
+    out->bus = bus;
+    out->device = device;
+    out->function = function;
+    out->bar_pa = bar_pa;
+    out->bar_size = round_up_page(required_size ? required_size : 4096);
+    out->common_off = common_off;
+    out->notify_off = notify_off;
+    out->isr_off = isr_off;
+    out->device_off = device_off;
+    out->notify_multiplier = notify_multiplier;
 
-    LOG_OK("ACPI: Discovered modern virtio-blk PCI device.");
-    LOG_DEBUG_HEX("ACPI: virtio-blk BAR PA: ", virtio_blk_info.bar_pa);
+    LOG_OK(name);
+    LOG_DEBUG_HEX("ACPI: virtio PCI BAR PA: ", out->bar_pa);
     return 0;
 }
 
 static void discover_pci_device(const ACPI_MCFG_ALLOCATION *alloc, uint8_t bus,
                                 uint8_t device, uint8_t function) {
-    if (virtio_blk_info.present) {
-        return;
-    }
-
     uint16_t vendor = pci_read16(alloc, bus, device, function, PCI_VENDOR_ID);
     if (vendor == 0xFFFF) {
         return;
     }
 
     uint16_t device_id = pci_read16(alloc, bus, device, function, PCI_DEVICE_ID);
-    if (vendor == PCI_VENDOR_VIRTIO && device_id == PCI_DEVICE_VIRTIO_BLK) {
-        parse_virtio_pci_caps(alloc, bus, device, function);
+    if (vendor == PCI_VENDOR_VIRTIO && device_id == PCI_DEVICE_VIRTIO_BLK &&
+        !virtio_blk_info.present) {
+        parse_virtio_pci_caps(alloc, bus, device, function, &virtio_blk_info,
+                              "ACPI: Discovered modern virtio-blk PCI device.");
+    } else if (vendor == PCI_VENDOR_VIRTIO && device_id == PCI_DEVICE_VIRTIO_GPU &&
+               !virtio_gpu_info.present) {
+        parse_virtio_pci_caps(alloc, bus, device, function, &virtio_gpu_info,
+                              "ACPI: Discovered modern virtio-gpu PCI device.");
     }
 }
 
@@ -286,8 +302,8 @@ static void parse_mcfg(ACPI_MCFG *mcfg) {
         ACPI_MCFG_ALLOCATION *alloc = (ACPI_MCFG_ALLOCATION *)ptr;
         LOG_DEBUG_HEX("ACPI: PCI ECAM base: ", alloc->BaseAddress);
 
-        for (uint16_t bus = alloc->StartBus; bus <= alloc->EndBus && !virtio_blk_info.present; bus++) {
-            for (uint8_t dev = 0; dev < 32 && !virtio_blk_info.present; dev++) {
+        for (uint16_t bus = alloc->StartBus; bus <= alloc->EndBus; bus++) {
+            for (uint8_t dev = 0; dev < 32; dev++) {
                 uint16_t vendor = pci_read16(alloc, (uint8_t)bus, dev, 0, PCI_VENDOR_ID);
                 if (vendor == 0xFFFF) {
                     continue;
@@ -295,7 +311,7 @@ static void parse_mcfg(ACPI_MCFG *mcfg) {
 
                 uint8_t header = pci_read8(alloc, (uint8_t)bus, dev, 0, PCI_HEADER_TYPE);
                 uint8_t functions = (header & 0x80) ? 8 : 1;
-                for (uint8_t fn = 0; fn < functions && !virtio_blk_info.present; fn++) {
+                for (uint8_t fn = 0; fn < functions; fn++) {
                     discover_pci_device(alloc, (uint8_t)bus, dev, fn);
                 }
             }
@@ -306,6 +322,9 @@ static void parse_mcfg(ACPI_MCFG *mcfg) {
 
     if (!virtio_blk_info.present) {
         LOG_WARN("ACPI: No modern virtio-blk PCI device found.");
+    }
+    if (!virtio_gpu_info.present) {
+        LOG_WARN("ACPI: No modern virtio-gpu PCI device found.");
     }
 }
 
@@ -341,12 +360,25 @@ static int parse_madt(ACPI_MADT *madt) {
                 }
                 cpu_mpidrs[cpu_count++] = mpidr;
             }
+            if (gicr_base == 0 && gicc->GICRBaseAddress != 0) {
+                gicr_base = gicc->GICRBaseAddress;
+                gicr_length = 0x20000;
+                LOG_DEBUG_HEX("ACPI: Found GIC Redistributor Base: ", gicr_base);
+            }
+        }
+        else if (sub->Type == MADT_TYPE_GIC_REDISTRIBUTOR) {
+            ACPI_MADT_GICR *gicr = (ACPI_MADT_GICR *)sub;
+            if (gicr_base == 0) {
+                gicr_base = gicr->DiscoveryRangeBaseAddress;
+                gicr_length = gicr->DiscoveryRangeLength;
+                LOG_DEBUG_HEX("ACPI: Found GIC Redistributor Base: ", gicr_base);
+            }
         }
 
         ptr += sub->Length;
     }
 
-    if (gicd_base != 0 && gicc_base != 0) {
+    if (gicd_base != 0 && (gicc_base != 0 || gicr_base != 0)) {
         LOG_OK("ACPI: Discovered GIC hardware successfully.");
         return 0;
     } else {
@@ -357,7 +389,12 @@ static int parse_madt(ACPI_MADT *madt) {
 
 int acpi_init(void *rsdp_ptr) {
     if (!rsdp_ptr) return -1;
+    gicd_base = 0;
+    gicc_base = 0;
+    gicr_base = 0;
+    gicr_length = 0;
     virtio_blk_info.present = 0;
+    virtio_gpu_info.present = 0;
     cpu_count = 0;
     
     ACPI_RSDP *rsdp = (ACPI_RSDP *)rsdp_ptr;
@@ -400,6 +437,14 @@ uint64_t acpi_get_gicc_base(void) {
     return gicc_base;
 }
 
+uint64_t acpi_get_gicr_base(void) {
+    return gicr_base;
+}
+
+uint32_t acpi_get_gicr_length(void) {
+    return gicr_length;
+}
+
 uint32_t acpi_get_cpu_count(void) {
     return cpu_count;
 }
@@ -416,5 +461,13 @@ int acpi_get_virtio_blk_info(acpi_virtio_blk_info_t *out) {
         return -1;
     }
     *out = virtio_blk_info;
+    return 0;
+}
+
+int acpi_get_virtio_gpu_info(acpi_virtio_pci_info_t *out) {
+    if (!out || !virtio_gpu_info.present) {
+        return -1;
+    }
+    *out = virtio_gpu_info;
     return 0;
 }

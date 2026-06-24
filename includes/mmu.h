@@ -23,4 +23,4 @@
 #define PTE_SW_OWNED  (1ULL << 55)    // Physical page is owned by this address space
 #define PTE_SW_COW    (1ULL << 56)    // Writable intent, currently mapped copy-on-write
 
-void mmu_init(void);
+void mmu_init(void *memory_map, uint64_t map_size, uint64_t desc_size);

@@ -1,8 +1,10 @@
 #pragma once
 
 #include <stdint.h>
+#include "spinlock.h"
 
 #define OCAP_INITIAL_CAPS 32
+#define OCAP_FIRST_DYNAMIC_SLOT 6
 
 typedef enum {
     OCAP_NONE = 0,
@@ -12,7 +14,8 @@ typedef enum {
     OCAP_VMA = 4,
     OCAP_REPLY = 5,
     OCAP_FILE = 6,
-    OCAP_DMA = 7
+    OCAP_DMA = 7,
+    OCAP_PIPE = 8
 } ocap_type_t;
 
 #define OCAP_RIGHT_READ     (1ULL << 0)
@@ -37,14 +40,18 @@ typedef struct {
 } ocap_t;
 
 typedef struct {
+    spinlock_t lock;
     ocap_t *entries;
     uint32_t capacity;
     uint32_t pages;
 } orange_cat_table_t;
 
 typedef void (*ocap_release_hook_t)(const ocap_t *cap);
+typedef int (*ocap_acquire_hook_t)(const ocap_t *cap);
 
 void ocap_set_release_hook(ocap_release_hook_t hook);
+int ocap_set_type_release_hook(uint32_t type, ocap_release_hook_t hook);
+int ocap_set_type_acquire_hook(uint32_t type, ocap_acquire_hook_t hook);
 int ocap_ensure(orange_cat_table_t *table, uint32_t min_capacity);
 int ocap_install(orange_cat_table_t *table, uint32_t type, uint32_t object_id,
                  uint64_t rights, uint64_t flags);
@@ -56,6 +63,9 @@ int ocap_lookup(const orange_cat_table_t *table, uint32_t slot, uint32_t type,
 int ocap_copy(const orange_cat_table_t *src, orange_cat_table_t *dst,
               uint32_t src_slot, uint64_t required_rights,
               uint32_t *dst_slot);
+int ocap_clone_at(const orange_cat_table_t *src, orange_cat_table_t *dst,
+                  uint32_t src_slot, uint32_t dst_slot,
+                  uint64_t required_rights);
 void ocap_clear(orange_cat_table_t *table);
 void ocap_release_table(orange_cat_table_t *table);
 void ocap_revoke_slot(orange_cat_table_t *table, uint32_t slot);

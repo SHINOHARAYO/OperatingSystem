@@ -4,8 +4,10 @@
 #include "mmu.h"
 #include "page_cache.h"
 #include "log.h"
+#include "spinlock.h"
 
 static vm_object_t objects[MAX_VM_OBJECTS];
+static spinlock_t objects_lock;
 
 static uint64_t align_pages(uint64_t size) {
     return (size + PAGE_SIZE - 1) / PAGE_SIZE;
@@ -29,9 +31,12 @@ static void clear_object(vm_object_t *object) {
 }
 
 int vm_object_init(void) {
+    objects_lock.value = 0;
+    uint64_t irq_flags = spin_lock_irqsave(&objects_lock);
     for (uint32_t i = 0; i < MAX_VM_OBJECTS; i++) {
         clear_object(&objects[i]);
     }
+    spin_unlock_irqrestore(&objects_lock, irq_flags);
 
     LOG_OK_HEX("VMOBJ: object slots: ", MAX_VM_OBJECTS);
     return 0;
@@ -43,6 +48,7 @@ static int allocate_object(uint32_t type, uint32_t owner_tid, uint64_t size,
         return -1;
     }
 
+    uint64_t irq_flags = spin_lock_irqsave(&objects_lock);
     for (uint32_t i = 1; i < MAX_VM_OBJECTS; i++) {
         if (!objects[i].present) {
             objects[i].present = 1;
@@ -56,10 +62,12 @@ static int allocate_object(uint32_t type, uint32_t owner_tid, uint64_t size,
             objects[i].page_count = align_pages(size);
             objects[i].flags = flags;
             *out_id = i;
+            spin_unlock_irqrestore(&objects_lock, irq_flags);
             return 0;
         }
     }
 
+    spin_unlock_irqrestore(&objects_lock, irq_flags);
     return -1;
 }
 
@@ -85,9 +93,11 @@ int vm_object_create_initrd(uint32_t owner_tid, uint32_t file_index,
         return -1;
     }
 
+    uint64_t irq_flags = spin_lock_irqsave(&objects_lock);
     objects[*out_id].file_index = file_index;
     objects[*out_id].file_offset = file_offset;
     objects[*out_id].data_size = data_size;
+    spin_unlock_irqrestore(&objects_lock, irq_flags);
     return 0;
 }
 
@@ -95,12 +105,15 @@ int vm_object_ref(uint32_t object_id) {
     if (object_id == 0) {
         return 0;
     }
+    uint64_t irq_flags = spin_lock_irqsave(&objects_lock);
     if (object_id >= MAX_VM_OBJECTS || !objects[object_id].present ||
         objects[object_id].refcount == UINT32_MAX) {
+        spin_unlock_irqrestore(&objects_lock, irq_flags);
         return -1;
     }
 
     objects[object_id].refcount++;
+    spin_unlock_irqrestore(&objects_lock, irq_flags);
     return 0;
 }
 
@@ -108,8 +121,10 @@ int vm_object_unref(uint32_t object_id) {
     if (object_id == 0) {
         return 0;
     }
+    uint64_t irq_flags = spin_lock_irqsave(&objects_lock);
     if (object_id >= MAX_VM_OBJECTS || !objects[object_id].present ||
         objects[object_id].refcount == 0) {
+        spin_unlock_irqrestore(&objects_lock, irq_flags);
         return -1;
     }
 
@@ -117,16 +132,21 @@ int vm_object_unref(uint32_t object_id) {
     if (objects[object_id].refcount == 0) {
         clear_object(&objects[object_id]);
     }
+    spin_unlock_irqrestore(&objects_lock, irq_flags);
     return 0;
 }
 
 const vm_object_t *vm_object_get(uint32_t object_id) {
+    uint64_t irq_flags = spin_lock_irqsave(&objects_lock);
     if (object_id == 0 || object_id >= MAX_VM_OBJECTS ||
         !objects[object_id].present) {
+        spin_unlock_irqrestore(&objects_lock, irq_flags);
         return 0;
     }
 
-    return &objects[object_id];
+    const vm_object_t *object = &objects[object_id];
+    spin_unlock_irqrestore(&objects_lock, irq_flags);
+    return object;
 }
 
 int vm_object_resolve_page(uint32_t object_id, uint64_t object_offset,
@@ -135,19 +155,28 @@ int vm_object_resolve_page(uint32_t object_id, uint64_t object_offset,
         return -1;
     }
 
-    const vm_object_t *object = vm_object_get(object_id);
-    if (!object || (object_offset & (PAGE_SIZE - 1)) != 0 ||
-        object_offset / PAGE_SIZE >= object->page_count) {
+    vm_object_t object;
+    uint64_t irq_flags = spin_lock_irqsave(&objects_lock);
+    if (object_id == 0 || object_id >= MAX_VM_OBJECTS ||
+        !objects[object_id].present) {
+        spin_unlock_irqrestore(&objects_lock, irq_flags);
+        return -1;
+    }
+    object = objects[object_id];
+    spin_unlock_irqrestore(&objects_lock, irq_flags);
+
+    if ((object_offset & (PAGE_SIZE - 1)) != 0 ||
+        object_offset / PAGE_SIZE >= object.page_count) {
         return -1;
     }
 
-    if (object->type == VM_OBJECT_INITRD && object_offset < object->data_size) {
-        uint64_t file_offset = object->file_offset + object_offset;
-        return page_cache_get_initrd_page(object->file_index, file_offset, out_paddr);
+    if (object.type == VM_OBJECT_INITRD && object_offset < object.data_size) {
+        uint64_t file_offset = object.file_offset + object_offset;
+        return page_cache_get_initrd_page(object.file_index, file_offset, out_paddr);
     }
 
-    if (object->type == VM_OBJECT_ANON ||
-        (object->type == VM_OBJECT_INITRD && object_offset >= object->data_size)) {
+    if (object.type == VM_OBJECT_ANON ||
+        (object.type == VM_OBJECT_INITRD && object_offset >= object.data_size)) {
         frame_t *frame = frame_alloc(owner_tid, FRAME_FLAG_USER);
         if (!frame) {
             return -1;

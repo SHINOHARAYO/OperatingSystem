@@ -4,9 +4,11 @@
 typedef unsigned long  uint64_t;
 typedef   signed long  int64_t;
 typedef unsigned int   uint32_t;
+typedef   signed int   int32_t;
 typedef unsigned short uint16_t;
 typedef unsigned char  uint8_t;
 
+#include "libc.h"
 #include "fs_proto.h"
 
 typedef struct {
@@ -67,6 +69,17 @@ typedef struct {
     uint32_t online_cores;
 } debug_info_t;
 
+typedef struct {
+    uint64_t calls;
+    uint64_t direct_calls;
+    uint64_t slow_calls;
+    uint64_t replies;
+    uint64_t cap_lookup_cycles;
+    uint64_t direct_roundtrip_cycles;
+    uint64_t total_roundtrip_cycles;
+    uint64_t counter_hz;
+} ipc_profile_t;
+
 #define VMA_READ       (1ULL << 0)
 #define VMA_WRITE      (1ULL << 1)
 #define VMA_EXEC       (1ULL << 2)
@@ -98,6 +111,7 @@ typedef struct {
 #define OCAP_REPLY    5
 #define OCAP_FILE     6
 #define OCAP_DMA      7
+#define OCAP_PIPE     8
 
 #define OCAP_RIGHT_READ     (1ULL << 0)
 #define OCAP_RIGHT_WRITE    (1ULL << 1)
@@ -113,6 +127,10 @@ typedef struct {
 
 #define CAP_SELF 1
 #define CAP_NS 2
+#define CAP_STDIN 3
+#define CAP_STDOUT 4
+#define CAP_STDERR 5
+#define CAP_FIRST_DYNAMIC 6
 #define IPC_INLINE_WORDS 16
 #define IPC_INLINE_BYTES 128
 #define IPC_REPLY_INLINE_WORDS 15
@@ -144,14 +162,45 @@ typedef struct {
 #define WAIT_STATUS_DONE 0
 #define WAIT_STATUS_RUNNING 1
 
-void printf(const char *fmt, ...);
-void puts(const char *s);
+int terminal_enable(void);
+void terminal_commit(void);
+void terminal_flush(void);
+char terminal_read_char(void);
+int terminal_write(const void *buf, size_t count);
+
+static inline int sys_bind_stdio(uint32_t endpoint_cap) {
+    register uint64_t x0 asm("x0") = endpoint_cap;
+    register uint64_t x8 asm("x8") = 52;
+    asm volatile("svc #0" : "+r" (x0) : "r" (x8) : "memory");
+    return (int)x0;
+}
+
+static inline ipc_profile_t sys_ipc_profile(void) {
+    register uint64_t x0 asm("x0");
+    register uint64_t x1 asm("x1");
+    register uint64_t x2 asm("x2");
+    register uint64_t x3 asm("x3");
+    register uint64_t x4 asm("x4");
+    register uint64_t x5 asm("x5");
+    register uint64_t x6 asm("x6");
+    register uint64_t x7 asm("x7");
+    register uint64_t x8 asm("x8") = 53;
+    asm volatile("svc #0"
+                 : "=r" (x0), "=r" (x1), "=r" (x2), "=r" (x3),
+                   "=r" (x4), "=r" (x5), "=r" (x6), "=r" (x7)
+                 : "r" (x8)
+                 : "memory");
+    ipc_profile_t profile = {x0, x1, x2, x3, x4, x5, x6, x7};
+    return profile;
+}
 
 static inline void sys_yield(void) {
     asm volatile("mov x8, #1\n\tsvc #0" : : : "memory");
 }
 
+static inline void sys_exit(int code) __attribute__((noreturn));
 static inline void sys_exit(int code) {
+    terminal_flush();
     register uint64_t x0 asm("x0") = (uint64_t)code;
     register uint64_t x8 asm("x8") = 8;
     asm volatile("svc #0" : : "r"(x0), "r"(x8) : "memory");
@@ -334,6 +383,110 @@ static inline int sys_ipc_reply(uint32_t reply_cap, int status, uint64_t flags, 
     return (int)x0;
 }
 
+typedef struct {
+    int read_cap;
+    int write_cap;
+} pipe_cap_pair_t;
+
+static inline pipe_cap_pair_t sys_pipe_create(void) {
+    register uint64_t x0 asm("x0");
+    register uint64_t x1 asm("x1");
+    register uint64_t x8 asm("x8") = 56;
+    asm volatile("svc #0" : "=r" (x0), "=r" (x1) : "r" (x8) : "memory");
+    pipe_cap_pair_t pair = {(int)x0, (int)x1};
+    return pair;
+}
+
+static inline long sys_pipe_read(uint32_t cap, void *buffer, uint64_t count) {
+    register uint64_t x0 asm("x0") = cap;
+    register uint64_t x1 asm("x1") = (uint64_t)buffer;
+    register uint64_t x2 asm("x2") = count;
+    register uint64_t x8 asm("x8") = 57;
+    asm volatile("svc #0" : "+r" (x0) : "r" (x1), "r" (x2), "r" (x8) : "memory");
+    return (long)x0;
+}
+
+static inline long sys_pipe_write(uint32_t cap, const void *buffer, uint64_t count) {
+    register uint64_t x0 asm("x0") = cap;
+    register uint64_t x1 asm("x1") = (uint64_t)buffer;
+    register uint64_t x2 asm("x2") = count;
+    register uint64_t x8 asm("x8") = 58;
+    asm volatile("svc #0" : "+r" (x0) : "r" (x1), "r" (x2), "r" (x8) : "memory");
+    return (long)x0;
+}
+
+static inline int sys_pipe_close(uint32_t cap) {
+    register uint64_t x0 asm("x0") = cap;
+    register uint64_t x8 asm("x8") = 59;
+    asm volatile("svc #0" : "+r" (x0) : "r" (x8) : "memory");
+    return (int)x0;
+}
+
+static inline int sys_pipe_dup(uint32_t cap) {
+    register uint64_t x0 asm("x0") = cap;
+    register uint64_t x8 asm("x8") = 60;
+    asm volatile("svc #0" : "+r" (x0) : "r" (x8) : "memory");
+    return (int)x0;
+}
+
+static inline ipc_msg_t sys_ipc_reply_recv(uint32_t reply_cap, int status,
+                                           uint64_t flags, uint64_t len,
+                                           const uint64_t payload[IPC_REPLY_INLINE_WORDS]) {
+    register uint64_t x0 asm("x0") = reply_cap;
+    register uint64_t x1 asm("x1") = (uint64_t)status;
+    register uint64_t x2 asm("x2") = flags;
+    register uint64_t x3 asm("x3") = len;
+    register uint64_t x4 asm("x4") = payload ? payload[0] : 0;
+    register uint64_t x5 asm("x5") = payload ? payload[1] : 0;
+    register uint64_t x6 asm("x6") = payload ? payload[2] : 0;
+    register uint64_t x7 asm("x7") = payload ? payload[3] : 0;
+    register uint64_t x8 asm("x8") = payload ? payload[4] : 0;
+    register uint64_t x9 asm("x9") = payload ? payload[5] : 0;
+    register uint64_t x10 asm("x10") = payload ? payload[6] : 0;
+    register uint64_t x11 asm("x11") = payload ? payload[7] : 0;
+    register uint64_t x12 asm("x12") = payload ? payload[8] : 0;
+    register uint64_t x13 asm("x13") = payload ? payload[9] : 0;
+    register uint64_t x14 asm("x14") = payload ? payload[10] : 0;
+    register uint64_t x15 asm("x15") = payload ? payload[11] : 0;
+    register uint64_t x16 asm("x16") = payload ? payload[12] : 0;
+    register uint64_t x17 asm("x17") = payload ? payload[13] : 0;
+    register uint64_t x18 asm("x18") = payload ? payload[14] : 0;
+
+    asm volatile(
+        "svc #54"
+        : "+r" (x0), "+r" (x1), "+r" (x2), "+r" (x3), "+r" (x4),
+          "+r" (x5), "+r" (x6), "+r" (x7), "+r" (x8), "+r" (x9),
+          "+r" (x10), "+r" (x11), "+r" (x12), "+r" (x13), "+r" (x14),
+          "+r" (x15), "+r" (x16), "+r" (x17), "+r" (x18)
+        :
+        : "memory"
+    );
+
+    ipc_msg_t msg;
+    msg.status = (int)x0;
+    msg.reply_cap = (uint32_t)x0;
+    msg.sender_tid = (uint32_t)x1;
+    msg.flags = 0;
+    msg.len = x2;
+    msg.payload[0] = x3;
+    msg.payload[1] = x4;
+    msg.payload[2] = x5;
+    msg.payload[3] = x6;
+    msg.payload[4] = x7;
+    msg.payload[5] = x8;
+    msg.payload[6] = x9;
+    msg.payload[7] = x10;
+    msg.payload[8] = x11;
+    msg.payload[9] = x12;
+    msg.payload[10] = x13;
+    msg.payload[11] = x14;
+    msg.payload[12] = x15;
+    msg.payload[13] = x16;
+    msg.payload[14] = x17;
+    msg.payload[15] = x18;
+    return msg;
+}
+
 static inline uint32_t sys_spawn_exec(uint32_t exec_cap, uint8_t priority) {
     register uint64_t x0 asm("x0") = exec_cap;
     register uint64_t x1 asm("x1") = priority;
@@ -364,6 +517,53 @@ static inline spawn_result_t sys_spawn_exec2(uint32_t exec_cap, uint8_t priority
     spawn_result_t result;
     result.tid = (uint32_t)x0;
     result.endpoint_cap = (int)x1;
+    return result;
+}
+
+static inline spawn_result_t sys_spawn_exec_args(uint32_t exec_cap,
+                                                  uint8_t priority,
+                                                  char *const argv[],
+                                                  uint32_t argc) {
+    register uint64_t x0 asm("x0") = exec_cap;
+    register uint64_t x1 asm("x1") = priority;
+    register uint64_t x2 asm("x2") = (uint64_t)argv;
+    register uint64_t x3 asm("x3") = argc;
+    register uint64_t x8 asm("x8") = 55;
+
+    asm volatile(
+        "svc #0"
+        : "+r" (x0), "+r" (x1)
+        : "r" (x2), "r" (x3), "r" (x8)
+        : "memory"
+    );
+
+    spawn_result_t result;
+    result.tid = (uint32_t)x0;
+    result.endpoint_cap = (int)x1;
+    return result;
+}
+
+static inline spawn_result_t sys_spawn_exec_stdio(uint32_t exec_cap,
+                                                   uint8_t priority,
+                                                   char *const argv[],
+                                                   uint32_t argc,
+                                                   uint32_t stdin_cap,
+                                                   uint32_t stdout_cap,
+                                                   uint32_t stderr_cap) {
+    register uint64_t x0 asm("x0") = exec_cap;
+    register uint64_t x1 asm("x1") = priority;
+    register uint64_t x2 asm("x2") = (uint64_t)argv;
+    register uint64_t x3 asm("x3") = argc;
+    register uint64_t x4 asm("x4") = stdin_cap;
+    register uint64_t x5 asm("x5") = stdout_cap;
+    register uint64_t x6 asm("x6") = stderr_cap;
+    register uint64_t x8 asm("x8") = 61;
+    asm volatile("svc #0"
+                 : "+r" (x0), "+r" (x1)
+                 : "r" (x2), "r" (x3), "r" (x4), "r" (x5), "r" (x6),
+                   "r" (x8)
+                 : "memory");
+    spawn_result_t result = {(uint32_t)x0, (int)x1};
     return result;
 }
 
@@ -709,6 +909,62 @@ static inline int sys_munmap(void *addr, uint64_t size) {
     );
 
     return (int)x0;
+}
+
+static inline ipc_msg_t sys_ipc_recv_timeout(uint32_t cap, uint64_t timeout_ms) {
+    register uint64_t x0 asm("x0") = cap;
+    register uint64_t x1 asm("x1") = timeout_ms;
+    register uint64_t x2 asm("x2");
+    register uint64_t x3 asm("x3");
+    register uint64_t x4 asm("x4");
+    register uint64_t x5 asm("x5");
+    register uint64_t x6 asm("x6");
+    register uint64_t x7 asm("x7");
+    register uint64_t x8 asm("x8") = 51;
+    register uint64_t x9 asm("x9");
+    register uint64_t x10 asm("x10");
+    register uint64_t x11 asm("x11");
+    register uint64_t x12 asm("x12");
+    register uint64_t x13 asm("x13");
+    register uint64_t x14 asm("x14");
+    register uint64_t x15 asm("x15");
+    register uint64_t x16 asm("x16");
+    register uint64_t x17 asm("x17");
+    register uint64_t x18 asm("x18");
+
+    asm volatile(
+        "svc #0"
+        : "+r" (x0), "+r" (x1), "=r" (x2), "=r" (x3), "=r" (x4),
+          "=r" (x5), "=r" (x6), "=r" (x7), "+r" (x8), "=r" (x9),
+          "=r" (x10), "=r" (x11), "=r" (x12), "=r" (x13), "=r" (x14),
+          "=r" (x15), "=r" (x16), "=r" (x17), "=r" (x18)
+        :
+        : "memory"
+    );
+
+    ipc_msg_t msg;
+    msg.status = (int)x0;
+    msg.reply_cap = (uint32_t)x0;
+    msg.sender_tid = (uint32_t)x1;
+    msg.flags = 0;
+    msg.len = x2;
+    msg.payload[0] = x3;
+    msg.payload[1] = x4;
+    msg.payload[2] = x5;
+    msg.payload[3] = x6;
+    msg.payload[4] = x7;
+    msg.payload[5] = x8;
+    msg.payload[6] = x9;
+    msg.payload[7] = x10;
+    msg.payload[8] = x11;
+    msg.payload[9] = x12;
+    msg.payload[10] = x13;
+    msg.payload[11] = x14;
+    msg.payload[12] = x15;
+    msg.payload[13] = x16;
+    msg.payload[14] = x17;
+    msg.payload[15] = x18;
+    return msg;
 }
 
 static inline int sys_dma_export(void *addr, uint64_t size, uint64_t rights) {
@@ -1101,6 +1357,13 @@ int vfs_mkdir(const char *name);
 int64_t vfs_copy_file(const char *src, const char *dst);
 void vfs_close_handle(uint32_t handle);
 spawn_result_t vfs_spawn_program(const char *name, uint8_t priority);
+spawn_result_t vfs_spawn_program_args(const char *name, uint8_t priority,
+                                      char *const argv[], uint32_t argc);
+spawn_result_t vfs_spawn_program_stdio(const char *name, uint8_t priority,
+                                       char *const argv[], uint32_t argc,
+                                       uint32_t stdin_cap,
+                                       uint32_t stdout_cap,
+                                       uint32_t stderr_cap);
 uint64_t page_align_size(uint64_t size);
 
 #endif

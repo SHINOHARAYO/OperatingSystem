@@ -3,12 +3,14 @@
 #include "mmu.h"
 #include "uart.h"
 #include "log.h"
+#include "spinlock.h"
 static uint8_t *bitmap = NULL;
 static uint64_t total_pages = 0;
 static uint64_t usable_pages = 0;
 static uint64_t free_pages = 0;
 static uint64_t memory_offset = 0;
 static uint64_t next_free_hint = 0;
+static spinlock_t pmm_lock;
 static void bitmap_set(uint64_t bit) {
     bitmap[bit / 8] |= (1 << (bit % 8));
 }
@@ -94,6 +96,7 @@ void pmm_init(void *memory_map, uint64_t map_size, uint64_t desc_size) {
 }
 
 void *pmm_alloc_page(void) {
+    uint64_t irq_flags = spin_lock_irqsave(&pmm_lock);
     for (uint64_t searched = 0; searched < total_pages; searched++) {
         uint64_t i = next_free_hint + searched;
         if (i >= total_pages) {
@@ -107,13 +110,14 @@ void *pmm_alloc_page(void) {
                 next_free_hint = 0;
             }
             uint64_t paddr = memory_offset + (i * PAGE_SIZE);
-            
+            spin_unlock_irqrestore(&pmm_lock, irq_flags);
             uint8_t *page = (uint8_t *)paddr;
             for(int j = 0; j < PAGE_SIZE; j++) page[j] = 0;
             
             return (void *)paddr;
         }
     }
+    spin_unlock_irqrestore(&pmm_lock, irq_flags);
     LOG_FAIL("PMM OOM!");
     return NULL;
 }
@@ -123,6 +127,7 @@ void *pmm_alloc_contiguous_pages(uint64_t page_count) {
         return NULL;
     }
 
+    uint64_t irq_flags = spin_lock_irqsave(&pmm_lock);
     uint64_t run_start = 0;
     uint64_t run_len = 0;
 
@@ -139,6 +144,7 @@ void *pmm_alloc_contiguous_pages(uint64_t page_count) {
                 free_pages -= page_count;
 
                 uint64_t paddr = memory_offset + (run_start * PAGE_SIZE);
+                spin_unlock_irqrestore(&pmm_lock, irq_flags);
                 uint8_t *ptr = (uint8_t *)paddr;
                 for (uint64_t b = 0; b < page_count * PAGE_SIZE; b++) {
                     ptr[b] = 0;
@@ -150,6 +156,7 @@ void *pmm_alloc_contiguous_pages(uint64_t page_count) {
         }
     }
 
+    spin_unlock_irqrestore(&pmm_lock, irq_flags);
     LOG_FAIL("PMM contiguous OOM!");
     return NULL;
 }
@@ -157,7 +164,8 @@ void *pmm_alloc_contiguous_pages(uint64_t page_count) {
 void pmm_free_page(void *page) {
     uint64_t paddr = (uint64_t)page;
     if (paddr < memory_offset || paddr >= memory_offset + (total_pages * PAGE_SIZE)) return;
-    
+
+    uint64_t irq_flags = spin_lock_irqsave(&pmm_lock);
     uint64_t bit = (paddr - memory_offset) / PAGE_SIZE;
     if (bitmap_test(bit)) {
         bitmap_clear(bit);
@@ -166,6 +174,7 @@ void pmm_free_page(void *page) {
             next_free_hint = bit;
         }
     }
+    spin_unlock_irqrestore(&pmm_lock, irq_flags);
 }
 
 void pmm_free_contiguous_pages(void *pages, uint64_t page_count) {
@@ -185,6 +194,7 @@ void pmm_free_contiguous_pages(void *pages, uint64_t page_count) {
         return;
     }
 
+    uint64_t irq_flags = spin_lock_irqsave(&pmm_lock);
     for (uint64_t i = 0; i < page_count; i++) {
         if (bitmap_test(start_bit + i)) {
             bitmap_clear(start_bit + i);
@@ -194,10 +204,14 @@ void pmm_free_contiguous_pages(void *pages, uint64_t page_count) {
             }
         }
     }
+    spin_unlock_irqrestore(&pmm_lock, irq_flags);
 }
 
 uint64_t pmm_get_free_memory(void) {
-    return free_pages * PAGE_SIZE;
+    uint64_t irq_flags = spin_lock_irqsave(&pmm_lock);
+    uint64_t result = free_pages * PAGE_SIZE;
+    spin_unlock_irqrestore(&pmm_lock, irq_flags);
+    return result;
 }
 
 uint64_t pmm_get_total_memory(void) {

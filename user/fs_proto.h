@@ -22,6 +22,8 @@
 
 #define VFS_EXEC_BOOT_UART  (1U << 0)
 #define VFS_EXEC_BOOT_BLOCK (1U << 1)
+#define VFS_EXEC_BOOT_DISPLAY (1U << 2)
+#define VFS_EXEC_BOOT_INPUT (1U << 3)
 
 #define VFS_HANDLE_SHIFT 32
 #define VFS_WRITE_FLAG_TRUNCATE 1ULL

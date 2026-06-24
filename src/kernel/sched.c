@@ -12,11 +12,15 @@
 #include "initrd.h"
 #include "usercopy.h"
 #include "memcap.h"
+#include "pipe.h"
+#include "ipc.h"
 #include "vfs.h"
 #include "acpi.h"
 #include "block_boot.h"
+#include "input_boot.h"
 #include "smp.h"
 #include "spinlock.h"
+#include "platform.h"
 #include <stdbool.h>
 
 extern uint64_t l1_table[512];
@@ -38,19 +42,36 @@ extern uint64_t l1_table[512];
 #define SCHED_BOOST_INTERVAL 1000
 #define MAX_VFS_EXEC_OBJECTS 32
 #define MAX_DMA_OBJECTS 64
-#define DMA_OBJECT_MAX_PAGES 16
+#define DMA_OBJECT_MAX_PAGES 4096
+#define SPAWN_ARG_MAX 8
+#define SPAWN_ARG_BYTES 64
 #define USER_UART_MMIO_VA 0xB0000000ULL
-#define UART_MMIO_PA 0x09000000ULL
 #define VIRTIO_MMIO_FALLBACK_PA 0x0A000000ULL
 #define BOOT_DEVICE_UART  (1U << 0)
 #define BOOT_DEVICE_BLOCK (1U << 1)
+#define BOOT_DEVICE_DISPLAY (1U << 2)
+#define BOOT_DEVICE_INPUT (1U << 3)
 
 static tcb_t **tasks = NULL;
 static uint32_t task_capacity = 0;
 static uint32_t task_table_pages = 0;
 static uint32_t task_slot_pages = 0;
+static tcb_t *get_tcb(uint32_t tid);
 static spinlock_t task_table_lock;
 static spinlock_t asid_lock;
+static spinlock_t termination_lock;
+static spinlock_t vfs_exec_lock;
+static spinlock_t dma_object_lock;
+
+typedef struct {
+    uint32_t argc;
+    char values[SPAWN_ARG_MAX][SPAWN_ARG_BYTES];
+} spawn_args_t;
+
+typedef struct {
+    tcb_t *parent;
+    uint32_t caps[3];
+} spawn_stdio_t;
 
 typedef struct {
     uint32_t core_id;
@@ -129,6 +150,18 @@ static tcb_t secondary_idle_tasks[MAX_SCHED_CORES];
 static uint32_t sched_online_cores = 1;
 static uint32_t next_ready_core = 0;
 static block_boot_info_t block_boot_info_page __attribute__((aligned(PAGE_SIZE)));
+static display_boot_info_t display_boot_info_page __attribute__((aligned(PAGE_SIZE)));
+
+void sched_set_display_boot_info(const display_boot_info_t *info) {
+    uint8_t *bytes = (uint8_t *)&display_boot_info_page;
+    for (uint64_t i = 0; i < PAGE_SIZE; i++) {
+        bytes[i] = 0;
+    }
+    if (info && info->magic == DISPLAY_BOOT_MAGIC &&
+        info->version == DISPLAY_BOOT_VERSION) {
+        display_boot_info_page = *info;
+    }
+}
 
 static uint32_t current_core_id(void) {
     uint64_t mpidr = 0;
@@ -171,9 +204,9 @@ static uint32_t sched_core_load(sched_core_t *core) {
     if (!core || !core->online) {
         return UINT32_MAX;
     }
-    spin_lock(&core->lock);
+    uint64_t irq_flags = spin_lock_irqsave(&core->lock);
     uint32_t load = core->ready_count;
-    spin_unlock(&core->lock);
+    spin_unlock_irqrestore(&core->lock, irq_flags);
     if (core->running_task && core->running_task->tid != 0 &&
         core->running_task->state == TASK_STATE_RUNNING) {
         load++;
@@ -208,18 +241,21 @@ static sched_core_t *sched_select_ready_core(void) {
 
 static int sched_task_can_balance(tcb_t *task) {
     return task && task->tid != 0 && task->pgd != NULL &&
-           task->parent_tid > 1 && task->base_priority == 0 &&
-           !task->kill_requested;
+           task->parent_tid > 1 && !task->kill_requested &&
+           !task->sched_has_run;
 }
 
 static void sched_set_current(sched_core_t *core, tcb_t *task, int task_idx) {
     if (!core) {
         core = &sched_cores[0];
     }
-    core->running_task = task;
+    __atomic_store_n(&core->running_task, task, __ATOMIC_RELEASE);
     core->current_task_idx = task_idx;
     if (task) {
         task->sched_core_id = core->core_id;
+        if (task->tid != 0) {
+            task->sched_has_run = 1;
+        }
     }
 }
 
@@ -274,7 +310,12 @@ static void ready_enqueue_tail_on_core(sched_core_t *core, tcb_t *task) {
     if (!core) {
         core = &sched_cores[0];
     }
-    spin_lock(&core->lock);
+    uint64_t irq_flags = spin_lock_irqsave(&core->lock);
+    if (task->state == TASK_STATE_FREE || task->state == TASK_STATE_DEAD ||
+        task->sched_queued) {
+        spin_unlock_irqrestore(&core->lock, irq_flags);
+        return;
+    }
 
     if (task->priority >= SCHED_LEVELS) {
         task->priority = SCHED_LEVELS - 1;
@@ -297,7 +338,7 @@ static void ready_enqueue_tail_on_core(sched_core_t *core, tcb_t *task) {
     task->sched_core_id = core->core_id;
     core->ready_count++;
     core->ready_bitmap |= ready_bit(priority);
-    spin_unlock(&core->lock);
+    spin_unlock_irqrestore(&core->lock, irq_flags);
 }
 
 static void ready_enqueue_tail(tcb_t *task) {
@@ -364,17 +405,17 @@ static void ready_remove(tcb_t *task) {
         return;
     }
     sched_core_t *core = sched_core_for_task(task);
-    spin_lock(&core->lock);
+    uint64_t irq_flags = spin_lock_irqsave(&core->lock);
     ready_detach_locked(core, task);
-    spin_unlock(&core->lock);
+    spin_unlock_irqrestore(&core->lock, irq_flags);
 }
 
 static tcb_t *ready_pop_highest(void) {
     sched_core_t *core = sched_current_core();
-    spin_lock(&core->lock);
+    uint64_t irq_flags = spin_lock_irqsave(&core->lock);
     uint32_t bitmap = core->ready_bitmap;
     if (bitmap == 0) {
-        spin_unlock(&core->lock);
+        spin_unlock_irqrestore(&core->lock, irq_flags);
         return NULL;
     }
 
@@ -383,11 +424,11 @@ static tcb_t *ready_pop_highest(void) {
     tcb_t *task = core->queues[queue_index];
     if (!task) {
         core->ready_bitmap &= ~ready_bit((uint8_t)queue_index);
-        spin_unlock(&core->lock);
+        spin_unlock_irqrestore(&core->lock, irq_flags);
         return NULL;
     }
     ready_detach_locked(core, task);
-    spin_unlock(&core->lock);
+    spin_unlock_irqrestore(&core->lock, irq_flags);
     return task;
 }
 
@@ -418,8 +459,8 @@ static int ready_steal_from_core(sched_core_t *dst, sched_core_t *src) {
 
     sched_core_t *first = dst->core_id < src->core_id ? dst : src;
     sched_core_t *second = first == dst ? src : dst;
-    spin_lock(&first->lock);
-    spin_lock(&second->lock);
+    uint64_t first_irq_flags = spin_lock_irqsave(&first->lock);
+    uint64_t second_irq_flags = spin_lock_irqsave(&second->lock);
 
     int stolen = 0;
     if (dst->ready_count == 0 && src->ready_count > 0) {
@@ -431,8 +472,8 @@ static int ready_steal_from_core(sched_core_t *dst, sched_core_t *src) {
         }
     }
 
-    spin_unlock(&second->lock);
-    spin_unlock(&first->lock);
+    spin_unlock_irqrestore(&second->lock, second_irq_flags);
+    spin_unlock_irqrestore(&first->lock, first_irq_flags);
     return stolen;
 }
 
@@ -453,9 +494,9 @@ static int ready_steal_for_current_core(void) {
 
 static int highest_ready_priority(void) {
     sched_core_t *core = sched_current_core();
-    spin_lock(&core->lock);
+    uint64_t irq_flags = spin_lock_irqsave(&core->lock);
     uint32_t bitmap = core->ready_bitmap;
-    spin_unlock(&core->lock);
+    spin_unlock_irqrestore(&core->lock, irq_flags);
     if (bitmap == 0) {
         return -1;
     }
@@ -471,14 +512,22 @@ void sched_make_ready(tcb_t *task) {
     }
 
     task_state_t old_state = task->state;
-    task->state = TASK_STATE_READY;
+    __atomic_store_n(&task->state, TASK_STATE_READY, __ATOMIC_RELEASE);
     task->ticks_remaining = quantum_for_priority(task->priority);
     task->quantum = task->ticks_remaining;
     task->wait_time = 0;
-    if (!task->sched_queued && old_state == TASK_STATE_FREE &&
-        sched_task_can_balance(task)) {
-        sched_core_t *target_core = sched_select_ready_core();
-        task->sched_core_id = target_core->core_id;
+    if (!task->sched_queued && old_state == TASK_STATE_FREE) {
+        tcb_t *parent = task->parent_tid > 1 ? get_tcb(task->parent_tid) : NULL;
+        if (parent && parent->state != TASK_STATE_FREE &&
+            parent->state != TASK_STATE_DEAD &&
+            parent->sched_core_id < MAX_SCHED_CORES &&
+            sched_cores[parent->sched_core_id].online) {
+            // A child commonly begins with synchronous IPC to its creator.
+            task->sched_core_id = parent->sched_core_id;
+        } else if (sched_task_can_balance(task)) {
+            sched_core_t *target_core = sched_select_ready_core();
+            task->sched_core_id = target_core->core_id;
+        }
     } else if (task->sched_core_id >= MAX_SCHED_CORES ||
                !sched_cores[task->sched_core_id].online) {
         task->sched_core_id = current_core_id();
@@ -486,6 +535,12 @@ void sched_make_ready(tcb_t *task) {
             !sched_cores[task->sched_core_id].online) {
             task->sched_core_id = 0;
         }
+    }
+
+    sched_core_t *owner = sched_core_for_task(task);
+    if (__atomic_load_n(&owner->running_task, __ATOMIC_ACQUIRE) == task) {
+        signal_remote_ready(task);
+        return;
     }
     ready_enqueue_tail(task);
     signal_remote_ready(task);
@@ -512,6 +567,9 @@ void sched_clear_ipc_state(tcb_t *task) {
     task->ipc_received_sender_tid = 0;
     task->ipc_msg_flags = 0;
     task->ipc_msg_len = 0;
+    task->ipc_fast_receive = 0;
+    task->ipc_cached_endpoint = NULL;
+    task->ipc_cached_endpoint_tid = 0;
     for (uint32_t i = 0; i < IPC_INLINE_WORDS; i++) {
         task->ipc_msg_payload[i] = 0;
     }
@@ -573,6 +631,12 @@ static void init_free_task_slot(tcb_t *task) {
     task->user_shared_pointer = 0;
     task->ipc_call_head = NULL;
     task->ipc_call_tail = NULL;
+    task->ipc_fast_reply_caller = NULL;
+    task->ipc_fast_reply_caller_tid = 0;
+    task->ipc_fast_reply_generation = 0;
+    task->ipc_fast_reply_active = 0;
+    task->ipc_fast_receive = 0;
+    task->ipc_profile_start = 0;
     task->priority = 0;
     task->base_priority = 0;
     task->quantum = 0;
@@ -580,6 +644,7 @@ static void init_free_task_slot(tcb_t *task) {
     task->wait_time = 0;
     task->sleep_ticks_remaining = 0;
     task->kill_requested = 0;
+    task->sched_has_run = 0;
     task->sched_core_id = 0;
     ready_queue_reset_task(task);
     timer_queue_reset_task(task);
@@ -735,6 +800,22 @@ tcb_t *sched_find_task(uint32_t tid) {
     return sched_task_get(tid);
 }
 
+tcb_t *sched_find_task_local(uint32_t tid) {
+    uint32_t core_id = current_core_id();
+    spin_lock(&task_table_lock);
+    for (uint32_t i = 0; i < task_capacity; i++) {
+        tcb_t *task = tasks[i];
+        if (task && task->state != TASK_STATE_FREE &&
+            task->state != TASK_STATE_DEAD && task->tid == tid &&
+            task->sched_core_id == core_id) {
+            spin_unlock(&task_table_lock);
+            return task;
+        }
+    }
+    spin_unlock(&task_table_lock);
+    return NULL;
+}
+
 static void recycle_dead_task_slot(tcb_t *task) {
     if (!task || task->state != TASK_STATE_DEAD || task->refcount != 0) {
         return;
@@ -748,6 +829,7 @@ static void recycle_dead_task_slot(tcb_t *task) {
     task->sp_el0 = 0;
     task->priority = 0;
     task->kill_requested = 0;
+    task->sched_has_run = 0;
     task->base_priority = 0;
     task->quantum = 0;
     task->ticks_remaining = 0;
@@ -792,6 +874,20 @@ tcb_t *sched_task_get(uint32_t tid) {
     }
     spin_unlock(&task_table_lock);
     return NULL;
+}
+
+int sched_task_hold(tcb_t *task) {
+    if (!task || task->tid == 0) {
+        return -1;
+    }
+    spin_lock(&task->lock);
+    if (task->state == TASK_STATE_FREE || task->state == TASK_STATE_DEAD) {
+        spin_unlock(&task->lock);
+        return -1;
+    }
+    task->refcount++;
+    spin_unlock(&task->lock);
+    return 0;
 }
 
 void sched_task_put(tcb_t *task) {
@@ -846,7 +942,9 @@ static void release_vfs_exec_object(uint32_t object_id) {
     if (object_id == 0 || object_id >= MAX_VFS_EXEC_OBJECTS) {
         return;
     }
+    spin_lock(&vfs_exec_lock);
     clear_vfs_exec_object(&vfs_exec_objects[object_id]);
+    spin_unlock(&vfs_exec_lock);
 }
 
 static void release_vfs_exec_caps(tcb_t *task) {
@@ -890,7 +988,9 @@ static void release_dma_object(uint32_t object_id) {
     if (object_id == 0 || object_id >= MAX_DMA_OBJECTS) {
         return;
     }
+    spin_lock(&dma_object_lock);
     clear_dma_object(&dma_objects[object_id]);
+    spin_unlock(&dma_object_lock);
 }
 
 static void release_dma_caps(tcb_t *task) {
@@ -949,6 +1049,40 @@ static void install_standard_caps(tcb_t *task) {
                    OCAP_RIGHT_CALL, 0);
 }
 
+static void inherit_standard_streams(tcb_t *parent, tcb_t *child) {
+    if (!parent || !child) {
+        return;
+    }
+    for (uint32_t slot = CAP_STDIN; slot <= CAP_STDERR; slot++) {
+        ocap_t cap;
+        if (ocap_read_slot(&parent->caps, slot, &cap) == 0 &&
+            cap.type != OCAP_NONE && cap.type != OCAP_REPLY) {
+            (void)ocap_clone_at(&parent->caps, &child->caps, slot, slot, 0);
+        }
+    }
+}
+
+int sched_bind_stdio_syscall(uint64_t *regs, uint32_t endpoint_cap) {
+    ocap_t endpoint;
+    if (!current_task ||
+        ocap_lookup(&current_task->caps, endpoint_cap, OCAP_ENDPOINT,
+                    OCAP_RIGHT_CALL, &endpoint) < 0) {
+        if (regs) regs[0] = (uint64_t)-1;
+        return -1;
+    }
+
+    for (uint32_t slot = CAP_STDIN; slot <= CAP_STDERR; slot++) {
+        if (install_cap_at(current_task, slot, endpoint.type,
+                           endpoint.object_id, endpoint.rights,
+                           endpoint.flags) < 0) {
+            if (regs) regs[0] = (uint64_t)-1;
+            return -1;
+        }
+    }
+    if (regs) regs[0] = 0;
+    return 0;
+}
+
 static void update_name_server_tid(uint32_t tid) {
     if (tid == 0 || !get_tcb(tid)) {
         return;
@@ -973,11 +1107,20 @@ static int same_name(const char *a, const char *b) {
 }
 
 static uint32_t boot_flags_for_initrd_name(const char *name) {
-    if (same_name(name, "uart.elf") || same_name(name, "keyboard.elf")) {
+    if (same_name(name, "uart.elf")) {
         return BOOT_DEVICE_UART;
+    }
+    if (same_name(name, "keyboard.elf")) {
+        return BOOT_DEVICE_UART | BOOT_DEVICE_INPUT;
+    }
+    if (same_name(name, "mouse.elf")) {
+        return BOOT_DEVICE_INPUT;
     }
     if (same_name(name, "block.elf")) {
         return BOOT_DEVICE_BLOCK;
+    }
+    if (same_name(name, "display.elf")) {
+        return BOOT_DEVICE_DISPLAY;
     }
     return 0;
 }
@@ -988,8 +1131,19 @@ static void apply_boot_device_grants(tcb_t *task, uint32_t flags) {
     }
     if (flags & BOOT_DEVICE_UART) {
         if (vmm_map_page_asid(task->pgd, task->asid, USER_UART_MMIO_VA,
-                              UART_MMIO_PA, VMM_FLAG_USER_DEVICE) < 0) {
+                              platform_get()->uart_pa, VMM_FLAG_USER_DEVICE) < 0) {
             LOG_WARN("SCHED: failed to map UART MMIO for boot service.");
+        }
+    }
+    if ((flags & BOOT_DEVICE_INPUT) && platform_get()->supports_virtio) {
+        for (uint64_t off = 0; off < INPUT_DEVICE_MMIO_SIZE; off += PAGE_SIZE) {
+            if (vmm_map_page_asid(task->pgd, task->asid,
+                                  INPUT_DEVICE_MMIO_VA + off,
+                                  INPUT_DEVICE_MMIO_PA + off,
+                                  VMM_FLAG_USER_DEVICE) < 0) {
+                LOG_WARN("SCHED: failed to map virtio input MMIO bank.");
+                break;
+            }
         }
     }
     if (flags & BOOT_DEVICE_BLOCK) {
@@ -1045,6 +1199,103 @@ static void apply_boot_device_grants(tcb_t *task, uint32_t flags) {
             LOG_WARN("SCHED: failed to map block boot info for boot service.");
         }
     }
+    if (flags & BOOT_DEVICE_DISPLAY) {
+        acpi_virtio_pci_info_t gpu_info;
+        if (display_boot_info_page.magic != DISPLAY_BOOT_MAGIC ||
+            display_boot_info_page.version != DISPLAY_BOOT_VERSION) {
+            display_boot_info_page.magic = DISPLAY_BOOT_MAGIC;
+            display_boot_info_page.version = DISPLAY_BOOT_VERSION;
+            display_boot_info_page.width = 0;
+            display_boot_info_page.height = 0;
+            display_boot_info_page.pixels_per_scan_line = 0;
+            display_boot_info_page.pixel_format = DISPLAY_PIXEL_BGR_RESERVED_8BIT;
+            display_boot_info_page.red_mask = 0;
+            display_boot_info_page.green_mask = 0;
+            display_boot_info_page.blue_mask = 0;
+            display_boot_info_page.reserved_mask = 0;
+            display_boot_info_page.framebuffer_pa = 0;
+            display_boot_info_page.framebuffer_size = 0;
+            display_boot_info_page.framebuffer_va = 0;
+        }
+        display_boot_info_page.gpu_present = 0;
+        display_boot_info_page.gpu_transport = DISPLAY_GPU_TRANSPORT_NONE;
+        display_boot_info_page.gpu_bar_va = DISPLAY_GPU_MMIO_VA;
+        display_boot_info_page.gpu_bar_size = 0;
+        display_boot_info_page.gpu_common_off = 0;
+        display_boot_info_page.gpu_notify_off = 0;
+        display_boot_info_page.gpu_isr_off = 0;
+        display_boot_info_page.gpu_device_off = 0;
+        display_boot_info_page.gpu_notify_multiplier = 0;
+        display_boot_info_page.gpu_pci_segment = 0;
+        display_boot_info_page.gpu_pci_bdf = 0;
+        display_boot_info_page.reserved2 = 0;
+
+        if (acpi_get_virtio_gpu_info(&gpu_info) == 0) {
+            display_boot_info_page.gpu_present = 1;
+            display_boot_info_page.gpu_transport = DISPLAY_GPU_TRANSPORT_PCI_MODERN;
+            display_boot_info_page.gpu_bar_size = gpu_info.bar_size;
+            display_boot_info_page.gpu_common_off = gpu_info.common_off;
+            display_boot_info_page.gpu_notify_off = gpu_info.notify_off;
+            display_boot_info_page.gpu_isr_off = gpu_info.isr_off;
+            display_boot_info_page.gpu_device_off = gpu_info.device_off;
+            display_boot_info_page.gpu_notify_multiplier = gpu_info.notify_multiplier;
+            display_boot_info_page.gpu_pci_segment = gpu_info.segment;
+            display_boot_info_page.gpu_pci_bdf =
+                ((uint32_t)gpu_info.bus << 8) |
+                ((uint32_t)gpu_info.device << 3) |
+                gpu_info.function;
+
+            for (uint64_t off = 0; off < gpu_info.bar_size; off += PAGE_SIZE) {
+                if (vmm_map_page_asid(task->pgd, task->asid,
+                                      DISPLAY_GPU_MMIO_VA + off,
+                                      gpu_info.bar_pa + off,
+                                      VMM_FLAG_USER_DEVICE) < 0) {
+                    LOG_WARN("SCHED: failed to map virtio-gpu PCI BAR.");
+                    display_boot_info_page.gpu_present = 0;
+                    break;
+                }
+            }
+        }
+
+        if (sched_map_boot_data(task->tid, &display_boot_info_page, PAGE_SIZE,
+                                DISPLAY_BOOT_INFO_VA) < 0) {
+            LOG_WARN("SCHED: failed to map display boot info.");
+            return;
+        }
+        if (display_boot_info_page.magic != DISPLAY_BOOT_MAGIC ||
+            display_boot_info_page.framebuffer_size == 0) {
+            if (!display_boot_info_page.gpu_present) {
+                LOG_WARN("SCHED: no display framebuffer or virtio-gpu available.");
+            } else {
+                LOG_WARN("SCHED: no UEFI framebuffer; display service will try virtio-gpu.");
+            }
+            return;
+        }
+
+        uint64_t page_offset = display_boot_info_page.framebuffer_pa & (PAGE_SIZE - 1);
+        uint64_t map_pa = display_boot_info_page.framebuffer_pa & ~(PAGE_SIZE - 1);
+        uint64_t map_size = display_boot_info_page.framebuffer_size + page_offset;
+        map_size = (map_size + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1);
+
+        if (vma_add_ex(&task->vm, DISPLAY_FRAMEBUFFER_VA,
+                       DISPLAY_FRAMEBUFFER_VA + map_size,
+                       VMA_USER | VMA_READ | VMA_WRITE | VMA_MMAP,
+                       0, map_size, 0, VMA_BACKING_DEVICE, 0,
+                       map_size / PAGE_SIZE, map_size / PAGE_SIZE) < 0) {
+            LOG_WARN("SCHED: failed to register display framebuffer VMA.");
+            return;
+        }
+
+        for (uint64_t off = 0; off < map_size; off += PAGE_SIZE) {
+            if (vmm_map_page_asid(task->pgd, task->asid,
+                                  DISPLAY_FRAMEBUFFER_VA + off,
+                                  map_pa + off,
+                                  VMM_FLAG_USER_DEVICE) < 0) {
+                LOG_WARN("SCHED: failed to map display framebuffer.");
+                return;
+            }
+        }
+    }
 }
 
 uint64_t *sched_task_trap_frame(tcb_t *task) {
@@ -1059,11 +1310,10 @@ static uint32_t ticks_from_ms(uint64_t ms) {
     return (uint32_t)ticks;
 }
 
-static void timer_remove(tcb_t *task) {
-    if (!task || !task->timer_queued) {
+static void timer_remove_locked(sched_core_t *core, tcb_t *task) {
+    if (!core || !task || !task->timer_queued) {
         return;
     }
-    sched_core_t *core = sched_core_for_task(task);
 
     uint32_t bucket = (uint32_t)(task->wake_tick & (SCHED_TIMER_WHEEL_SIZE - 1));
     if (task->timer_prev) {
@@ -1077,13 +1327,24 @@ static void timer_remove(tcb_t *task) {
     timer_queue_reset_task(task);
 }
 
+static void timer_remove(tcb_t *task) {
+    if (!task) {
+        return;
+    }
+    sched_core_t *core = sched_core_for_task(task);
+    uint64_t irq_flags = spin_lock_irqsave(&core->lock);
+    timer_remove_locked(core, task);
+    spin_unlock_irqrestore(&core->lock, irq_flags);
+}
+
 static void timer_insert_at(tcb_t *task, uint64_t wake_tick) {
     if (!task || task->state == TASK_STATE_FREE) {
         return;
     }
 
-    timer_remove(task);
     sched_core_t *core = sched_core_for_task(task);
+    uint64_t irq_flags = spin_lock_irqsave(&core->lock);
+    timer_remove_locked(core, task);
     task->wake_tick = wake_tick;
     uint32_t bucket = (uint32_t)(wake_tick & (SCHED_TIMER_WHEEL_SIZE - 1));
     task->timer_next = core->timer_wheel[bucket];
@@ -1093,6 +1354,7 @@ static void timer_insert_at(tcb_t *task, uint64_t wake_tick) {
     }
     core->timer_wheel[bucket] = task;
     task->timer_queued = 1;
+    spin_unlock_irqrestore(&core->lock, irq_flags);
 }
 
 static void timer_insert_after(tcb_t *task, uint64_t delta_ticks) {
@@ -1102,6 +1364,22 @@ static void timer_insert_after(tcb_t *task, uint64_t delta_ticks) {
     timer_insert_at(task, sched_core_for_task(task)->total_ticks + delta_ticks);
 }
 
+void sched_arm_timeout(tcb_t *task, uint64_t timeout_ms) {
+    if (!task) {
+        return;
+    }
+    task->sleep_ticks_remaining = ticks_from_ms(timeout_ms);
+    timer_insert_after(task, task->sleep_ticks_remaining);
+}
+
+void sched_cancel_timeout(tcb_t *task) {
+    if (!task || !task->timer_queued) {
+        return;
+    }
+    timer_remove(task);
+    task->sleep_ticks_remaining = 0;
+}
+
 static int tick_has_expired(uint64_t now, uint64_t target) {
     return (int64_t)(now - target) >= 0;
 }
@@ -1109,23 +1387,40 @@ static int tick_has_expired(uint64_t now, uint64_t target) {
 static void process_timer_wheel_bucket(void) {
     sched_core_t *core = sched_current_core();
     uint32_t bucket = (uint32_t)(core->total_ticks & (SCHED_TIMER_WHEEL_SIZE - 1));
-    tcb_t *task = core->timer_wheel[bucket];
-    while (task) {
-        tcb_t *next = task->timer_next;
-        if (tick_has_expired(core->total_ticks, task->wake_tick)) {
-            timer_remove(task);
-            if (task->state == TASK_STATE_SLEEPING) {
-                task->sleep_ticks_remaining = 0;
-                sched_make_ready(task);
-            } else if (task->state == TASK_STATE_BLOCKED_ON_IRQ) {
-                uint64_t *tf = sched_task_trap_frame(task);
-                tf[0] = 0;
-                task->awaiting_irq = 0;
-                task->sleep_ticks_remaining = 0;
-                sched_make_ready(task);
+
+    while (1) {
+        tcb_t *expired = NULL;
+        uint64_t irq_flags = spin_lock_irqsave(&core->lock);
+        for (tcb_t *task = core->timer_wheel[bucket]; task; task = task->timer_next) {
+            if (tick_has_expired(core->total_ticks, task->wake_tick)) {
+                expired = task;
+                timer_remove_locked(core, task);
+                break;
             }
         }
-        task = next;
+        spin_unlock_irqrestore(&core->lock, irq_flags);
+
+        if (!expired) {
+            return;
+        }
+        if (expired->state == TASK_STATE_SLEEPING) {
+            expired->sleep_ticks_remaining = 0;
+            sched_make_ready(expired);
+        } else if (expired->state == TASK_STATE_BLOCKED_ON_IRQ) {
+            uint64_t *tf = sched_task_trap_frame(expired);
+            tf[0] = 0;
+            expired->awaiting_irq = 0;
+            expired->sleep_ticks_remaining = 0;
+            sched_make_ready(expired);
+        } else if (expired->state == TASK_STATE_BLOCKED_ON_IPC_RECV) {
+            uint64_t *tf = sched_task_trap_frame(expired);
+            tf[0] = (uint64_t)-1;
+            tf[1] = 0;
+            tf[2] = 0;
+            sched_clear_ipc_state(expired);
+            expired->sleep_ticks_remaining = 0;
+            sched_make_ready(expired);
+        }
     }
 }
 
@@ -1414,6 +1709,13 @@ static void invalidate_reply_caps_for_caller(uint32_t caller_tid) {
                 ocap_revoke_slot(&task->caps, cap);
             }
         }
+        if (task->ipc_fast_reply_active && task->ipc_fast_reply_caller &&
+            task->ipc_fast_reply_caller_tid == caller_tid) {
+            sched_task_put(task->ipc_fast_reply_caller);
+            task->ipc_fast_reply_active = 0;
+            task->ipc_fast_reply_caller = NULL;
+            task->ipc_fast_reply_caller_tid = 0;
+        }
     }
 }
 
@@ -1583,6 +1885,7 @@ static void record_task_termination(tcb_t *task, uint32_t reason, int exit_code,
         return;
     }
 
+    uint64_t irq_flags = spin_lock_irqsave(&termination_lock);
     termination_record_t *record = find_termination_record(task->parent_tid, task->tid);
     if (!record) {
         for (uint32_t i = 0; i < task_capacity; i++) {
@@ -1594,6 +1897,7 @@ static void record_task_termination(tcb_t *task, uint32_t reason, int exit_code,
     }
 
     if (!record) {
+        spin_unlock_irqrestore(&termination_lock, irq_flags);
         LOG_FAIL("SCHED: Dropping child exit status; record table full.");
         return;
     }
@@ -1608,6 +1912,7 @@ static void record_task_termination(tcb_t *task, uint32_t reason, int exit_code,
     record->far = far;
 
     wake_waiting_parent(record);
+    spin_unlock_irqrestore(&termination_lock, irq_flags);
 }
 
 static void destroy_task(tcb_t *task) {
@@ -1621,6 +1926,7 @@ static void destroy_task(tcb_t *task) {
     unlink_queued_ipc_call(task);
     wake_ipc_peers(task->tid);
     invalidate_reply_caps_for_caller(task->tid);
+    ipc_task_died(task->tid);
     vfs_task_died(task->tid);
     memcap_release_for_owner(task->tid);
     memcap_forget_mappings_for_target(task->tid);
@@ -1639,6 +1945,7 @@ static void destroy_task(tcb_t *task) {
     task->sp_el0 = 0;
     task->priority = 0;
     task->kill_requested = 0;
+    task->sched_has_run = 0;
     task->base_priority = 0;
     task->quantum = 0;
     task->ticks_remaining = 0;
@@ -1685,7 +1992,7 @@ static void reset_to_kernel_address_space(void) {
 static void priority_boost_current_core(void) {
     sched_core_t *core = sched_current_core();
     tcb_t *boosted_head = NULL;
-    spin_lock(&core->lock);
+    uint64_t irq_flags = spin_lock_irqsave(&core->lock);
     for (uint32_t level = 0; level < SCHED_LEVELS; level++) {
         tcb_t *head = core->queues[level];
         core->queues[level] = NULL;
@@ -1724,7 +2031,7 @@ static void priority_boost_current_core(void) {
         running->ticks_remaining = running->quantum;
         running->wait_time = 0;
     }
-    spin_unlock(&core->lock);
+    spin_unlock_irqrestore(&core->lock, irq_flags);
 }
 
 static tcb_t *ready_pop_or_steal(void) {
@@ -1773,6 +2080,11 @@ static void schedule_next(void) {
     }
 
     sched_set_current(core, target, target_idx);
+    if (prev->tid != 0 &&
+        __atomic_load_n(&prev->state, __ATOMIC_ACQUIRE) == TASK_STATE_READY &&
+        !prev->sched_queued) {
+        ready_enqueue_tail_on_core(core, prev);
+    }
     target->state = TASK_STATE_RUNNING;
     target->wait_time = 0;
     if (target->ticks_remaining == 0) {
@@ -1848,21 +2160,24 @@ static __attribute__((noreturn)) void terminate_current_task(uint32_t reason, in
 
 static int sched_take_kill_request(tcb_t *task) {
     int requested = 0;
-    sched_task_lock(task);
-    if (task && task->kill_requested) {
+    if (!task || !spin_trylock(&task->lock)) {
+        return 0;
+    }
+    if (task->kill_requested) {
         task->kill_requested = 0;
         requested = 1;
     }
-    sched_task_unlock(task);
+    spin_unlock(&task->lock);
     return requested;
 }
 
 static void sched_request_remote_kill(tcb_t *target) {
-    sched_task_lock(target);
-    if (target) {
-        target->kill_requested = 1;
+    if (!target) {
+        return;
     }
-    sched_task_unlock(target);
+    uint64_t irq_flags = spin_lock_irqsave(&target->lock);
+    target->kill_requested = 1;
+    spin_unlock_irqrestore(&target->lock, irq_flags);
 
     for (uint32_t core_id = 0; core_id < MAX_SCHED_CORES; core_id++) {
         sched_remote_reschedule(core_id);
@@ -1887,7 +2202,9 @@ static void sched_process_owner_kills(void) {
         }
 
         int destroy = 0;
-        sched_task_lock(task);
+        if (!spin_trylock(&task->lock)) {
+            continue;
+        }
         if (task->kill_requested &&
             task->state != TASK_STATE_FREE &&
             task->state != TASK_STATE_DEAD &&
@@ -1895,7 +2212,7 @@ static void sched_process_owner_kills(void) {
             task->kill_requested = 0;
             destroy = 1;
         }
-        sched_task_unlock(task);
+        spin_unlock(&task->lock);
 
         if (destroy) {
             record_task_termination(task, TASK_TERM_KILLED, -1, 0, 0, 0);
@@ -1947,6 +2264,7 @@ void sched_init(void) {
     }
 
     memcap_init();
+    pipe_init();
     tasks[0]->lock.value = 0;
     tasks[0]->tid = 0;
     tasks[0]->state = TASK_STATE_RUNNING;
@@ -2052,6 +2370,7 @@ int sched_create_task(void (*entry_point)(void), uint8_t priority) {
     tcb->wait_time = 0;
     tcb->sleep_ticks_remaining = 0;
     tcb->kill_requested = 0;
+    tcb->sched_has_run = 0;
     ready_queue_reset_task(tcb);
     timer_queue_reset_task(tcb);
     sched_clear_ipc_state(tcb);
@@ -2079,9 +2398,56 @@ int sched_create_task(void (*entry_point)(void), uint8_t priority) {
     return tcb->tid;
 }
 
+static int install_initial_args(tcb_t *task, frame_t *stack_frame,
+                                const spawn_args_t *args) {
+    uint64_t *trap_frame = (uint64_t *)task->sp;
+    uint32_t argc = args ? args->argc : 0;
+    if (argc > SPAWN_ARG_MAX) {
+        return -1;
+    }
+
+    uint8_t *stack = (uint8_t *)stack_frame->paddr;
+    uint64_t arg_addrs[SPAWN_ARG_MAX];
+    uint64_t cursor = TASK_STACK_SIZE;
+    for (uint32_t i = argc; i > 0; i--) {
+        uint64_t length = 0;
+        while (length + 1 < SPAWN_ARG_BYTES && args->values[i - 1][length]) {
+            length++;
+        }
+        length++;
+        if (length > cursor) {
+            return -1;
+        }
+        cursor -= length;
+        for (uint64_t j = 0; j < length; j++) {
+            stack[cursor + j] = args->values[i - 1][j];
+        }
+        arg_addrs[i - 1] = USER_STACK_BASE + cursor;
+    }
+
+    cursor &= ~0xFULL;
+    uint64_t argv_bytes = ((uint64_t)argc + 1ULL) * sizeof(uint64_t);
+    if (argv_bytes > cursor) {
+        return -1;
+    }
+    cursor = (cursor - argv_bytes) & ~0xFULL;
+    uint64_t *argv = (uint64_t *)(stack + cursor);
+    for (uint32_t i = 0; i < argc; i++) {
+        argv[i] = arg_addrs[i];
+    }
+    argv[argc] = 0;
+
+    task->sp_el0 = USER_STACK_BASE + cursor;
+    trap_frame[0] = argc;
+    trap_frame[1] = USER_STACK_BASE + cursor;
+    return 0;
+}
+
 static int create_user_task_with_file_cap(const uint8_t *elf_data, uint64_t elf_size,
                                           uint8_t priority, uint32_t file_cap,
-                                          uint32_t parent_tid) {
+                                          uint32_t parent_tid,
+                                          const spawn_args_t *args,
+                                          const spawn_stdio_t *stdio) {
     int idx = find_free_task_slot(1);
     if (idx == -1) {
         LOG_FAIL("SCHED: Cannot create user task, task table growth failed.");
@@ -2145,6 +2511,7 @@ static int create_user_task_with_file_cap(const uint8_t *elf_data, uint64_t elf_
     tcb->wait_time = 0;
     tcb->sleep_ticks_remaining = 0;
     tcb->kill_requested = 0;
+    tcb->sched_has_run = 0;
     ready_queue_reset_task(tcb);
     timer_queue_reset_task(tcb);
     
@@ -2155,6 +2522,16 @@ static int create_user_task_with_file_cap(const uint8_t *elf_data, uint64_t elf_
     tcb->wait_target_tid = 0;
     clear_caps(tcb);
     install_standard_caps(tcb);
+    inherit_standard_streams(get_tcb(parent_tid), tcb);
+    if (stdio) {
+        for (uint32_t i = 0; i < 3; i++) {
+            if (stdio->caps[i] != 0 &&
+                pipe_inherit_cap(stdio->parent, tcb, stdio->caps[i],
+                                 CAP_STDIN + i) < 0) {
+                goto fail;
+            }
+        }
+    }
     tcb->user_heap_pointer = 0xA0000000;
     tcb->user_shared_pointer = USER_SHARED_BASE;
     uint64_t entry_point = elf_load(elf_data, elf_size, tcb->pgd, tcb->asid, &tcb->vm, file_cap);
@@ -2188,7 +2565,10 @@ static int create_user_task_with_file_cap(const uint8_t *elf_data, uint64_t elf_
         goto fail;
     }
     tcb->user_stack_base = (void *)stack_frame->paddr;
-    tcb->sp_el0 = USER_STACK_TOP;
+    if (install_initial_args(tcb, stack_frame, args) < 0) {
+        LOG_FAIL("SCHED: Failed to initialize user arguments.");
+        goto fail;
+    }
     sched_make_ready(tcb);
     
     LOG_DEBUG_HEX("SCHED: Created new user task. TID = ", tcb->tid);
@@ -2221,13 +2601,13 @@ fail:
 }
 
 int sched_create_user_task(const uint8_t *elf_data, uint64_t elf_size, uint8_t priority) {
-    return create_user_task_with_file_cap(elf_data, elf_size, priority, 0, 0);
+    return create_user_task_with_file_cap(elf_data, elf_size, priority, 0, 0, 0, 0);
 }
 
 int sched_create_user_task_from_file(const uint8_t *elf_data, uint64_t elf_size,
                                      uint8_t priority, uint32_t initrd_index) {
     return create_user_task_with_file_cap(elf_data, elf_size, priority,
-                                          initrd_index + 1, 0);
+                                          initrd_index + 1, 0, 0, 0);
 }
 
 static int copy_vmas(vm_space_t *dst, const vm_space_t *src) {
@@ -2402,6 +2782,7 @@ int sched_fork_syscall(uint64_t *regs) {
     child->wait_time = 0;
     child->sleep_ticks_remaining = 0;
     child->kill_requested = 0;
+    child->sched_has_run = 0;
     ready_queue_reset_task(child);
     timer_queue_reset_task(child);
     sched_clear_ipc_state(child);
@@ -2415,6 +2796,7 @@ int sched_fork_syscall(uint64_t *regs) {
     child->wait_target_tid = 0;
     clear_caps(child);
     install_standard_caps(child);
+    inherit_standard_streams(current_task, child);
     if (ensure_cap_capacity(child, current_task->caps.capacity) < 0) {
         vmm_destroy_address_space(child->pgd);
         vma_destroy(&child->vm);
@@ -2425,10 +2807,22 @@ int sched_fork_syscall(uint64_t *regs) {
         regs[0] = (uint64_t)-1;
         return -1;
     }
-    for (uint32_t i = 3; i < current_task->caps.capacity; i++) {
+    for (uint32_t i = CAP_FIRST_DYNAMIC; i < current_task->caps.capacity; i++) {
         ocap_t cap = current_task->caps.entries[i];
         if (cap.type != OCAP_NONE && cap.type != OCAP_VMA && cap.type != OCAP_REPLY) {
-            child->caps.entries[i] = cap;
+            if (ocap_clone_at(&current_task->caps, &child->caps, i, i, 0) < 0) {
+                vmm_destroy_address_space(child->pgd);
+                vma_destroy(&child->vm);
+                clear_caps(child);
+                release_cap_table(child);
+                child->pgd = NULL;
+                release_user_asid(child->asid);
+                child->asid = 0;
+                child->state = TASK_STATE_FREE;
+                child->refcount = 0;
+                regs[0] = (uint64_t)-1;
+                return -1;
+            }
         }
     }
 
@@ -2696,7 +3090,7 @@ int sched_spawn_syscall(uint64_t *regs, uint64_t elf_data, uint64_t elf_size, ui
     }
 
     int tid = create_user_task_with_file_cap((const uint8_t*)elf_data, elf_size,
-                                             priority, 0, current_task->tid);
+                                             priority, 0, current_task->tid, 0, 0);
     if (tid >= 0) {
         tcb_t *child = get_tcb((uint32_t)tid);
         if (child) {
@@ -2735,7 +3129,7 @@ int sched_spawn_file_syscall(uint64_t *regs, uint64_t name_ptr, uint8_t priority
     }
 
     int tid = create_user_task_with_file_cap(elf_data, elf_size, priority,
-                                             initrd_index + 1, current_task->tid);
+                                             initrd_index + 1, current_task->tid, 0, 0);
     if (tid >= 0) {
         tcb_t *child = get_tcb((uint32_t)tid);
         if (child) {
@@ -2758,7 +3152,7 @@ int sched_install_exec_cap_at(uint32_t tid, uint32_t cap, uint32_t initrd_index)
     tcb_t *task = get_tcb(tid);
     const uint8_t *elf_data = 0;
     uint64_t elf_size = 0;
-    if (!task || cap < 3 ||
+    if (!task || cap < CAP_FIRST_DYNAMIC ||
         initrd_get_file(initrd_index, &elf_data, &elf_size) < 0) {
         return -1;
     }
@@ -2770,7 +3164,7 @@ int sched_install_exec_cap_at(uint32_t tid, uint32_t cap, uint32_t initrd_index)
 int sched_install_file_cap_at(uint32_t tid, uint32_t cap, uint32_t initrd_index) {
     tcb_t *task = get_tcb(tid);
     const initrd_entry_t *entry = initrd_get_entry(initrd_index);
-    if (!task || cap < 3 || !entry) {
+    if (!task || cap < CAP_FIRST_DYNAMIC || !entry) {
         return -1;
     }
 
@@ -2811,12 +3205,16 @@ int sched_map_boot_data(uint32_t tid, const void *data, uint64_t size, uint64_t 
     return 0;
 }
 
-static int find_free_vfs_exec_object(void) {
+static int reserve_vfs_exec_object(void) {
+    spin_lock(&vfs_exec_lock);
     for (uint32_t i = 1; i < MAX_VFS_EXEC_OBJECTS; i++) {
         if (!vfs_exec_objects[i].present) {
+            vfs_exec_objects[i].present = 1;
+            spin_unlock(&vfs_exec_lock);
             return (int)i;
         }
     }
+    spin_unlock(&vfs_exec_lock);
     return -1;
 }
 
@@ -2855,7 +3253,7 @@ int sched_vfs_exec_create_syscall(uint64_t *regs, uint32_t client_tid,
         return -1;
     }
 
-    int object_id = find_free_vfs_exec_object();
+    int object_id = reserve_vfs_exec_object();
     if (object_id < 0) {
         regs[0] = (uint64_t)-1;
         sched_task_put(client);
@@ -2864,6 +3262,7 @@ int sched_vfs_exec_create_syscall(uint64_t *regs, uint32_t client_tid,
 
     uint8_t *copy = (uint8_t *)pmm_alloc_contiguous_pages(pages64);
     if (!copy) {
+        release_vfs_exec_object((uint32_t)object_id);
         regs[0] = (uint64_t)-1;
         sched_task_put(client);
         return -1;
@@ -2872,13 +3271,14 @@ int sched_vfs_exec_create_syscall(uint64_t *regs, uint32_t client_tid,
     if (copy_from_user(copy, elf_data, (size_t)elf_size) < 0 ||
         copy[0] != 0x7f || copy[1] != 'E' || copy[2] != 'L' || copy[3] != 'F') {
         pmm_free_contiguous_pages(copy, pages64);
+        release_vfs_exec_object((uint32_t)object_id);
         regs[0] = (uint64_t)-1;
         sched_task_put(client);
         return -1;
     }
 
+    spin_lock(&vfs_exec_lock);
     vfs_exec_object_t *object = &vfs_exec_objects[object_id];
-    object->present = 1;
     object->owner_tid = client_tid;
     object->fs_tid = fs->tid;
     object->file_index = file_index;
@@ -2886,11 +3286,12 @@ int sched_vfs_exec_create_syscall(uint64_t *regs, uint32_t client_tid,
     object->size = elf_size;
     object->pages = (uint32_t)pages64;
     object->data = copy;
+    spin_unlock(&vfs_exec_lock);
 
     int cap_slot = install_cap(client, OCAP_EXEC, (uint32_t)object_id,
                                OCAP_RIGHT_SPAWN, OCAP_FLAG_VFS_EXEC);
     if (cap_slot < 0) {
-        clear_vfs_exec_object(object);
+        release_vfs_exec_object((uint32_t)object_id);
         regs[0] = (uint64_t)-1;
         sched_task_put(client);
         return -1;
@@ -2903,7 +3304,41 @@ int sched_vfs_exec_create_syscall(uint64_t *regs, uint32_t client_tid,
     return cap_slot;
 }
 
-int sched_spawn_exec_syscall(uint64_t *regs, uint32_t exec_cap, uint8_t priority) {
+static int copy_spawn_args_from_user(spawn_args_t *args,
+                                     uint64_t argv_ptr, uint32_t argc) {
+    if (!args || argc > SPAWN_ARG_MAX || (argc != 0 && argv_ptr == 0)) {
+        return -1;
+    }
+    args->argc = argc;
+    for (uint32_t i = 0; i < SPAWN_ARG_MAX; i++) {
+        args->values[i][0] = '\0';
+    }
+    if (argc == 0) {
+        return 0;
+    }
+
+    uint64_t pointers[SPAWN_ARG_MAX];
+    if (copy_from_user(pointers, argv_ptr, (size_t)argc * sizeof(uint64_t)) < 0) {
+        return -1;
+    }
+    for (uint32_t i = 0; i < argc; i++) {
+        if (pointers[i] == 0 ||
+            copy_string_from_user(args->values[i], SPAWN_ARG_BYTES,
+                                  pointers[i]) < 0) {
+            return -1;
+        }
+    }
+    return 0;
+}
+
+static int spawn_exec_args(uint64_t *regs, uint32_t exec_cap,
+                           uint8_t priority, uint64_t argv_ptr,
+                           uint32_t argc, const spawn_stdio_t *stdio) {
+    spawn_args_t args;
+    if (copy_spawn_args_from_user(&args, argv_ptr, argc) < 0) {
+        if (regs) regs[0] = (uint64_t)-1;
+        return -1;
+    }
     ocap_t cap;
     if (!current_task ||
         ocap_lookup(&current_task->caps, exec_cap, OCAP_EXEC,
@@ -2916,27 +3351,34 @@ int sched_spawn_exec_syscall(uint64_t *regs, uint32_t exec_cap, uint8_t priority
     uint64_t elf_size = 0;
     int tid = -1;
     if (cap.flags & OCAP_FLAG_VFS_EXEC) {
-        if (cap.object_id == 0 || cap.object_id >= MAX_VFS_EXEC_OBJECTS ||
-            !vfs_exec_objects[cap.object_id].present) {
+        if (cap.object_id == 0 || cap.object_id >= MAX_VFS_EXEC_OBJECTS) {
             if (regs) regs[0] = (uint64_t)-1;
             return -1;
         }
 
+        spin_lock(&vfs_exec_lock);
         vfs_exec_object_t *object = &vfs_exec_objects[cap.object_id];
+        if (!object->present) {
+            spin_unlock(&vfs_exec_lock);
+            if (regs) regs[0] = (uint64_t)-1;
+            return -1;
+        }
         elf_data = object->data;
         elf_size = object->size;
         tid = create_user_task_with_file_cap(elf_data, elf_size, priority,
-                                             0, current_task->tid);
+                                             0, current_task->tid, &args, stdio);
         if (tid >= 0) {
             apply_boot_device_grants(get_tcb((uint32_t)tid), object->boot_flags);
         }
+        spin_unlock(&vfs_exec_lock);
     } else {
         if (initrd_get_file(cap.object_id, &elf_data, &elf_size) < 0) {
             if (regs) regs[0] = (uint64_t)-1;
             return -1;
         }
         tid = create_user_task_with_file_cap(elf_data, elf_size, priority,
-                                             cap.object_id + 1, current_task->tid);
+                                             cap.object_id + 1, current_task->tid,
+                                             &args, stdio);
     }
 
     if (cap.flags & OCAP_FLAG_VFS_EXEC) {
@@ -2956,6 +3398,29 @@ int sched_spawn_exec_syscall(uint64_t *regs, uint32_t exec_cap, uint8_t priority
         regs[1] = tid >= 0 ? (uint64_t)install_endpoint_cap_for_tid(current_task, (uint32_t)tid) : (uint64_t)-1;
     }
     return tid;
+}
+
+int sched_spawn_exec_args_syscall(uint64_t *regs, uint32_t exec_cap,
+                                  uint8_t priority, uint64_t argv_ptr,
+                                  uint32_t argc) {
+    return spawn_exec_args(regs, exec_cap, priority, argv_ptr, argc, 0);
+}
+
+int sched_spawn_exec_args_stdio_syscall(uint64_t *regs, uint32_t exec_cap,
+                                        uint8_t priority, uint64_t argv_ptr,
+                                        uint32_t argc, uint32_t stdin_cap,
+                                        uint32_t stdout_cap,
+                                        uint32_t stderr_cap) {
+    spawn_stdio_t stdio = {
+        .parent = current_task,
+        .caps = {stdin_cap, stdout_cap, stderr_cap}
+    };
+    return spawn_exec_args(regs, exec_cap, priority, argv_ptr, argc, &stdio);
+}
+
+int sched_spawn_exec_syscall(uint64_t *regs, uint32_t exec_cap,
+                             uint8_t priority) {
+    return sched_spawn_exec_args_syscall(regs, exec_cap, priority, 0, 0);
 }
 
 void sched_await_irq_syscall(uint64_t *regs, uint32_t irq_num) {
@@ -3154,6 +3619,62 @@ void sched_handoff_to_task(tcb_t *target) {
     cpu_switch_to(prev, target);
 }
 
+int sched_ipc_direct_handoff(tcb_t *target) {
+    sched_core_t *core = sched_current_core();
+    tcb_t *prev = core->running_task;
+    if (!prev || !target || target == prev ||
+        target->sched_core_id != core->core_id || target->sched_queued ||
+        target->timer_queued) {
+        return -1;
+    }
+
+    if (prev->pgd != NULL) {
+        uint64_t outgoing_sp_el0;
+        __asm__ volatile("mrs %0, sp_el0" : "=r"(outgoing_sp_el0));
+        prev->sp_el0 = outgoing_sp_el0;
+    }
+
+    sched_set_current(core, target, -1);
+    target->state = TASK_STATE_RUNNING;
+    target->wait_time = 0;
+    if (prev->ticks_remaining != 0) {
+        target->ticks_remaining = prev->ticks_remaining;
+        target->quantum = target->ticks_remaining;
+    }
+    switch_to_task_address_space(target);
+    cpu_switch_to(prev, target);
+    return 0;
+}
+
+int sched_ipc_direct_reply_handoff(tcb_t *target) {
+    sched_core_t *core = sched_current_core();
+    tcb_t *prev = core->running_task;
+    if (!prev || !target || target == prev ||
+        target->sched_core_id != core->core_id || target->sched_queued ||
+        target->timer_queued) {
+        return -1;
+    }
+
+    if (prev->pgd != NULL) {
+        uint64_t outgoing_sp_el0;
+        __asm__ volatile("mrs %0, sp_el0" : "=r"(outgoing_sp_el0));
+        prev->sp_el0 = outgoing_sp_el0;
+    }
+
+    prev->state = TASK_STATE_READY;
+    ready_enqueue_tail_on_core(core, prev);
+    sched_set_current(core, target, -1);
+    target->state = TASK_STATE_RUNNING;
+    target->wait_time = 0;
+    if (prev->ticks_remaining != 0) {
+        target->ticks_remaining = prev->ticks_remaining;
+        target->quantum = target->ticks_remaining;
+    }
+    switch_to_task_address_space(target);
+    cpu_switch_to(prev, target);
+    return 0;
+}
+
 static int install_endpoint_cap_for_tid(tcb_t *task, uint32_t tid) {
     if (!task || !get_tcb(tid)) {
         return -1;
@@ -3190,14 +3711,17 @@ void sched_wait_syscall(uint64_t *regs, uint32_t tid) {
         return;
     }
 
+    uint64_t irq_flags = spin_lock_irqsave(&termination_lock);
     termination_record_t *record = find_termination_record(current_task->tid, tid);
     if (record) {
         write_wait_result(regs, record);
         clear_termination_record(record);
+        spin_unlock_irqrestore(&termination_lock, irq_flags);
         return;
     }
 
     if (!has_live_child(current_task->tid, tid)) {
+        spin_unlock_irqrestore(&termination_lock, irq_flags);
         write_wait_error(regs, 1);
         return;
     }
@@ -3205,6 +3729,7 @@ void sched_wait_syscall(uint64_t *regs, uint32_t tid) {
     current_task->state = TASK_STATE_BLOCKED_ON_WAIT;
     current_task->wait_target_tid = tid;
     current_task->ticks_remaining = 0;
+    spin_unlock_irqrestore(&termination_lock, irq_flags);
 
     sched_reschedule();
 }
@@ -3220,17 +3745,21 @@ void sched_poll_syscall(uint64_t *regs, uint32_t tid) {
         return;
     }
 
+    uint64_t irq_flags = spin_lock_irqsave(&termination_lock);
     termination_record_t *record = find_termination_record(current_task->tid, tid);
     if (record) {
         write_wait_result(regs, record);
+        spin_unlock_irqrestore(&termination_lock, irq_flags);
         return;
     }
 
     if (has_live_child(current_task->tid, tid)) {
+        spin_unlock_irqrestore(&termination_lock, irq_flags);
         write_wait_running(regs, tid);
         return;
     }
 
+    spin_unlock_irqrestore(&termination_lock, irq_flags);
     write_wait_error(regs, 1);
 }
 
@@ -3269,7 +3798,8 @@ int sched_current_is_user(void) {
     return current_task && current_task->state != TASK_STATE_FREE && current_task->pgd != NULL;
 }
 
-void sched_fault_current_task(uint64_t esr, uint64_t elr, uint64_t far) {
+void sched_fault_current_task(uint64_t esr, uint64_t elr, uint64_t far,
+                              uint64_t vector_source) {
     if (!sched_current_is_user()) {
         return;
     }
@@ -3313,6 +3843,43 @@ void sched_fault_current_task(uint64_t esr, uint64_t elr, uint64_t far) {
         LOG_DEBUG_HEX("SCHED: Fault VMA end: ", vma->end);
         LOG_DEBUG_HEX("SCHED: Fault VMA flags: ", vma->flags);
     }
+    uint64_t *tf = sched_task_trap_frame(current_task);
+    uint64_t pte_pa = 0;
+    uint64_t pte_entry = 0;
+    uint64_t sctlr = 0;
+    uint64_t tcr = 0;
+    uint64_t ttbr0 = 0;
+    __asm__ volatile("mrs %0, sctlr_el1" : "=r"(sctlr));
+    __asm__ volatile("mrs %0, tcr_el1" : "=r"(tcr));
+    __asm__ volatile("mrs %0, ttbr0_el1" : "=r"(ttbr0));
+    LOG_INFO_HEX("SCHEDDBG: ESR EC: ", ec);
+    LOG_INFO_HEX("SCHEDDBG: ESR ISS: ", esr & 0x01FFFFFFULL);
+    LOG_INFO_HEX("SCHEDDBG: vector source: ", vector_source);
+    LOG_INFO_HEX("SCHEDDBG: trap ELR: ", tf ? tf[32] : 0);
+    LOG_INFO_HEX("SCHEDDBG: trap SPSR: ", tf ? tf[33] : 0);
+    LOG_INFO_HEX("SCHEDDBG: task PGD: ", current_task->pgd);
+    LOG_INFO_HEX("SCHEDDBG: task ASID: ", current_task->asid);
+    LOG_INFO_HEX("SCHEDDBG: task SP_EL0: ", current_task->sp_el0);
+    LOG_INFO_HEX("SCHEDDBG: SCTLR_EL1: ", sctlr);
+    LOG_INFO_HEX("SCHEDDBG: TCR_EL1: ", tcr);
+    LOG_INFO_HEX("SCHEDDBG: TTBR0_EL1: ", ttbr0);
+    if (vmm_query_page(current_task->pgd, elr & ~(PAGE_SIZE - 1),
+                       &pte_pa, &pte_entry) == 0) {
+        uint64_t insn_pa = pte_pa + (elr & (PAGE_SIZE - 1));
+        LOG_INFO_HEX("SCHEDDBG: ELR page PA: ", pte_pa);
+        LOG_INFO_HEX("SCHEDDBG: ELR PTE: ", pte_entry);
+        LOG_INFO_HEX("SCHEDDBG: ELR bytes[0..7]: ",
+                     *(volatile uint64_t *)insn_pa);
+    } else {
+        LOG_WARN("SCHEDDBG: ELR page is not mapped.");
+    }
+    if (vmm_query_page(current_task->pgd, current_task->sp_el0 - 16,
+                       &pte_pa, &pte_entry) == 0) {
+        LOG_INFO_HEX("SCHEDDBG: SP_EL0 page PA: ", pte_pa);
+        LOG_INFO_HEX("SCHEDDBG: SP_EL0 PTE: ", pte_entry);
+    } else {
+        LOG_WARN("SCHEDDBG: SP_EL0 page is not mapped.");
+    }
 
     terminate_current_task(TASK_TERM_FAULTED, -1, esr, elr, fault_va);
 }
@@ -3322,12 +3889,16 @@ int sched_resolve_user_page(uint64_t user_va, int write) {
            sched_resolve_task_page(current_task, user_va, write) : -1;
 }
 
-static int find_free_dma_object(void) {
+static int reserve_dma_object(void) {
+    spin_lock(&dma_object_lock);
     for (uint32_t i = 1; i < MAX_DMA_OBJECTS; i++) {
         if (!dma_objects[i].present) {
+            dma_objects[i].present = 1;
+            spin_unlock(&dma_object_lock);
             return (int)i;
         }
     }
+    spin_unlock(&dma_object_lock);
     return -1;
 }
 
@@ -3344,14 +3915,13 @@ void sched_dma_export_syscall(uint64_t *regs, uint64_t user_va, uint64_t size,
     }
 
     uint32_t page_count = (uint32_t)(size / PAGE_SIZE);
-    int object_id = find_free_dma_object();
+    int object_id = reserve_dma_object();
     if (object_id < 0) {
         regs[0] = (uint64_t)-1;
         return;
     }
 
     dma_object_t *object = &dma_objects[object_id];
-    object->present = 1;
     object->owner_tid = current_task->tid;
     object->user_va = user_va;
     object->size = size;
@@ -3399,15 +3969,16 @@ void sched_dma_paddr_syscall(uint64_t *regs, uint32_t dma_cap, uint64_t offset) 
     if (!regs || !current_task ||
         ocap_lookup(&current_task->caps, dma_cap, OCAP_DMA,
                     OCAP_RIGHT_DMA | OCAP_RIGHT_MAP, &cap) < 0 ||
-        cap.object_id == 0 || cap.object_id >= MAX_DMA_OBJECTS ||
-        !dma_objects[cap.object_id].present ||
-        dma_objects[cap.object_id].owner_tid != current_task->tid) {
+        cap.object_id == 0 || cap.object_id >= MAX_DMA_OBJECTS) {
         if (regs) regs[0] = 0;
         return;
     }
 
+    spin_lock(&dma_object_lock);
     dma_object_t *object = &dma_objects[cap.object_id];
-    if (offset >= object->size) {
+    if (!object->present || object->owner_tid != current_task->tid ||
+        offset >= object->size) {
+        spin_unlock(&dma_object_lock);
         regs[0] = 0;
         return;
     }
@@ -3415,12 +3986,14 @@ void sched_dma_paddr_syscall(uint64_t *regs, uint32_t dma_cap, uint64_t offset) 
     uint32_t page = (uint32_t)(offset / PAGE_SIZE);
     uint64_t page_off = offset & (PAGE_SIZE - 1);
     if (page >= object->page_count || !object->pages[page]) {
+        spin_unlock(&dma_object_lock);
         regs[0] = 0;
         return;
     }
 
     regs[0] = object->pages[page] + page_off;
     regs[1] = object->size - offset;
+    spin_unlock(&dma_object_lock);
 }
 
 void sched_dma_release_syscall(uint64_t *regs, uint32_t dma_cap) {

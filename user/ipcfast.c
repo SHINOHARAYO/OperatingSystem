@@ -4,7 +4,9 @@ static uint64_t expected_word(uint32_t round, uint32_t word) {
     return 0xF000000000000000ULL | ((uint64_t)round << 32) | word;
 }
 
-void _start(void) {
+int main(int argc, char **argv) {
+    (void)argc;
+    (void)argv;
     uint64_t lengths[4] = {0, 8, 64, 128};
     int all_ok = 1;
 
@@ -32,5 +34,5 @@ void _start(void) {
         sys_ipc_reply(msg.reply_cap, ok ? 0 : -1, 0, 24, reply);
     }
 
-    sys_exit(all_ok ? 0 : 1);
+    return all_ok ? 0 : 1;
 }
